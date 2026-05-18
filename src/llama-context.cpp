@@ -1657,12 +1657,14 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             ggml_tensor * b_sigmoid = ggml_sigmoid(ctx, b_in);
 
             // state view: reads directly from recurrent memory GPU buffer (zero-copy)
+            // upstream GDN expects flat state: (S_v*S_v*H, K=1, n_seqs=1, 1)
             ggml_tensor * s_tensor = mem_recurrent->s_l[il];
             size_t s_byte_offset = (size_t)cell_idx * n_embd_s * ggml_element_size(s_tensor);
-            ggml_tensor * s_view = ggml_view_4d(ctx, s_tensor, S, S, H_v, (int64_t)1,
-                S * ggml_element_size(s_tensor),
-                S * S * ggml_element_size(s_tensor),
-                S * S * H_v * ggml_element_size(s_tensor),
+            int64_t state_flat = S * S * H_v;
+            ggml_tensor * s_view = ggml_view_4d(ctx, s_tensor, state_flat, (int64_t)1, (int64_t)1, (int64_t)1,
+                state_flat * ggml_element_size(s_tensor),
+                state_flat * ggml_element_size(s_tensor),
+                state_flat * ggml_element_size(s_tensor),
                 s_byte_offset);
 
             // GDN op: same kernel as forward pass, bit-identical state update
