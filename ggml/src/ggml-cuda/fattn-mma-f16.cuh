@@ -571,6 +571,117 @@ static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile(
     }
 }
 
+// Generalized turbo tile loader for non-turbo4 types (turbo3_0, turbo2_0, turbo3_tcq, turbo2_tcq).
+// Reads raw quantized bytes from K/V cache, dequants to half2 in shared memory tile.
+// is_value selects V alpha (adaptive) vs K alpha (static) for TCQ types.
+template <ggml_type turbo_type, int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check, bool is_value>
+static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
+        const char * __restrict__ raw,
+        half2      * __restrict__ tile,
+        const int stride_bytes,
+        const int i_sup) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+
+    for (int row = tid; row < nbatch_fa; row += nthreads) {
+        if (oob_check && row >= i_sup) {
+#pragma unroll
+            for (int b = 0; b < D/2; ++b)
+                tile[row * stride_tile + b] = make_half2(0.0f, 0.0f);
+            continue;
+        }
+        const char * row_ptr = raw + (int64_t)row * stride_bytes;
+
+        if constexpr (turbo_type == GGML_TYPE_TURBO3_0) {
+            constexpr int blocks_per_row = D / QK_TURBO3;
+#pragma unroll
+            for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
+                const block_turbo3_0 * blk = (const block_turbo3_0 *)(row_ptr) + blk_idx;
+                const float norm = __half2float(blk->norm);
+                half cn_h[8];
+#pragma unroll
+                for (int c = 0; c < 8; c++)
+                    cn_h[c] = __float2half(d_turbo_centroids_3bit_fattn[c] * norm);
+#pragma unroll
+                for (int b = 0; b < QK_TURBO3/2; ++b) {
+                    const int j0 = b * 2;
+                    const int j1 = j0 + 1;
+                    const uint8_t low2_0 = (blk->qs[j0/4] >> ((j0%4)*2)) & 0x3;
+                    const uint8_t hi1_0  = (blk->signs[j0/8] >> (j0%8)) & 0x1;
+                    const uint8_t low2_1 = (blk->qs[j1/4] >> ((j1%4)*2)) & 0x3;
+                    const uint8_t hi1_1  = (blk->signs[j1/8] >> (j1%8)) & 0x1;
+                    tile[row * stride_tile + blk_idx * (QK_TURBO3/2) + b] =
+                        __halves2half2(cn_h[low2_0 | (hi1_0 << 2)], cn_h[low2_1 | (hi1_1 << 2)]);
+                }
+            }
+        } else if constexpr (turbo_type == GGML_TYPE_TURBO2_0) {
+            constexpr int blocks_per_row = D / QK_TURBO2;
+#pragma unroll
+            for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
+                const block_turbo2_0 * blk = (const block_turbo2_0 *)(row_ptr) + blk_idx;
+                const float norm = __half2float(blk->norm);
+                half cn_h[4];
+#pragma unroll
+                for (int c = 0; c < 4; c++)
+                    cn_h[c] = __float2half(d_turbo_centroids_2bit_fattn[c] * norm);
+#pragma unroll
+                for (int b = 0; b < QK_TURBO2/2; ++b) {
+                    const int j0 = b * 2;
+                    const int j1 = j0 + 1;
+                    const uint8_t idx0 = (blk->qs[j0/4] >> ((j0%4)*2)) & 0x3;
+                    const uint8_t idx1 = (blk->qs[j1/4] >> ((j1%4)*2)) & 0x3;
+                    tile[row * stride_tile + blk_idx * (QK_TURBO2/2) + b] =
+                        __halves2half2(cn_h[idx0], cn_h[idx1]);
+                }
+            }
+        } else if constexpr (turbo_type == GGML_TYPE_TURBO3_TCQ) {
+            const float alpha = is_value ? d_tcq_decode_alpha_v_fattn : d_tcq_decode_alpha_k_fattn;
+            constexpr int blocks_per_row = D / QK_TURBO3_TCQ;
+#pragma unroll
+            for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
+                const block_turbo3_tcq * blk = (const block_turbo3_tcq *)(row_ptr) + blk_idx;
+                const float norm = __half2float(blk->norm) * alpha;
+#pragma unroll
+                for (int b = 0; b < QK_TURBO3_TCQ/2; ++b) {
+                    const int t0 = b * 2;
+                    const int t1 = t0 + 1;
+                    const int bp0 = t0 * 3;
+                    const uint16_t raw0 = (uint16_t)blk->qs[bp0/8] | ((uint16_t)blk->qs[bp0/8+1] << 8);
+                    const int state0 = (raw0 >> (bp0%8)) & 0x1FF;
+                    const int bp1 = t1 * 3;
+                    const uint16_t raw1 = (uint16_t)blk->qs[bp1/8] | ((uint16_t)blk->qs[bp1/8+1] << 8);
+                    const int state1 = (raw1 >> (bp1%8)) & 0x1FF;
+                    tile[row * stride_tile + blk_idx * (QK_TURBO3_TCQ/2) + b] =
+                        __halves2half2(__float2half(d_turbo3_tcq_codebook_fattn[state0] * norm),
+                                       __float2half(d_turbo3_tcq_codebook_fattn[state1] * norm));
+                }
+            }
+        } else if constexpr (turbo_type == GGML_TYPE_TURBO2_TCQ) {
+            const float alpha = is_value ? d_tcq_decode_alpha_v_fattn : d_tcq_decode_alpha_k_fattn;
+            constexpr int blocks_per_row = D / QK_TURBO2_TCQ;
+#pragma unroll
+            for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
+                const block_turbo2_tcq * blk = (const block_turbo2_tcq *)(row_ptr) + blk_idx;
+                const float norm = __half2float(blk->norm) * alpha;
+#pragma unroll
+                for (int b = 0; b < QK_TURBO2_TCQ/2; ++b) {
+                    const int t0 = b * 2;
+                    const int t1 = t0 + 1;
+                    const int bp0 = t0 * 2;
+                    const uint16_t raw0 = (uint16_t)blk->qs[bp0/8] | ((uint16_t)blk->qs[bp0/8+1] << 8);
+                    const int state0 = (raw0 >> (bp0%8)) & 0xFF;
+                    const int bp1 = t1 * 2;
+                    const uint16_t raw1 = (uint16_t)blk->qs[bp1/8] | ((uint16_t)blk->qs[bp1/8+1] << 8);
+                    const int state1 = (raw1 >> (bp1%8)) & 0xFF;
+                    tile[row * stride_tile + blk_idx * (QK_TURBO2_TCQ/2) + b] =
+                        __halves2half2(__float2half(d_turbo2_tcq_codebook_fattn[state0] * norm),
+                                       __float2half(d_turbo2_tcq_codebook_fattn[state1] * norm));
+                }
+            }
+        }
+    }
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
     typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ,
@@ -661,10 +772,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     cp_async_wait_all();
                 }
             } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
-                // stride_K is nb11 (byte stride) for turbo; K_h2 reinterpreted as char*
                 const char * K_raw = (const char *)K_h2;
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
                 flash_attn_ext_turbo4_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>(
+                    K_raw + int64_t(k_VKQ_0) * stride_K, tile_K, stride_K, k_VKQ_sup);
+            } else {
+                const char * K_raw = (const char *)K_h2;
+                constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
+                flash_attn_ext_turbo_load_tile<type_K, DKQ, stride_tile_K, nbatch_fa, nthreads_turbo, oob_check, false>(
                     K_raw + int64_t(k_VKQ_0) * stride_K, tile_K, stride_K, k_VKQ_sup);
             }
             __syncthreads();
@@ -1025,6 +1140,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const char * V_raw = (const char *)V_h2;
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
                 flash_attn_ext_turbo4_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>(
+                    V_raw + int64_t(k_VKQ_0) * stride_V, tile_V, stride_V, k_VKQ_sup);
+                __syncthreads();
+            } else {
+                const char * V_raw = (const char *)V_h2;
+                constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
+                flash_attn_ext_turbo_load_tile<type_V, DV, stride_tile_V, nbatch_fa, nthreads_turbo, oob_check, true>(
                     V_raw + int64_t(k_VKQ_0) * stride_V, tile_V, stride_V, k_VKQ_sup);
                 __syncthreads();
             }

@@ -1089,8 +1089,8 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(
     } else { static_assert(std::is_same_v<T, void>, "bad type"); }
 }
 
-// TCQ decode-time V alpha: mirrors d_tcq_decode_alpha_v from fattn.cu
-// When TURBO_TCQ_DECODE_ALPHA_V is set, this is loaded via fattn.cu's load_tcq_decode_alpha_fattn_common()
+// TCQ decode-time alphas: per-compilation-unit copies, set by cudaMemcpyToSymbol before kernel launch
+static __constant__ float d_tcq_decode_alpha_k_fattn = 1.0f;
 static __constant__ float d_tcq_decode_alpha_v_fattn = 1.0f;
 
 // TCQ 3-bit V dequant: 9-bit state → codebook lookup

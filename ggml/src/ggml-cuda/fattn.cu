@@ -1538,14 +1538,46 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
         return true;
     }();
-    const bool turbo4_matched = K->type == GGML_TYPE_TURBO4_0 && V->type == GGML_TYPE_TURBO4_0;
-    if (turbo_mma_fused && turbo4_matched && (Q->ne[0] == 128 || Q->ne[0] == 256) &&
+    const bool turbo_matched = K->type == V->type && turbo_kv;
+    if (turbo_mma_fused && turbo_matched && (Q->ne[0] == 128 || Q->ne[0] == 256) &&
         turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         cudaStream_t stream = ctx.stream();
         int device;
         CUDA_CHECK(cudaGetDevice(&device));
 
-        // Pre-rotate Q: turbo4 K stays in WHT-rotated domain (no inv-FWHT), so Q must be rotated.
+        // Load TCQ codebooks for fused kernel (constant memory used by inline dequant)
+        if (K->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO3_TCQ) {
+            static bool tcq3_fused_loaded[GGML_CUDA_MAX_DEVICES] = {};
+            if (!tcq3_fused_loaded[device]) {
+                tcq3_fused_loaded[device] = true;
+                const char *cb_path = getenv("TURBO_TCQ_CB");
+                if (cb_path) {
+                    float cb[512];
+                    FILE *f = fopen(cb_path, "rb");
+                    if (f && fread(cb, sizeof(float), 512, f) == 512) {
+                        fclose(f);
+                        cudaMemcpyToSymbol(d_turbo3_tcq_codebook_fattn, cb, 512*sizeof(float));
+                    } else { if (f) fclose(f); }
+                }
+            }
+        }
+        if (K->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO2_TCQ) {
+            static bool tcq2_fused_loaded[GGML_CUDA_MAX_DEVICES] = {};
+            if (!tcq2_fused_loaded[device]) {
+                tcq2_fused_loaded[device] = true;
+                const char *cb_path = getenv("TURBO_TCQ_CB2");
+                if (cb_path) {
+                    float cb[256];
+                    FILE *f = fopen(cb_path, "rb");
+                    if (f && fread(cb, sizeof(float), 256, f) == 256) {
+                        fclose(f);
+                        cudaMemcpyToSymbol(d_turbo2_tcq_codebook_fattn, cb, 256*sizeof(float));
+                    } else { if (f) fclose(f); }
+                }
+            }
+        }
+
+        // Pre-rotate Q: all turbo K types stay in WHT-rotated domain, so Q must be rotated.
         ggml_tensor Q_rot_fused;
         ggml_tensor * orig_q_fused = nullptr;
         if (Q->ne[0] % 128 == 0) {
@@ -1564,11 +1596,28 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             dst->src[0] = &Q_rot_fused;
         }
 
-        if (Q->ne[0] == 128) {
-            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst);
-        } else {
-            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst);
+        // TCQ decode alpha for V dequant
+        if (V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ) {
+            load_tcq_decode_alpha(device);
+            if (d_tcq_decode_alpha_v_static == 0.0f) {
+                float alpha = tcq_compute_alpha_v(V->type, V->ne[1]);
+                cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha, sizeof(float));
+            }
         }
+
+#define TURBO_FUSED_DISPATCH(tK, tV) \
+        if (K->type == tK && V->type == tV) { \
+            if (Q->ne[0] == 128) \
+                ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, tK, tV>(ctx, dst); \
+            else \
+                ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, tK, tV>(ctx, dst); \
+        }
+        TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
+        else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
+        else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
+        else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_0)
+        else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO2_0,   GGML_TYPE_TURBO2_0)
+#undef TURBO_FUSED_DISPATCH
 
         if (orig_q_fused) dst->src[0] = orig_q_fused;
         return;
