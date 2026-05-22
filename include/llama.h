@@ -382,6 +382,8 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool no_fused_gdn; // disable fused Gated Delta Net kernels (use decomposed ops)
+        bool logits_all;  // if false, reserve logits buffer for n_seqs outputs only (saves VRAM on big-vocab models);
+                          // set true when per-token logits are needed (e.g. perplexity)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

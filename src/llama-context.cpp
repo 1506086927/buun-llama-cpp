@@ -193,6 +193,7 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.logits_all = params.logits_all;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -620,6 +621,9 @@ void llama_context::sched_reserve() {
     }
 
     // reserve worst-case graph
+    // when logits_all is false, reserve for n_seqs outputs only to save VRAM on big-vocab models
+    const int n_outputs_pp = (cparams.logits_all || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) ? (int)n_tokens : (int)n_seqs;
+
     int n_splits_pp = -1;
     int n_nodes_pp  = -1;
 
@@ -664,7 +668,7 @@ void llama_context::sched_reserve() {
     {
         // TODO: not sure if the following graph would be worst case for multi-stream KV caches:
         //
-        // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
+        // auto * gf = graph_reserve(n_tokens, 1, n_outputs_pp, mctx.get());
         //
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
@@ -826,9 +830,8 @@ bool llama_context::memory_update(bool optimize) {
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-        const bool     reserve_all_outputs = cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
+        const bool     reserve_all_outputs = cparams.logits_all || cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
         const uint32_t n_outputs_pp        = reserve_all_outputs ? n_tokens : n_seqs;
-
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
@@ -3280,6 +3283,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
+
+            if (!cparams.logits_all && !warned_logits_all && n_outputs > (int32_t)cparams.n_seq_max) {
+                warned_logits_all = true;
+                LLAMA_LOG_WARN("%s: --no-logits-all is set but batch requested %d outputs (> n_seq_max = %d); "
+                               "consider removing --no-logits-all for this workload\n",
+                               __func__, n_outputs, cparams.n_seq_max);
+            }
         }
 
         ggml_status status;
@@ -4889,6 +4899,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.no_fused_gdn               =*/ false,
+        /*.logits_all                  =*/ true,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.dflash_n_slots              =*/ 1,
