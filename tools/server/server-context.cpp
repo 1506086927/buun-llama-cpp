@@ -12,6 +12,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "fit.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -745,6 +746,10 @@ private:
 
     bool sleeping = false;
 
+    // MTP↔mmproj GPU swap state
+    bool mmproj_gpu_swap = false;
+    bool mmproj_is_on_gpu = false;
+
     void destroy() {
         llama_init.reset();
 
@@ -764,6 +769,94 @@ private:
 
 
         llama_batch_free(batch);
+    }
+
+    mtmd_context_params make_mmproj_params(bool use_gpu) const {
+        mtmd_context_params mparams = mtmd_context_params_default();
+        mparams.use_gpu          = use_gpu;
+        mparams.print_timings    = false;
+        mparams.n_threads        = params_base.cpuparams.n_threads;
+        mparams.flash_attn_type  = params_base.flash_attn_type;
+        mparams.warmup           = use_gpu; // only warmup when on GPU
+        mparams.image_min_tokens = params_base.image_min_tokens;
+        mparams.image_max_tokens = params_base.image_max_tokens;
+        mparams.media_marker     = get_media_marker();
+        return mparams;
+    }
+
+    void reload_mmproj(bool use_gpu) {
+        mtmd_free(mctx);
+        mctx = nullptr;
+        auto mparams = make_mmproj_params(use_gpu);
+        mctx = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, mparams);
+        for (server_slot & slot : slots) {
+            slot.mctx = mctx;
+        }
+    }
+
+    llama_context * create_mtp_context() {
+        auto cparams = common_context_params_to_llama(params_base);
+        cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.n_rs_seq = 0;
+        return llama_init_from_model(model_tgt, cparams);
+    }
+
+    void swap_mtp_to_mmproj_gpu() {
+        SRV_INF("%s", "swapping MTP out, loading mmproj to GPU...\n");
+        int64_t t0 = ggml_time_us();
+
+        for (server_slot & slot : slots) {
+            slot.spec.reset();
+            slot.spec_shared = nullptr;
+        }
+        spec.reset();
+
+        ctx_dft.reset();
+        params_base.speculative.draft.ctx_dft = nullptr;
+
+        reload_mmproj(true);
+        if (!mctx) {
+            SRV_ERR("%s", "failed to load mmproj to GPU, falling back to CPU\n");
+            reload_mmproj(false);
+        } else {
+            mmproj_is_on_gpu = true;
+        }
+
+        SRV_INF("MTP→mmproj swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
+    }
+
+    void swap_mmproj_to_mtp() {
+        SRV_INF("%s", "unloading mmproj from GPU, recreating MTP...\n");
+        int64_t t0 = ggml_time_us();
+
+        mmproj_is_on_gpu = false;
+        reload_mmproj(false);
+
+        ctx_dft.reset(create_mtp_context());
+        if (!ctx_dft) {
+            SRV_ERR("%s", "failed to recreate MTP context after mmproj swap\n");
+            return;
+        }
+
+        ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+        params_base.speculative.draft.ctx_tgt = ctx_tgt;
+        params_base.speculative.draft.ctx_dft = ctx_dft.get();
+
+        try {
+            spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to reinit speculative context: %s\n", e.what());
+        }
+
+        for (server_slot & slot : slots) {
+            slot.ctx_dft = ctx_dft.get();
+            if (spec) {
+                slot.spec_shared = spec.get();
+                common_speculative_set_seq_id(slot.get_spec(), slot.id);
+            }
+        }
+
+        SRV_INF("mmproj→MTP swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -842,10 +935,60 @@ private:
         // Expanded back to 2*n_parallel before first speculative draft.
         n_parallel_user = params_base.n_parallel;
         recurrent_expanded = true;
+
+        // When mmproj GPU swap is active and context is auto-sized, run the fitter
+        // BEFORE doubling n_parallel. The doubled n_parallel inflates recurrent state
+        // estimates, causing the fitter to think even minimum context doesn't fit.
+        // Running with the real n_parallel lets it correctly size the context.
+        const bool has_mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+        if (params_base.mmproj_gpu_swap && has_mtp
+                && !params_base.mmproj.path.empty()
+                && params_base.fit_params && params_base.n_ctx == 0) {
+            std::error_code ec;
+            const auto fsize = std::filesystem::file_size(params_base.mmproj.path, ec);
+            if (!ec && fsize > 0) {
+                const size_t mmproj_gpu_estimate = fsize + 256ull * 1024 * 1024;
+                for (auto & margin : params_base.fit_params_target) {
+                    if (margin < mmproj_gpu_estimate) {
+                        margin = mmproj_gpu_estimate;
+                    }
+                }
+            }
+
+            auto mparams_fit = common_model_params_to_llama(params_base);
+            auto cparams_fit = common_context_params_to_llama(params_base);
+
+            SRV_INF("mmproj GPU swap: running auto-fit with n_parallel=%d, margin=%zu MiB\n",
+                    params_base.n_parallel, params_base.fit_params_target[0] / (1024 * 1024));
+
+            common_fit_params(params_base.model.path.c_str(), &mparams_fit, &cparams_fit,
+                params_base.tensor_split,
+                params_base.tensor_buft_overrides.data(),
+                params_base.fit_params_target.data(),
+                params_base.fit_params_min_ctx,
+                params_base.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+            if (cparams_fit.n_ctx > 0) {
+                params_base.n_ctx = cparams_fit.n_ctx;
+                SRV_INF("mmproj GPU swap: auto-fit chose n_ctx = %u\n", cparams_fit.n_ctx);
+            }
+            params_base.fit_params = false;
+        }
+
         if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_NONE || params_base.speculative.has_dft()) {
             params_base.n_parallel = n_parallel_user * 2;
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
+
+            // The n_parallel doubling is only for spec decode backup sequences.
+            // With unified KV, both sequences share the same KV cells (backup
+            // uses seq_id bitmask, no extra memory). Non-unified splits the KV
+            // cache into separate streams, halving per-slot context for no benefit
+            // when the extra sequences are just transient backups.
+            if (!params_base.kv_unified && n_parallel_user == 1) {
+                params_base.kv_unified = true;
+                SRV_INF("%s", "auto-enabled kv-unified: spec decode backup doesn't need separate KV stream\n");
+            }
         }
 
         llama_init = common_init_from_params(params_base);
@@ -927,9 +1070,7 @@ private:
             }
 
             // Upstream MTP: create draft context from target model's MTP heads
-            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                            params_base.speculative.types.end(),
-                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+            const bool spec_mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
             if (spec_mtp && params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
                 auto cparams = common_context_params_to_llama(params_dft);
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -939,16 +1080,11 @@ private:
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft.get();
             }
-        } else if (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
-                             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()) {
+        } else if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
             SRV_INF("creating MTP draft context against the target model '%s'\n",
                     params_base.model.path.c_str());
 
-            auto cparams_mtp = common_context_params_to_llama(params_base);
-            cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-            cparams_mtp.n_rs_seq = 0;
-
-            ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
+            ctx_dft.reset(create_mtp_context());
             if (ctx_dft == nullptr) {
                 SRV_ERR("%s", "failed to create MTP context\n");
                 return false;
@@ -960,25 +1096,27 @@ private:
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
         }
 
-        std::string & mmproj_path = params_base.mmproj.path;
+        const std::string & mmproj_path = params_base.mmproj.path;
         if (!mmproj_path.empty()) {
-            mtmd_context_params mparams = mtmd_context_params_default();
+            mmproj_gpu_swap = params_base.mmproj_gpu_swap && ctx_dft && !model_dft;
 
-            mparams.use_gpu          = params_base.mmproj_use_gpu;
-            mparams.print_timings    = false;
-            mparams.n_threads        = params_base.cpuparams.n_threads;
-            mparams.flash_attn_type  = params_base.flash_attn_type;
-            mparams.warmup           = params_base.warmup;
-            mparams.image_min_tokens = params_base.image_min_tokens;
-            mparams.image_max_tokens = params_base.image_max_tokens;
-            mparams.media_marker     = get_media_marker();
+            const bool use_gpu = mmproj_gpu_swap ? false : params_base.mmproj_use_gpu;
+            auto mparams = make_mmproj_params(use_gpu);
+            if (!mmproj_gpu_swap) {
+                mparams.warmup = params_base.warmup;
+            }
 
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
             if (mctx == nullptr) {
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                 return false;
             }
-            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            if (mmproj_gpu_swap) {
+                SRV_INF("loaded multimodal model on CPU (GPU swap enabled), '%s'\n", mmproj_path.c_str());
+            } else {
+                SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            }
 
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
@@ -2704,7 +2842,6 @@ private:
                 } else {
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
                     const auto & params_spec = slot.task->params.speculative;
-                    // Pass actual position (accounts for image tokens in M-RoPE) instead of text token count.
                     const llama_pos n_past = slot.prompt.tokens.pos_next();
                     draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, n_past);
                 }
@@ -3165,6 +3302,15 @@ private:
 
                     bool has_mtmd = false;
 
+                    // swap MTP out of VRAM so mmproj can use GPU for image encoding
+                    const bool needs_mmproj_swap = mmproj_gpu_swap && !mmproj_is_on_gpu
+                        && slot.prompt.n_tokens() < slot.task->n_tokens()
+                        && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL;
+
+                    if (needs_mmproj_swap) {
+                        swap_mtp_to_mmproj_gpu();
+                    }
+
                     // check if we should process the image
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
@@ -3196,6 +3342,10 @@ private:
                         }
 
                         has_mtmd = true;
+                    }
+
+                    if (needs_mmproj_swap && mmproj_is_on_gpu) {
+                        swap_mmproj_to_mtp();
                     }
 
                     // add prompt tokens for processing in the current batch

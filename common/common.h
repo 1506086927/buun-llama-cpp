@@ -395,6 +395,10 @@ struct common_params_speculative {
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
     }
 
+    bool has_type(common_speculative_type t) const {
+        return std::find(types.begin(), types.end(), t) != types.end();
+    }
+
     // fork: single-type compat helper (most fork code checks one type at a time)
     common_speculative_type type() const {
         if (types.empty() || (types.size() == 1 && types[0] == COMMON_SPECULATIVE_TYPE_NONE)) {
@@ -408,11 +412,7 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
-        });
-
-        return needs_rs_seq ? draft.n_max : 0u;
+        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ? draft.n_max : 0u;
     }
 };
 
@@ -619,6 +619,7 @@ struct common_params {
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;     // use GPU for multimodal model
+    bool mmproj_gpu_swap = false;   // swap MTP↔mmproj VRAM on vision requests
     bool no_mmproj = false;         // explicitly disable multimodal model
     std::vector<std::string> image; // path to image file(s)
     int image_min_tokens = -1;

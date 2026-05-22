@@ -2768,16 +2768,12 @@ common_speculative * common_speculative_init(
         ctx_dft = common_speculative_create_ctx_dft(params);
     }
 
-    auto has_type = [&](common_speculative_type t) {
-        return std::find(params.types.begin(), params.types.end(), t) != params.types.end();
-    };
-
     std::vector<common_speculative_config> configs = {};
     {
-        bool has_suffix   = has_type(COMMON_SPECULATIVE_TYPE_SUFFIX);
-        bool has_copyspec = has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC);
-        bool has_recycle  = has_type(COMMON_SPECULATIVE_TYPE_RECYCLE);
-        bool has_dflash   = has_type(COMMON_SPECULATIVE_TYPE_DFLASH);
+        bool has_suffix   = params.has_type(COMMON_SPECULATIVE_TYPE_SUFFIX);
+        bool has_copyspec = params.has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC);
+        bool has_recycle  = params.has_type(COMMON_SPECULATIVE_TYPE_RECYCLE);
+        bool has_dflash   = params.has_type(COMMON_SPECULATIVE_TYPE_DFLASH);
 
         if (has_copyspec) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_COPYSPEC, params));
@@ -2918,9 +2914,7 @@ llama_tokens common_speculative_draft(
     auto & dp = spec->dparams[0];
     dp.drafting = true;
     dp.n_max    = params.n_max;
-    // Use explicit n_past when provided (needed for vision tokens where
-    // actual positions exceed text token count due to M-RoPE spatial dims).
-    // Fall back to prompt_tgt.size() for text-only prompts.
+    // M-RoPE: actual positions may exceed text token count due to image spatial dims
     dp.n_past   = n_past_override >= 0 ? n_past_override : (llama_pos)prompt_tgt.size();
     dp.id_last  = id_last;
     dp.prompt   = &prompt_tgt;
