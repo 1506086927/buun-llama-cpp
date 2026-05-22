@@ -572,13 +572,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
-    auto handle_reshape = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+    auto handle_reshape = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool allow_permuted_src = false) -> ggml_backend_meta_split_state {
         switch (src_ss[0].axis) {
             case GGML_BACKEND_SPLIT_AXIS_0:
             case GGML_BACKEND_SPLIT_AXIS_1:
             case GGML_BACKEND_SPLIT_AXIS_2:
             case GGML_BACKEND_SPLIT_AXIS_3: {
-                GGML_ASSERT(!ggml_is_permuted(tensor) && !ggml_is_permuted(tensor->src[0]));
+                GGML_ASSERT(!ggml_is_permuted(tensor));
+                if (!allow_permuted_src) {
+                    GGML_ASSERT(!ggml_is_permuted(tensor->src[0]));
+                }
                 if (src_ss[0].axis == ggml_n_dims(tensor->src[0]) - 1) {
                     return {ggml_backend_meta_split_axis(ggml_n_dims(tensor) - 1), {0}, 1};
                 }
@@ -860,7 +863,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             case GGML_OP_CPY: {
                 split_state = handle_cpy(src_ss);
             } break;
-            case GGML_OP_CONT:
+            case GGML_OP_CONT: {
+                split_state = handle_reshape(src_ss, /*allow_permuted_src=*/ true);
+            } break;
             case GGML_OP_RESHAPE: {
                 split_state = handle_reshape(src_ss);
             } break;
