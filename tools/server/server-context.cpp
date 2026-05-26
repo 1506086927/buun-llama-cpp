@@ -825,8 +825,10 @@ private:
         }
         spec.reset();
 
-        ctx_dft.reset();
-        params_base.speculative.draft.ctx_dft = nullptr;
+        if (ctx_dft) {
+            ctx_dft.reset();
+            params_base.speculative.draft.ctx_dft = nullptr;
+        }
 
         reload_mmproj(true);
         if (!mctx) {
@@ -836,41 +838,47 @@ private:
             mmproj_is_on_gpu = true;
         }
 
-        SRV_INF("MTP→mmproj swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
+        SRV_INF("swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
     }
 
     void swap_mmproj_to_mtp() {
-        SRV_INF("%s", "unloading mmproj from GPU, recreating MTP...\n");
+        SRV_INF("%s", "unloading mmproj from GPU, restoring prior state...\n");
         int64_t t0 = ggml_time_us();
 
         mmproj_is_on_gpu = false;
         reload_mmproj(false);
 
-        ctx_dft.reset(create_mtp_context());
-        if (!ctx_dft) {
-            SRV_ERR("%s", "failed to recreate MTP context after mmproj swap\n");
-            return;
-        }
-
-        ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
-        params_base.speculative.draft.ctx_tgt = ctx_tgt;
-        params_base.speculative.draft.ctx_dft = ctx_dft.get();
-
-        try {
-            spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
-        } catch (const std::exception & e) {
-            SRV_ERR("failed to reinit speculative context: %s\n", e.what());
-        }
-
-        for (server_slot & slot : slots) {
-            slot.ctx_dft = ctx_dft.get();
-            if (spec) {
-                slot.spec_shared = spec.get();
-                common_speculative_set_seq_id(slot.get_spec(), slot.id);
+        if (ctx_dft) {
+            // Already had MTP before the swap — recreate it
+            ctx_dft.reset(create_mtp_context());
+            if (!ctx_dft) {
+                SRV_ERR("%s", "failed to recreate MTP context after mmproj swap\n");
+                return;
             }
+
+            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = ctx_dft.get();
+
+            try {
+                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to reinit speculative context: %s\n", e.what());
+            }
+
+            for (server_slot & slot : slots) {
+                slot.ctx_dft = ctx_dft.get();
+                if (spec) {
+                    slot.spec_shared = spec.get();
+                    common_speculative_set_seq_id(slot.get_spec(), slot.id);
+                }
+            }
+        } else {
+            // No MTP was active — mmproj stays on CPU until next image arrives
+            SRV_INF("%s", "(no MTP to restore, mmproj will reload on next image)\n");
         }
 
-        SRV_INF("mmproj→MTP swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
+        SRV_INF("swap done in %" PRId64 " ms\n", (ggml_time_us() - t0) / 1000);
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -946,8 +954,9 @@ private:
         const bool has_mmproj = !mmproj_path.empty();
 
         // measure mmproj memory for auto-fit (upstream #21489)
-        // skip when mmproj_gpu_swap: mmproj starts on CPU, swap path handles GPU margin separately
-        if (has_mmproj && params_base.fit_params && !params_base.mmproj_gpu_swap) {
+        // Only reserve mmproj space when auto-fit is actively selecting context size.
+        // When -c is explicit, the fitter doesn't run so there's no need to reserve.
+        if (has_mmproj && params_base.fit_params && params_base.n_ctx == 0 && !params_base.mmproj_gpu_swap) {
             auto mparams_measure = make_mmproj_params(params_base.mmproj_use_gpu);
             auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_measure);
             if (!mmproj_mem.empty()) {
@@ -1097,15 +1106,19 @@ private:
             params_base.fit_params = false;
         }
 
-        if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_NONE || params_base.speculative.has_dft()) {
+        // Always enable kv_unified for single-slot servers — simplifies CUDA graph topology,
+        // giving ~28% faster prompt eval even without speculative decoding.
+        if (n_parallel_user == 1 && !params_base.kv_unified) {
+            params_base.kv_unified = true;
+            SRV_INF("%s", "auto-enabled kv-unified: single-slot server doesn't need separate KV stream\n");
+        }
+
+        // Double n_parallel only when actual speculative decoding is active
+        // (external draft model or MTP), not for phantom --spec-type draft without -md.
+        if (params_base.speculative.has_dft() || params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
             params_base.n_parallel = n_parallel_user * 2;
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
-
-            if (!params_base.kv_unified && n_parallel_user == 1) {
-                params_base.kv_unified = true;
-                SRV_INF("%s", "auto-enabled kv-unified: spec decode backup doesn't need separate KV stream\n");
-            }
         }
 
         llama_init = common_init_from_params(params_base);
@@ -1218,7 +1231,10 @@ private:
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
-            mmproj_gpu_swap = params_base.mmproj_gpu_swap && ctx_dft && !model_dft;
+            mmproj_gpu_swap = params_base.mmproj_gpu_swap && !model_dft;
+            // Note: ctx_dft is NOT required here. Without MTP, the swap simply
+            // keeps mmproj on CPU until an image arrives, loads it to GPU for
+            // encoding, then moves it back. No MTP state to swap out.
 
             const bool use_gpu = mmproj_gpu_swap ? false : params_base.mmproj_use_gpu;
             auto mparams = make_mmproj_params(use_gpu);
