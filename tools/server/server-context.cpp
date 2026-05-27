@@ -1044,9 +1044,11 @@ private:
                         total += bytes;
                         for (size_t i = 0; i < tgt_devices.size(); i++) {
                             if (tgt_devices[i] == devs[j]) {
-                                SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
-                                        bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
-                                params_base.fit_params_target[i] += bytes;
+                                if (bytes > params_base.fit_params_target[i]) {
+                                    SRV_DBG("[spec] raising fit_params_target to %.2f MiB for device %s\n",
+                                            bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
+                                    params_base.fit_params_target[i] = bytes;
+                                }
                                 break;
                             }
                         }
