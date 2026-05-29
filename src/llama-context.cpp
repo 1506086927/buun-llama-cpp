@@ -622,16 +622,14 @@ void llama_context::sched_reserve() {
 
     // reserve worst-case graph
     // when logits_all is false, reserve for n_seqs outputs only to save VRAM on big-vocab models
-    const int n_outputs_pp = (cparams.logits_all || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) ? (int)n_tokens : (int)n_seqs;
+    const bool     reserve_all_outputs = cparams.logits_all || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
+    const int n_outputs_pp = reserve_all_outputs ? (int)n_tokens : (int)n_seqs;
 
     int n_splits_pp = -1;
     int n_nodes_pp  = -1;
 
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
-
-    const bool     reserve_all_outputs = cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
-    const uint32_t n_outputs_pp        = reserve_all_outputs ? n_tokens : n_seqs;
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
