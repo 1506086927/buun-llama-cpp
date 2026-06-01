@@ -938,6 +938,11 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
 
     const bool turbo_k = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ;
     const bool turbo_v = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ;
+    // Mixed (asymmetric) K/V: a q8_0 side must be dequanted to f16 here too, otherwise the raw
+    // q8_0 bytes are handed to the f16-only MMA kernel below and read as f16 → garbage. f16 sides
+    // need no conversion (already f16). This is the prefill mirror of the decode dequant path.
+    const bool q8_k = K->type == GGML_TYPE_Q8_0;
+    const bool q8_v = V->type == GGML_TYPE_Q8_0;
 
     int device;
     CUDA_CHECK(cudaGetDevice(&device));
@@ -945,8 +950,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     half * k_fp16 = nullptr;
     half * v_fp16 = nullptr;
 
-    // Allocate and dequant K to fp16 (turbo2, turbo3, or turbo4)
-    if (turbo_k) {
+    // Allocate and dequant K to fp16 (turbo2/3/4 or q8_0)
+    if (turbo_k || q8_k) {
         // Size for full cache (kv_size from root) so we never realloc mid-session.
         const ggml_tensor * k_root = K;
         while (k_root->view_src) k_root = k_root->view_src;
@@ -1008,15 +1013,20 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             }
             k_turbo2_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
-        } else {
+        } else if (K->type == GGML_TYPE_TURBO4_0) {
             // turbo4 K: inverse FWHT dequant → produces K in original domain (no Q rotation needed)
             k_turbo4_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+        } else {
+            // q8_0 K (mixed K/V): plain dequant to f16 in original (unrotated) domain. Q stays
+            // unrotated (turbo_k is false → the Q-rotation block below is skipped).
+            k_q8_0_dequant_f16_tkhe<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         }
     }
 
-    // Allocate and dequant V to fp16 (turbo2, turbo3, or turbo4)
-    if (turbo_v) {
+    // Allocate and dequant V to fp16 (turbo2/3/4 or q8_0)
+    if (turbo_v || q8_v) {
         // Size for full cache (kv_size from root) so we never realloc mid-session.
         const ggml_tensor * v_root = V;
         while (v_root->view_src) v_root = v_root->view_src;
@@ -1078,8 +1088,14 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             }
             k_turbo2_tcq_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]));
-        } else {
+        } else if (V->type == GGML_TYPE_TURBO4_0) {
             k_turbo4_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+        } else {
+            // q8_0 V (mixed K/V): plain dequant to f16 in original domain. q8_0 V is not rotated,
+            // and the graph-level inverse WHT is gated on V being a turbo type (llama-graph.cpp),
+            // so no spurious un-rotation is applied here.
+            k_q8_0_dequant_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
         }
     }
@@ -1373,8 +1389,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
-        return BEST_FATTN_KERNEL_NONE;
+    {
+        auto is_turbo_type = [](ggml_type t) {
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+                   t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
+        };
+        // Asymmetric turbo K/V (e.g. q8_0 K + turbo4 V) is handled by the turbo dequant-to-f16
+        // FA paths (ggml_cuda_turbo_prefill_attend for prefill, do_decode_dequant for decode).
+        // Without this exemption the upstream K!=V guard reports FA unsupported, so llama.cpp
+        // falls back to the non-FA attention path, which mishandles turbo4 V (garbage output).
+        if (K->type != V->type && !is_turbo_type(K->type) && !is_turbo_type(V->type)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
@@ -1709,8 +1735,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         CUDA_CHECK(cudaGetDevice(&device_dec));
 
         if (do_decode_dequant) {
-            const bool k_needs_dequant = turbo_k_only || (K->type == GGML_TYPE_Q8_0 && Q->ne[0] > 256);
-            const bool v_needs_dequant = turbo_v_only || (V->type == GGML_TYPE_Q8_0 && Q->ne[0] > 256);
+            // Mixed q8_0 + turbo: when one side is turbo (dequanted to f16) and the other is
+            // q8_0, the FA kernel gets a (Q8_0, F16) pair, which produces garbage at D<=256
+            // (no correct mixed VEC combo). Dequant the q8_0 side to f16 too so the pair is
+            // (F16, F16) — matching the symmetric turbo path that goes through the same f16 FA.
+            const bool k_needs_dequant = turbo_k_only || (K->type == GGML_TYPE_Q8_0 && (Q->ne[0] > 256 || turbo_v_only));
+            const bool v_needs_dequant = turbo_v_only || (V->type == GGML_TYPE_Q8_0 && (Q->ne[0] > 256 || turbo_k_only));
             if (k_needs_dequant) {
                 // Size the dequant buffer for the FULL cache (kv_size from the underlying root
                 // tensor), not just the current n_kv. This prevents per-token reallocations as
