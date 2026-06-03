@@ -1661,7 +1661,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return true;
     }();
     const bool turbo_matched = K->type == V->type && turbo_kv;
-    if (turbo_mma_fused && turbo_matched && Q->ne[1] <= 4 &&
+    // Asymmetric fused "q6 sweet spot" (6.124 bpw): turbo8 K + turbo4 V. Only this pair is
+    // instantiated, and only at D=256 (dense Qwen geometry). Both stay WHT-rotated like the
+    // matched path (Q pre-rotated below, V un-rotated at graph level).
+    const bool turbo_fused_asym = K->type == GGML_TYPE_TURBO8_0 && V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256;
+    if (turbo_mma_fused && (turbo_matched || turbo_fused_asym) && Q->ne[1] <= 4 &&
         (Q->ne[0] == 128 || Q->ne[0] == 256) &&
         turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         cudaStream_t stream = ctx.stream();
@@ -1735,7 +1739,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             else \
                 ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, tK, tV>(ctx, dst); \
         }
-        TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
+        // Asymmetric "q6 sweet spot" (6.124 bpw): turbo8 K + turbo4 V, D=256 only (no D=128 instance).
+        if (K->type == GGML_TYPE_TURBO8_0 && V->type == GGML_TYPE_TURBO4_0) {
+            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO8_0, GGML_TYPE_TURBO4_0>(ctx, dst);
+        }
+        else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
