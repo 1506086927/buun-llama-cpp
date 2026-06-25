@@ -89,15 +89,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
         static bool cb2_loaded = false;
         if (!cb2_loaded) {
             cb2_loaded = true;
-            const char * cb_path = getenv("TURBO_TCQ_CB2");
-            if (cb_path) {
-                float cb[256];
-                FILE * f = fopen(cb_path, "rb");
-                if (f && fread(cb, sizeof(float), 256, f) == 256) {
-                    fclose(f);
-                    CUDA_CHECK(cudaMemcpyToSymbol(d_turbo2_tcq_codebook_fattn, cb, 256 * sizeof(float)));
-                } else { if (f) fclose(f); }
-            }
+            turbo2_tcq_load_kv_decode();
         }
     }
     if constexpr (type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ ||
@@ -121,9 +113,9 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
         if (alpha_v_static > 0.0f) {
             alpha_v = alpha_v_static;
         } else if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
-            alpha_v = fmaxf(0.98f, fminf(1.06f, 1.1484f - 0.01443f * ln_ctx));
+            alpha_v = 1.02f;  // flat optimum for the coord-descent codebook (K=iter374/V=iter500)
         } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
-            alpha_v = fmaxf(1.00f, fminf(1.12f, 0.8865f + 0.0195f * ln_ctx));
+            alpha_v = 1.06f;  // flat optimum for the coord-descent codebook (K=iter195/V=iter208)
         }
         CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha_v, sizeof(float)));
 

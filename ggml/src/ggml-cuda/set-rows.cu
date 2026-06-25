@@ -164,7 +164,8 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
                                         const uint3   ne01,
                                         const uint3   ne02,
                                         const uint3   ne11_fd,
-                                        const uint3   ne12_fd) {
+                                        const uint3   ne12_fd,
+                                        const float * __restrict__ kmean_mu) {
     const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
 
     if (i >= ne_total) {
@@ -200,7 +201,16 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
     const float * src_block = src0_row + i00;
     block_type * dst_block = dst_row_ptr + i00 / qk;
 
-    quantize_func(src_block, dst_block);
+    // Affine tap: raw-domain per-head mean subtract before the block quantizer's normalize+FWHT.
+    // kmean_mu != nullptr only for turbo4/turbo8 dispatches (null for standard quants → no-op).
+    if (kmean_mu != nullptr) {
+        float tapped[qk];
+        #pragma unroll
+        for (int j = 0; j < qk; j++) tapped[j] = src_block[j] - kmean_mu[i00 + j];
+        quantize_func(tapped, dst_block);
+    } else {
+        quantize_func(src_block, dst_block);
+    }
 
     GGML_UNUSED(ne10);
     GGML_UNUSED(ne11);
@@ -217,7 +227,7 @@ static void set_rows_cuda_quant(
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream, const float * kmean_mu = nullptr) {
 
     GGML_ASSERT(ne00 % qk == 0);
     const int64_t ne_total = (ne00 * ne01 * ne02 * ne03) / qk;
@@ -244,8 +254,20 @@ static void set_rows_cuda_quant(
 
         k_set_rows_quant<idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
-            ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+            ne01_fd, ne02_fd, ne11_fd, ne12_fd, kmean_mu);
     }
+}
+
+// Affine-tap mean vector for a turbo4/turbo8 set_rows dst (per-layer slice of the K or V mean
+// table, selected by cache_k_/cache_v_ name). Returns nullptr (no tap) unless the dst is a
+// cache_{k,v}_l<N> tensor within table bounds AND a mean table is loaded (TURBO_KMEAN/VMEAN_SUB).
+static inline const float * turbo_tap_mu(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, int64_t ne00) {
+    if (strncmp(dst->name, "cache_k_l", 9) != 0 && strncmp(dst->name, "cache_v_l", 9) != 0) return nullptr;
+    const int pf_layer = atoi(dst->name + 9);
+    if (pf_layer < 0 || pf_layer >= PFHEAD_MAX_L || ne00 > PFHEAD_MAX_C) return nullptr;
+    const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
+    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device) : turbo_vmean_table_enc(ctx.device);
+    return tbl ? tbl + (size_t) pf_layer * PFHEAD_MAX_C : nullptr;
 }
 
 template <typename src_t, typename idx_t, typename dst_t>
@@ -771,23 +793,26 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         set_rows_cuda_quant<idx_t, block_turbo4_0, QK_TURBO4, quantize_f32_turbo4_0_block>(
             src0_d, src1_d, (block_turbo4_0*)dst->data,
             ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
-            nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream, turbo_tap_mu(ctx, dst, ne00));
     } else if (dst->type == GGML_TYPE_TURBO8_0) {
         set_rows_cuda_quant<idx_t, block_turbo8_0, QK_TURBO8, quantize_f32_turbo8_0_block>(
             src0_d, src1_d, (block_turbo8_0*)dst->data,
             ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
-            nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream, turbo_tap_mu(ctx, dst, ne00));
     } else if (dst->type == GGML_TYPE_TURBO3_TCQ) {
         GGML_ASSERT(ne00 % QK_TURBO3_TCQ == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO3_TCQ;
         // Runtime codebook loading: TURBO_TCQ_CB overrides compiled-in codebook (per-device)
         {
             static bool tcq_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
-            if (!tcq_cb_loaded[ctx.device]) {
-                tcq_cb_loaded[ctx.device] = true;
-                turbo_tcq_load_kv_encode();
-                load_tcq_norm_alpha(ctx.device);
-                init_tcq_error_dump(ctx.device);
+            static int tcq_hot_e = -1; if (tcq_hot_e < 0) tcq_hot_e = getenv("TURBO_TCQ_HOTSWAP") ? 1 : 0;
+            if (!tcq_cb_loaded[ctx.device] || tcq_hot_e) {
+                turbo_tcq_load_kv_encode();                 // self-gates on mtime under hotswap
+                if (!tcq_cb_loaded[ctx.device]) {
+                    tcq_cb_loaded[ctx.device] = true;
+                    load_tcq_norm_alpha(ctx.device);
+                    init_tcq_error_dump(ctx.device);
+                }
             }
         }
         // TCQ Viterbi encode: 512 threads per block. The TCQ3 backtrace stores
@@ -842,26 +867,18 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     } else if (dst->type == GGML_TYPE_TURBO2_TCQ) {
         GGML_ASSERT(ne00 % QK_TURBO2_TCQ == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO2_TCQ;
-        // Runtime codebook loading: TURBO_TCQ_CB2 overrides compiled-in 2-bit codebook (per-device)
+        // Runtime codebook loading: TURBO_TCQ_CB_K/_V (?? TURBO_TCQ_CB) override the compiled-in
+        // 2-bit K/V codebooks (per-device). V defaults to a copy of the compiled-in K book.
         {
             static bool tcq2_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
-            if (!tcq2_cb_loaded[ctx.device]) {
-                tcq2_cb_loaded[ctx.device] = true;
-                const char *cb_path = getenv("TURBO_TCQ_CB2");
-                if (cb_path) {
-                    float cb[256];
-                    FILE *f = fopen(cb_path, "rb");
-                    if (f && fread(cb, sizeof(float), 256, f) == 256) {
-                        fclose(f);
-                        cudaMemcpyToSymbol(d_turbo2_tcq_codebook, cb, 256*sizeof(float));
-                        fprintf(stderr, "TCQ2 encode: loaded 2-bit codebook from %s (device %d)\n", cb_path, ctx.device);
-                    } else {
-                        if (f) fclose(f);
-                        fprintf(stderr, "TCQ2 encode: FAILED to load codebook from %s\n", cb_path);
-                    }
+            static int tcq2_hot_e = -1; if (tcq2_hot_e < 0) tcq2_hot_e = getenv("TURBO_TCQ_HOTSWAP") ? 1 : 0;
+            if (!tcq2_cb_loaded[ctx.device] || tcq2_hot_e) {
+                turbo2_tcq_load_kv_encode();                // self-gates on mtime under hotswap
+                if (!tcq2_cb_loaded[ctx.device]) {
+                    tcq2_cb_loaded[ctx.device] = true;
+                    load_tcq_norm_alpha(ctx.device);
+                    init_tcq_error_dump(ctx.device);
                 }
-                load_tcq_norm_alpha(ctx.device);
-                init_tcq_error_dump(ctx.device);
             }
         }
         // 2-bit TCQ Viterbi encode: 256 threads per block. Compressed backtrace
@@ -896,10 +913,18 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
             const int shared_bytes = tcq2_use_shared_bt[ctx.device] ? tcq2_bt_shared_bytes : 0;
+            const float * kvmean_mu = nullptr;
+            if (strncmp(dst->name, "cache_k_l", 9) == 0 || strncmp(dst->name, "cache_v_l", 9) == 0) {
+                const int pf_layer = atoi(dst->name + 9);
+                if (pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
+                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device) : turbo_vmean_table_enc(ctx.device);
+                    if (tbl) kvmean_mu = tbl + (size_t) pf_layer * PFHEAD_MAX_C;
+                }
+            }
             k_set_rows_turbo2_tcq<idx_t><<<(int)ne_total_groups, 256, shared_bytes, stream>>>(
                 src0_d, src1_d, (block_turbo2_tcq *)dst->data,
                 ne_total_groups, tcq_bt_buf[ctx.device], tcq2_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
-                s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
+                s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, kvmean_mu, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }
     } else {
