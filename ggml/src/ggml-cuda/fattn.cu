@@ -8,6 +8,42 @@
 #include "fattn.cuh"
 
 #include <atomic>
+#include <sys/stat.h>
+#include <vector>
+
+#include "turbo1_cq_codebook.h"   // macro TURBO1_CQ_CB_INIT (256x8 codebook)
+static __constant__ float d_turbo1_cq_cb_fattn[256*8] = TURBO1_CQ_CB_INIT;
+
+// turbo1_nsn per-chunk per-head centering buffer (defined in set-rows.cu) + table dims.
+extern float * turbo1_nsn_o_buf(int device, int is_k);
+#ifndef PFHEAD_MAX_L
+#define PFHEAD_MAX_L 128
+#define PFHEAD_MAX_C 2048
+#endif
+
+// E6 subtractive dither (decode side). MUST match set-rows.cu encode exactly (same TPDF, same
+// block-address seed). Constants set once from TURBO1_DITHER env.
+static __constant__ int   d_turbo1_dither_fattn;
+static __constant__ float d_turbo1_dither_w_fattn;
+static __device__ __forceinline__ float turbo1_tpdf_fattn(unsigned long long seed, int j, float w) {
+    unsigned long long s = seed + (unsigned long long)(j + 1) * 0x9E3779B97F4A7C15ULL;
+    s = (s ^ (s >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    s = (s ^ (s >> 27)) * 0x94D049BB133111EBULL;
+    s =  s ^ (s >> 31);
+    float u1 = (float)(unsigned int)(s & 0xFFFFFFFFu) * (1.0f / 4294967296.0f);
+    float u2 = (float)(unsigned int)(s >> 32)         * (1.0f / 4294967296.0f);
+    return (u1 + u2 - 1.0f) * w;
+}
+static void turbo1_load_dither_fattn() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const char * dz = getenv("TURBO1_DITHER");
+    float dw = dz ? (float)atof(dz) : 0.0f;
+    int don = dw > 0.0f ? 1 : 0;
+    cudaMemcpyToSymbol(d_turbo1_dither_fattn, &don, sizeof(int));
+    cudaMemcpyToSymbol(d_turbo1_dither_w_fattn, &dw, sizeof(float));
+}
 
 // InnerQ: update the fattn-side inverse scale array from host (all devices)
 void turbo_innerq_update_fattn_scales(const float * scale_inv) {
@@ -444,6 +480,12 @@ static inline float tcq_compute_alpha_v(ggml_type v_type, int64_t n_kv) {
     } else if (v_type == GGML_TYPE_TURBO2_TCQ) {
         // Flat optimum for the coord-descent codebook (K=iter195/V=iter208).
         return 1.06f;
+    } else if (v_type == GGML_TYPE_TURBO1_TCQ) {
+        // 1-bit wants a higher decode alpha than 2/3-bit (monotone in bits: t3=1.02, t2=1.06, t1=1.14).
+        // Sweep optimum on the baked K=seed5/iter135, V=seed1/iter490 codebooks @8192/24ch:
+        // V=1.14 → median KLD 0.0452 (−11% vs alpha=1.0's 0.0508). K alpha left at 1.0 (shared global);
+        // K=1.02 buys a further −0.3% via TURBO_TCQ_DECODE_ALPHA_K=1.02 env if desired.
+        return 1.14f;
     }
     return 1.0f;
 }
@@ -792,6 +834,285 @@ static __global__ void k_turbo8_dequant_f16_inv_fwht(
     }
 }
 
+// turbo1 V dequant: sign * scale in the rotated domain. The graph applies the
+// inverse FWHT on the attention output (V is stored rotated), so no rotation here.
+static __global__ void k_turbo1_dequant_f16(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int j = threadIdx.x;
+    if (j >= ne0) return;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int blk_idx  = j / QK_TURBO1;
+    const int j_in_blk = j % QK_TURBO1;
+    const block_turbo1 * blk = (const block_turbo1 *)src_row + blk_idx;
+
+    const float d = __half2float(blk->d);
+    const uint8_t bit = (blk->qs[j_in_blk >> 3] >> (j_in_blk & 7)) & 1u;
+    const float val = bit ? -d : d;
+
+    dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
+}
+
+// turbo1 K dequant with inverse FWHT: produces K in original (unrotated) domain
+// so Q does NOT need pre-rotation. 128 threads per block, loops over 128-element groups.
+static __global__ void k_turbo1_dequant_f16_inv_fwht(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
+
+    __shared__ float smem[128];
+
+    const float * s1 = d_turbo_wht_signs1_fattn;
+    const float * s2 = d_turbo_wht_signs2_fattn;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+
+    const int n_blocks = (int)(ne0 / QK_TURBO1);
+
+    for (int blk_idx = 0; blk_idx < n_blocks; blk_idx++) {
+        const block_turbo1 * blk = (const block_turbo1 *)src_row + blk_idx;
+        const float d = __half2float(blk->d);
+        const uint8_t bit = (blk->qs[tid >> 3] >> (tid & 7)) & 1u;
+        float recon = bit ? -d : d;
+        if (d_turbo1_dither_fattn) {
+            // Subtractive: recon = d*(q - u), q=+-1, u = same TPDF as encode (block-address seed).
+            const float qv = bit ? -1.0f : 1.0f;
+            const float u  = turbo1_tpdf_fattn((unsigned long long)(unsigned long)blk, tid, d_turbo1_dither_w_fattn);
+            recon = d * (qv - u);
+        }
+
+        float val = fwht128_butterfly_inplace(recon * s2[tid], smem);
+
+        val = val * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid];
+        fwht128_store_half(val, dst + dst_base + blk_idx * 128);
+        __syncthreads();
+    }
+}
+
+// turbo1_nsn dequant: per-row inverse FWHT to original domain + NSNQuant un-normalize/un-center.
+// v = s1 * (s2 * sqrt(128) * invFWHT(sign*sigma) + o[layer][head*ne0 + blk*128 + tid]).
+// Used for BOTH K and V (both decode to original domain — no graph un-rotation). o_layer = the
+// per-(layer) slice of the per-chunk per-head mean buffer (selected K vs V by the caller).
+static __global__ void k_turbo1_nsn_dequant_f16(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        const float * __restrict__ o_layer) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
+
+    __shared__ float smem[128];
+    const float * s1a = d_turbo_wht_signs1_fattn;
+    const float * s2a = d_turbo_wht_signs2_fattn;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f; // sigma
+    constexpr float sqrt_128 = 11.31370849898476f;
+    const int n_blocks = (int)(ne0 / QK_TURBO1_NSN);
+
+    for (int blk_idx = 0; blk_idx < n_blocks; blk_idx++) {
+        const block_turbo1_nsn * blk = (const block_turbo1_nsn *)src_row + blk_idx;
+        const float bs1 = __half2float(blk->s1);
+        const float bs2 = __half2float(blk->s2);
+        const uint8_t bit = (blk->qs[tid >> 3] >> (tid & 7)) & 1u;
+        const float recon = bit ? -inv_sqrt_128 : inv_sqrt_128; // sign * sigma
+
+        float val = fwht128_butterfly_inplace(recon * s2a[tid], smem);
+        // x_recon[tid] = invFWHT(sign*sigma)
+        const float x_recon = val * inv_sqrt_128 * s1a[tid] * d_innerq_channel_scale_inv_fattn[tid];
+        const float o = o_layer ? o_layer[head * ne0 + blk_idx * 128 + tid] : 0.0f;
+        const float v_out = bs1 * (bs2 * sqrt_128 * x_recon + o);
+        fwht128_store_half(v_out, dst + dst_base + blk_idx * 128);
+        __syncthreads();
+    }
+}
+
+// turbo1_cq dequant: per-row inverse FWHT of codebook reconstruction → original domain (K and V).
+// recon_rotated[tid] = d * codebook[qs[tid/8]][tid%8], then inverse FWHT.
+static __global__ void k_turbo1_cq_dequant_f16(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
+
+    __shared__ float smem[128];
+    const float * s1 = d_turbo_wht_signs1_fattn;
+    const float * s2 = d_turbo_wht_signs2_fattn;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    const int n_blocks = (int)(ne0 / QK_TURBO1_CQ);
+
+    for (int blk_idx = 0; blk_idx < n_blocks; blk_idx++) {
+        const block_turbo1_cq * blk = (const block_turbo1_cq *)src_row + blk_idx;
+        const float d = __half2float(blk->d);
+        const int g = tid >> 3, k = tid & 7;
+        const float recon = d * d_turbo1_cq_cb_fattn[(int)blk->qs[g] * 8 + k];
+
+        float val = fwht128_butterfly_inplace(recon * s2[tid], smem);
+        val = val * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid];
+        fwht128_store_half(val, dst + dst_base + blk_idx * 128);
+        __syncthreads();
+    }
+}
+
+// turbo1_tcq decode codebooks (256-state, separate K/V). Cold-start = turbo2_tcq decode anchor;
+// TURBO1_TCQ_CB_K / _V (?? TURBO1_TCQ_CB) override. MUST match the encode-side symbols.
+// Baked-in turbo1_tcq decode codebooks — MUST be bit-identical to the encode-side arrays in
+// turbo-quant-cuda.cuh (K = seed5/iter135, V = seed1/iter490; joint median KLD 0.0509 @8192/24ch).
+static __constant__ float d_turbo1_tcq_cb_fattn[256]   = {  // K decode
+    -0.05690895f, -0.05690895f, +0.06699874f, +0.15792155f, +0.03688013f, +0.04268654f, -0.14011213f, -0.02965679f,
+    -0.02438163f, -0.02438163f, -0.19953799f, -0.09293428f, -0.03144405f, -0.02849112f, +0.08199784f, +0.08199784f,
+    +0.09005091f, +0.09005091f, -0.05940611f, -0.05580222f, -0.07773691f, +0.06265988f, -0.01465418f, -0.00772985f,
+    -0.07816899f, -0.02297225f, +0.05464951f, +0.05464951f, +0.04231037f, +0.04641661f, -0.08938144f, -0.08938144f,
+    +0.00365320f, +0.10741787f, -0.16739547f, -0.04616742f, -0.14219233f, -0.00901757f, -0.08096506f, -0.01814358f,
+    +0.01111611f, +0.01161552f, -0.03937600f, -0.01077888f, +0.05573412f, +0.12505241f, -0.06129042f, -0.06129042f,
+    +0.01023831f, +0.01023831f, -0.12061471f, -0.12061471f, -0.04995122f, +0.02263966f, +0.03203409f, +0.11107059f,
+    -0.07132407f, +0.12659174f, +0.01221013f, +0.04215888f, -0.10731849f, -0.10731849f, +0.05396174f, +0.05396174f,
+    -0.08873346f, -0.02921234f, -0.08342038f, +0.01016524f, -0.04502235f, -0.02802503f, +0.08100778f, +0.09756171f,
+    +0.07306496f, +0.07941060f, +0.06482599f, +0.17851813f, -0.17608380f, -0.13157773f, -0.02980503f, -0.02493151f,
+    -0.08945329f, -0.04105385f, +0.06271980f, +0.06271980f, +0.04196313f, +0.04196313f, -0.07387091f, -0.07387091f,
+    -0.17707518f, -0.00678580f, -0.10799771f, -0.01689552f, +0.13846508f, +0.13846508f, +0.00282240f, +0.00900819f,
+    -0.06046259f, +0.00667074f, +0.08675562f, +0.08675562f, +0.03267998f, +0.08196472f, -0.05092679f, -0.05092679f,
+    -0.14121383f, -0.01879669f, -0.05341130f, -0.00773192f, -0.08829777f, +0.02199137f, +0.02482944f, +0.10630896f,
+    -0.04461808f, -0.04461808f, +0.07664362f, +0.07906501f, +0.02414565f, +0.14515512f, -0.12866446f, -0.05883218f,
+    +0.07126531f, +0.07126531f, -0.09748757f, -0.04700467f, -0.00578264f, -0.00578264f, -0.05956273f, +0.09283913f,
+    +0.07512030f, +0.07512030f, -0.05542693f, -0.02299234f, -0.12123095f, -0.04918547f, +0.00890487f, +0.06046228f,
+    +0.07268346f, +0.08064783f, -0.08709023f, -0.00295277f, +0.09379439f, +0.09379439f, -0.05568655f, -0.05568655f,
+    -0.07594635f, -0.07594635f, +0.06194503f, +0.08429574f, +0.00319491f, +0.18098263f, +0.01526845f, +0.02230061f,
+    +0.01046284f, +0.07030793f, -0.03586691f, +0.12040213f, -0.11210962f, -0.09723122f, +0.02993215f, +0.02993215f,
+    -0.16422588f, -0.04235943f, +0.01761191f, +0.03886831f, -0.01567245f, +0.12241358f, +0.03636941f, +0.03636941f,
+    -0.10172297f, -0.02071226f, +0.02888141f, +0.09684418f, -0.09620761f, -0.02462198f, +0.03707082f, +0.07376128f,
+    -0.06408252f, +0.08888291f, +0.01361814f, +0.04392439f, +0.02771172f, +0.02771172f, -0.12401393f, -0.04075170f,
+    +0.01655904f, +0.01655904f, -0.11275508f, -0.11275508f, +0.03323539f, +0.03323539f, -0.10384015f, +0.19677565f,
+    +0.01188133f, +0.01514807f, +0.02290127f, +0.13536246f, +0.07205503f, +0.15930237f, -0.07375064f, -0.05046035f,
+    -0.08193663f, -0.08193663f, -0.03241898f, +0.04459962f, -0.01891778f, -0.01165876f, +0.09547786f, +0.14283878f,
+    +0.02682622f, +0.12911709f, -0.05600601f, -0.05600601f, -0.16854414f, -0.08491614f, +0.04553003f, +0.04553003f,
+    +0.00329509f, +0.08321664f, -0.00810051f, +0.10836335f, -0.00792713f, -0.00792713f, -0.13737200f, -0.09546821f,
+    +0.06686576f, +0.17066576f, -0.05565165f, -0.04070367f, -0.09663567f, -0.04676020f, +0.09122299f, +0.09122299f,
+    +0.02007535f, +0.11729758f, +0.00424169f, +0.00424169f, +0.01952964f, +0.13675623f, -0.11927815f, -0.01915905f,
+    +0.08001547f, +0.08001547f, -0.05414105f, -0.05414105f, -0.15429053f, -0.06953919f, +0.02160413f, +0.05599044f,
+    -0.06471479f, -0.06471479f, +0.05585973f, +0.13141583f, -0.02186239f, +0.02123550f, -0.02659754f, +0.04245459f,
+};
+static __constant__ float d_turbo1_tcq_cb_v_fattn[256] = {  // V decode
+    -0.05822275f, -0.04057012f, +0.07030253f, +0.07030253f, +0.00910952f, +0.13381734f, -0.15394895f, -0.03654402f,
+    -0.06419166f, -0.06419166f, -0.00322056f, -0.00322056f, -0.04590228f, -0.02467079f, +0.07511869f, +0.07511869f,
+    +0.05966081f, +0.06482045f, -0.05617626f, -0.05617626f, -0.10456542f, -0.04816543f, -0.03039524f, +0.03820165f,
+    -0.02399842f, -0.02399842f, +0.03528102f, +0.11460238f, +0.01120800f, +0.01120800f, -0.12139006f, -0.12139006f,
+    +0.06143143f, +0.15165478f, -0.00829714f, +0.03238043f, -0.07274882f, -0.07274882f, +0.01648950f, +0.04747831f,
+    -0.13129655f, -0.08037784f, -0.01519387f, -0.01374798f, +0.09782079f, +0.09782079f, -0.04960374f, -0.04960374f,
+    -0.02048401f, -0.02048401f, -0.14179772f, -0.10473511f, +0.05546302f, +0.07371018f, +0.01881939f, +0.14756195f,
+    -0.04088041f, +0.00697273f, +0.02537729f, +0.03056769f, -0.13503331f, -0.09729782f, +0.05183329f, +0.18428555f,
+    -0.17827763f, -0.15089703f, -0.03956327f, -0.01698648f, -0.03595189f, -0.03595189f, +0.07393072f, +0.07393072f,
+    +0.08052437f, +0.17165796f, +0.00083603f, +0.03242609f, -0.16325922f, -0.12540159f, -0.01560353f, +0.00438857f,
+    -0.06914193f, -0.05732659f, +0.04068601f, +0.05820430f, +0.00498649f, +0.09965154f, -0.11689261f, -0.11689261f,
+    +0.04313961f, +0.11466423f, -0.07856513f, -0.00676461f, +0.14289343f, +0.14289343f, -0.01477776f, +0.00207787f,
+    -0.08715416f, -0.08715416f, +0.05999934f, +0.05999934f, +0.08748800f, +0.08748800f, -0.03674424f, -0.03598228f,
+    +0.04614007f, +0.04614007f, -0.10481524f, -0.10481524f, -0.03229756f, -0.03229756f, +0.02437326f, +0.10609587f,
+    -0.04459647f, -0.04459647f, +0.08320531f, +0.08320531f, +0.09055579f, +0.09055579f, -0.09849767f, -0.03800276f,
+    +0.02997772f, +0.02997772f, -0.10893033f, -0.10893033f, -0.05067614f, +0.01131399f, -0.02704101f, +0.09590967f,
+    +0.08146118f, +0.08146118f, -0.07268019f, -0.05547163f, -0.15487537f, -0.03218244f, +0.03206071f, +0.07322103f,
+    -0.01254456f, -0.01254456f, +0.10675898f, +0.11011963f, +0.07422783f, +0.07422783f, -0.05873942f, -0.05318457f,
+    -0.08198534f, -0.08198534f, +0.03441365f, +0.06745050f, +0.00344696f, +0.02957109f, +0.10733211f, +0.17381467f,
+    -0.12887627f, +0.06219940f, -0.02732148f, -0.00106800f, -0.11212935f, +0.11931811f, +0.01623658f, +0.01623658f,
+    -0.05334378f, +0.00559292f, -0.17833017f, -0.06168034f, +0.04205889f, +0.05851458f, -0.06669462f, -0.06669462f,
+    +0.00689281f, +0.04394012f, +0.08635867f, +0.11145297f, -0.09817721f, -0.05329924f, +0.05398905f, +0.07623540f,
+    +0.11233878f, +0.17313740f, +0.00950995f, +0.01250056f, -0.05599560f, -0.03859993f, -0.07366411f, +0.00118889f,
+    +0.02521585f, +0.02521585f, -0.11893971f, -0.10650937f, +0.05810528f, +0.05810528f, -0.16678603f, -0.04473093f,
+    -0.01108021f, -0.00942814f, +0.07052016f, +0.14542146f, +0.07294562f, +0.07294562f, -0.06669298f, -0.06669298f,
+    -0.03622010f, +0.02799591f, -0.11604622f, -0.06511734f, -0.00890048f, -0.00399124f, +0.13813104f, +0.13813104f,
+    +0.03711793f, +0.08076523f, -0.05968392f, -0.05968392f, -0.16921099f, -0.07368306f, +0.01830781f, +0.03795826f,
+    -0.03008453f, -0.03008453f, +0.04872094f, +0.16440891f, -0.00369157f, -0.00369157f, -0.15617938f, -0.09730178f,
+    +0.04716997f, +0.04716997f, -0.07361570f, -0.06438473f, -0.04917597f, -0.03088157f, +0.08131150f, +0.08131150f,
+    -0.07323092f, +0.16313137f, +0.02744950f, +0.02744950f, +0.03818675f, +0.08015263f, -0.10156032f, -0.01302207f,
+    +0.05073140f, +0.05073140f, -0.05120790f, -0.05120790f, -0.05612922f, -0.05612922f, +0.06819829f, +0.08482070f,
+    -0.10348321f, +0.11792021f, +0.00979673f, +0.03041706f, +0.00188910f, +0.00188910f, -0.06026103f, +0.05430736f,
+};
+static void turbo1_tcq_load_cb_fattn() {
+    auto load_file = [](const char * p, float * out) -> bool {
+        FILE * f = fopen(p, "rb"); if (!f) return false;
+        bool ok = fread(out, sizeof(float), 256, f) == 256; fclose(f); return ok;
+    };
+    auto file_mtime = [](const char * p) -> long { struct stat st; return (p && stat(p, &st) == 0) ? (long)st.st_mtime : 0; };
+    int dev = 0; cudaGetDevice(&dev);
+    static int hot = -1; if (hot < 0) hot = getenv("TURBO1_TCQ_HOTSWAP") ? 1 : 0;
+    static bool init[GGML_CUDA_MAX_DEVICES] = {};
+    static long mk[GGML_CUDA_MAX_DEVICES] = {}, mv[GGML_CUDA_MAX_DEVICES] = {};
+    const char * cb = getenv("TURBO1_TCQ_CB");
+    const char * kp = getenv("TURBO1_TCQ_CB_K"); if (!kp) kp = cb;
+    const char * vp = getenv("TURBO1_TCQ_CB_V"); if (!vp) vp = cb;
+    const bool first = !init[dev];
+    const long nk = (hot || first) ? file_mtime(kp) : mk[dev];
+    const long nv = (hot || first) ? file_mtime(vp) : mv[dev];
+    const bool do_k = first || (hot && nk != mk[dev]);
+    const bool do_v = first || (hot && nv != mv[dev]);
+    if (!do_k && !do_v) return;
+    float buf[256];
+    // cold-start default = baked-in best codebook (seed5/iter135 K, seed1/iter490 V); only env overrides it.
+    if (do_k && kp && load_file(kp, buf)) { cudaMemcpyToSymbol(d_turbo1_tcq_cb_fattn,   buf, 256*sizeof(float)); mk[dev] = nk; }
+    if (do_v && vp && load_file(vp, buf)) { cudaMemcpyToSymbol(d_turbo1_tcq_cb_v_fattn, buf, 256*sizeof(float)); mv[dev] = nv; }
+    init[dev] = true;
+    if (first)
+        fprintf(stderr, "TCQ1 decode: K/V codebooks (K=%s V=%s) hotswap=%d\n", kp?kp:"baked-in", vp?vp:"baked-in", hot);
+}
+
+// turbo1_tcq dequant: trellis-state decode of rotated coords, then per-row inverse FWHT → original
+// domain (K and V). state_tid = read_8_bits(qs, tid*1); recon = norm * cb[state]. is_v picks K/V book.
+static __global__ void k_turbo1_tcq_dequant_f16(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        const float alpha, const int is_v) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
+
+    __shared__ float smem[128];
+    const float * s1 = d_turbo_wht_signs1_fattn;
+    const float * s2 = d_turbo_wht_signs2_fattn;
+    const float * cb = is_v ? d_turbo1_tcq_cb_v_fattn : d_turbo1_tcq_cb_fattn;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    const int n_blocks = (int)(ne0 / QK_TURBO1_TCQ);
+
+    for (int blk_idx = 0; blk_idx < n_blocks; blk_idx++) {
+        const block_turbo1_tcq * blk = (const block_turbo1_tcq *)src_row + blk_idx;
+        const float norm = __half2float(blk->norm);
+        const int bit_pos = tid;                 // k=1: bit offset = tid
+        const int byte_idx = bit_pos >> 3;
+        const int bit_off  = bit_pos & 7;
+        const uint16_t raw = (uint16_t)blk->qs[byte_idx] | ((uint16_t)blk->qs[byte_idx + 1] << 8);
+        const int state = (raw >> bit_off) & 0xFF;
+        const float recon = norm * alpha * cb[state];
+
+        float val = fwht128_butterfly_inplace(recon * s2[tid], smem);
+        val = val * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid];
+        fwht128_store_half(val, dst + dst_base + blk_idx * 128);
+        __syncthreads();
+    }
+}
+
 // turbo2 K dequant with inverse FWHT: produces K in original (unrotated) domain.
 // 128 threads per block, loops over 128-element FWHT groups (each group spans
 // 4 turbo2 storage blocks of 32 elements; all 4 blocks share the same norm).
@@ -964,6 +1285,26 @@ static __global__ void k_bf16_to_f16_tkhe(
     dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
 }
 
+static bool vbr_stage2a_promoted_k_type_supported(ggml_type t) {
+    return t == GGML_TYPE_F16 ||
+           t == GGML_TYPE_BF16 ||
+           t == GGML_TYPE_Q8_0 ||
+           t == GGML_TYPE_TURBO2_TCQ ||
+           t == GGML_TYPE_TURBO1_TCQ ||
+           t == GGML_TYPE_TURBO3_TCQ ||
+           t == GGML_TYPE_TURBO4_0 ||
+           t == GGML_TYPE_TURBO8_0;
+}
+
+static bool vbr_stage2a_v_type_uses_rotated_domain(ggml_type t) {
+    return t == GGML_TYPE_TURBO2_0 ||
+           t == GGML_TYPE_TURBO3_0 ||
+           t == GGML_TYPE_TURBO4_0 ||
+           t == GGML_TYPE_TURBO8_0 ||
+           t == GGML_TYPE_TURBO3_TCQ ||
+           t == GGML_TYPE_TURBO2_TCQ;
+}
+
 // Persistent Q rotation buffer per device (shared between prefill and decode paths)
 static float * q_rot_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  q_rot_buf_size[GGML_CUDA_MAX_DEVICES] = {};
@@ -971,8 +1312,16 @@ static size_t  q_rot_buf_size[GGML_CUDA_MAX_DEVICES] = {};
 // Persistent K/V fp16 dequant buffers per device (shared between prefill and decode paths)
 static half * kv_dequant_k_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  kv_dequant_k_buf_size[GGML_CUDA_MAX_DEVICES] = {};
+static half * kv_dequant_k_promoted_buf[GGML_CUDA_MAX_DEVICES] = {};
+static size_t  kv_dequant_k_promoted_buf_size[GGML_CUDA_MAX_DEVICES] = {};
+static int32_t * vbr_stage2a_k_row_bands_buf[GGML_CUDA_MAX_DEVICES] = {};
+static size_t    vbr_stage2a_k_row_bands_buf_size[GGML_CUDA_MAX_DEVICES] = {};
 static half * kv_dequant_v_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  kv_dequant_v_buf_size[GGML_CUDA_MAX_DEVICES] = {};
+static half * kv_dequant_v_promoted_buf[GGML_CUDA_MAX_DEVICES] = {};
+static size_t  kv_dequant_v_promoted_buf_size[GGML_CUDA_MAX_DEVICES] = {};
+static int32_t * vbr_stage2a_v_row_bands_buf[GGML_CUDA_MAX_DEVICES] = {};
+static size_t    vbr_stage2a_v_row_bands_buf_size[GGML_CUDA_MAX_DEVICES] = {};
 
 // === FWHT rotation kernels for pre-rotate-queries approach ===
 // Forward rotation on Q before attention (both prefill and decode paths).
@@ -1004,14 +1353,202 @@ static __global__ void k_turbo_fwht_forward(
     }
 }
 
+static __device__ int64_t vbr_stage2a_src_row_for_logical_row(
+        const int64_t row,
+        const int32_t * __restrict__ bands,
+        const int64_t n_bands,
+        const int64_t band_stride) {
+    for (int64_t ib = 0; ib < n_bands; ++ib) {
+        const int64_t bo = ib * band_stride;
+        const int32_t row0 = bands[bo + 0];
+        const int32_t row1 = bands[bo + 1];
+        if (row0 < 0 || row1 < 0) {
+            continue;
+        }
+        if (row >= row0 && row < row1) {
+            if (band_stride >= 4 && bands[bo + 2] >= 0) {
+                return (int64_t) bands[bo + 2] + (row - row0);
+            }
+            return row;
+        }
+    }
+    return -1;
+}
+
+static __global__ void k_vbr_stage2a_copy_promoted_rows_f16(
+        half * __restrict__ dst,
+        const half * __restrict__ src,
+        const int32_t * __restrict__ bands,
+        const int64_t n_bands,
+        const int64_t band_stride,
+        const int64_t ne0, const int64_t dst_ne1, const int64_t src_ne1, const int64_t ne2) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int j = threadIdx.x;
+    if (j >= ne0 || row >= dst_ne1) {
+        return;
+    }
+
+    const int64_t src_row = vbr_stage2a_src_row_for_logical_row(row, bands, n_bands, band_stride);
+    if (src_row < 0 || src_row >= src_ne1) {
+        return;
+    }
+
+    const int64_t dst_off = strm * (dst_ne1 * ne2 * ne0) + row     * (ne2 * ne0) + head * ne0 + j;
+    const int64_t src_off = strm * (src_ne1 * ne2 * ne0) + src_row * (ne2 * ne0) + head * ne0 + j;
+    dst[dst_off] = src[src_off];
+}
+
+static __global__ void k_vbr_stage2a_copy_promoted_rows_bf16(
+        half * __restrict__ dst,
+        const char * __restrict__ src,
+        const int32_t * __restrict__ bands,
+        const int64_t n_bands,
+        const int64_t band_stride,
+        const int64_t ne0, const int64_t dst_ne1, const int64_t src_ne1, const int64_t ne2,
+        const size_t src_nb1, const size_t src_nb2, const size_t src_nb3) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int j = threadIdx.x;
+    if (j >= ne0 || row >= dst_ne1) {
+        return;
+    }
+
+    const int64_t src_row = vbr_stage2a_src_row_for_logical_row(row, bands, n_bands, band_stride);
+    if (src_row < 0 || src_row >= src_ne1) {
+        return;
+    }
+
+    const int64_t dst_off = strm * (dst_ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j;
+    const nv_bfloat16 * src_ptr = (const nv_bfloat16 *) (src + strm * src_nb3 + src_row * src_nb1 + head * src_nb2);
+    dst[dst_off] = __float2half(__bfloat162float(src_ptr[j]));
+}
+
+static __global__ void k_vbr_stage2a_copy_promoted_rows_native_f16(
+        half * __restrict__ dst,
+        const char * __restrict__ src,
+        const int32_t * __restrict__ bands,
+        const int64_t n_bands,
+        const int64_t band_stride,
+        const int64_t ne0, const int64_t dst_ne1, const int64_t src_ne1, const int64_t ne2,
+        const size_t src_nb1, const size_t src_nb2, const size_t src_nb3) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int j = threadIdx.x;
+    if (j >= ne0 || row >= dst_ne1) {
+        return;
+    }
+
+    const int64_t src_row = vbr_stage2a_src_row_for_logical_row(row, bands, n_bands, band_stride);
+    if (src_row < 0 || src_row >= src_ne1) {
+        return;
+    }
+
+    const int64_t dst_off = strm * (dst_ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j;
+    const half * src_ptr = (const half *) (src + strm * src_nb3 + src_row * src_nb1 + head * src_nb2);
+    dst[dst_off] = src_ptr[j];
+}
+
+static __global__ void k_vbr_stage2a_cast_native_f16_tkhe(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int j = threadIdx.x;
+    if (j >= ne0) {
+        return;
+    }
+
+    const half * src_ptr = (const half *) (src + strm * nb3 + row * nb1 + head * nb2);
+    const int64_t dst_off = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j;
+    dst[dst_off] = src_ptr[j];
+}
+
+static __global__ void k_vbr_stage2a_v_rotated_to_original_f16(
+        half * __restrict__ data,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3) {
+    const int64_t group = blockIdx.x;
+    const int64_t row   = blockIdx.y;
+    const int64_t hz    = blockIdx.z;
+    const int64_t head  = hz % ne2;
+    const int64_t strm  = hz / ne2;
+    const int tid = threadIdx.x;
+    if (tid >= 128 || group * 128 + tid >= ne0 || row >= ne1 || strm >= ne3) {
+        return;
+    }
+
+    const int64_t off = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + group * 128 + tid;
+    __shared__ float smem[128];
+    const float val0 = __half2float(data[off]) * d_turbo_wht_signs2_fattn[tid];
+    float val = fwht128_butterfly_inplace(val0, smem);
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    val = val * inv_sqrt_128 * d_turbo_wht_signs1_fattn[tid] * d_innerq_channel_scale_inv_fattn[tid];
+    data[off] = __float2half(val);
+}
+
+static __global__ void k_vbr_stage2a_v_original_to_rotated_f16(
+        half * __restrict__ data,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3) {
+    const int64_t group = blockIdx.x;
+    const int64_t row   = blockIdx.y;
+    const int64_t hz    = blockIdx.z;
+    const int64_t head  = hz % ne2;
+    const int64_t strm  = hz / ne2;
+    const int tid = threadIdx.x;
+    if (tid >= 128 || group * 128 + tid >= ne0 || row >= ne1 || strm >= ne3) {
+        return;
+    }
+
+    const int64_t off = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + group * 128 + tid;
+    __shared__ float smem[128];
+    const float val0 = __half2float(data[off]) * d_turbo_wht_signs1_fattn[tid];
+    float val = fwht128_butterfly_inplace(val0, smem);
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    val = val * inv_sqrt_128 * d_turbo_wht_signs2_fattn[tid];
+    data[off] = __float2half(val);
+}
+
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     load_tcq_decode_alpha(ctx.device);
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * K_promoted = dst->src[5];
+    const ggml_tensor * K_row_bands = dst->src[6];
+    const ggml_tensor * V_promoted = dst->src[7];
+    const ggml_tensor * V_row_bands = dst->src[8];
+    const bool vbr_stage2a_k = K_promoted != nullptr || K_row_bands != nullptr;
+    const bool vbr_stage2a_v = V_promoted != nullptr || V_row_bands != nullptr;
+    if (vbr_stage2a_k) {
+        GGML_ASSERT(K_promoted != nullptr);
+        GGML_ASSERT(K_row_bands != nullptr);
+        GGML_ASSERT(vbr_stage2a_promoted_k_type_supported(K_promoted->type));
+        GGML_ASSERT(K_promoted->ne[0] == K->ne[0]);
+        GGML_ASSERT(K_promoted->ne[2] == K->ne[2]);
+        GGML_ASSERT(K_promoted->ne[3] == K->ne[3]);
+        GGML_ASSERT(K_promoted->ne[1] > 0);
+        GGML_ASSERT(K_row_bands->type == GGML_TYPE_I32);
+        GGML_ASSERT(K_row_bands->ne[0] == 2 || K_row_bands->ne[0] >= 4);
+    }
+    if (vbr_stage2a_v) {
+        GGML_ASSERT(V_promoted != nullptr);
+        GGML_ASSERT(V_row_bands != nullptr);
+        GGML_ASSERT(vbr_stage2a_promoted_k_type_supported(V_promoted->type));
+        GGML_ASSERT(V_promoted->ne[0] == V->ne[0]);
+        GGML_ASSERT(V_promoted->ne[2] == V->ne[2]);
+        GGML_ASSERT(V_promoted->ne[3] == V->ne[3]);
+        GGML_ASSERT(V_promoted->ne[1] > 0);
+        GGML_ASSERT(V_row_bands->type == GGML_TYPE_I32);
+        GGML_ASSERT(V_row_bands->ne[0] == 2 || V_row_bands->ne[0] >= 4);
+    }
 
-    const bool turbo_k = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ;
-    const bool turbo_v = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ;
+    const bool turbo_k = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1 || K->type == GGML_TYPE_TURBO1_NSN || K->type == GGML_TYPE_TURBO1_CQ || K->type == GGML_TYPE_TURBO1_TCQ;
+    const bool turbo_v = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1 || V->type == GGML_TYPE_TURBO1_NSN || V->type == GGML_TYPE_TURBO1_CQ || V->type == GGML_TYPE_TURBO1_TCQ;
     // Mixed (asymmetric) K/V: a q8_0 side must be dequanted to f16 here too, otherwise the raw
     // q8_0 bytes are handed to the f16-only MMA kernel below and read as f16 → garbage. f16 sides
     // need no conversion (already f16). This is the prefill mirror of the decode dequant path.
@@ -1032,7 +1569,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         // Size for full cache (kv_size from root) so we never realloc mid-session.
         const ggml_tensor * k_root = K;
         while (k_root->view_src) k_root = k_root->view_src;
-        const size_t k_size = (size_t)k_root->ne[0] * k_root->ne[1] * k_root->ne[2] * sizeof(half);
+        const size_t k_size = (size_t) ggml_nelements(k_root) * sizeof(half);
         if (k_size > kv_dequant_k_buf_size[device]) {
             if (kv_dequant_k_buf[device]) CUDA_CHECK(cudaFree(kv_dequant_k_buf[device]));
             CUDA_CHECK(cudaMalloc(&kv_dequant_k_buf[device], k_size));
@@ -1055,8 +1592,11 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                     turbo_tcq_load_kv_decode();
                 }
             }
-            k_turbo3_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k, 0);
+            // TCQ K quality is sensitive to where the FWHT roundtrip is rounded. Decode to the
+            // original domain here, matching the decode-side dequant path, instead of rotating Q
+            // and consuming rotated-domain K in the F16 MMA kernel.
+            k_turbo3_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
         } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
             {
                 static bool tcq2_fattn_k_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
@@ -1066,8 +1606,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                     turbo2_tcq_load_kv_decode();
                 }
             }
-            k_turbo2_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
-                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k, 0);
+            k_turbo2_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
         } else if (K->type == GGML_TYPE_TURBO4_0) {
             // turbo4 K: inverse FWHT dequant → produces K in original domain (no Q rotation needed)
             k_turbo4_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
@@ -1076,6 +1616,23 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             // turbo8 K: inverse FWHT dequant → produces K in original domain (no Q rotation needed)
             k_turbo8_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+        } else if (K->type == GGML_TYPE_TURBO1) {
+            // turbo1 K: inverse FWHT dequant → produces K in original domain (no Q rotation needed)
+            k_turbo1_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+        } else if (K->type == GGML_TYPE_TURBO1_CQ) {
+            k_turbo1_cq_dequant_f16<<<grid_k, 128, 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+        } else if (K->type == GGML_TYPE_TURBO1_TCQ) {
+            k_turbo1_tcq_dequant_f16<<<grid_k, 128, 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k, 0);
+        } else if (K->type == GGML_TYPE_TURBO1_NSN) {
+            // turbo1_nsn K: inverse FWHT + NSNQuant un-normalize/un-center → original domain.
+            const int kl_nsn = atoi(K->name + 9);
+            const float * o_k = (kl_nsn >= 0 && kl_nsn < PFHEAD_MAX_L)
+                ? turbo1_nsn_o_buf(device, 1) + (size_t) kl_nsn * PFHEAD_MAX_C : nullptr;
+            k_turbo1_nsn_dequant_f16<<<grid_k, 128, 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], o_k);
         } else if (K->type == GGML_TYPE_BF16) {
             // bf16 K (mixed K/V): cast to f16 in original (unrotated) domain. Q stays unrotated.
             k_bf16_to_f16_tkhe<<<grid_k, K->ne[0], 0, stream>>>(
@@ -1088,12 +1645,124 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         }
     }
 
+    if (vbr_stage2a_k) {
+        GGML_ASSERT(k_fp16 != nullptr);
+
+        const size_t bands_bytes = (size_t) K_row_bands->ne[0] * K_row_bands->ne[1] * sizeof(int32_t);
+        if (bands_bytes > vbr_stage2a_k_row_bands_buf_size[device]) {
+            if (vbr_stage2a_k_row_bands_buf[device]) CUDA_CHECK(cudaFree(vbr_stage2a_k_row_bands_buf[device]));
+            CUDA_CHECK(cudaMalloc(&vbr_stage2a_k_row_bands_buf[device], bands_bytes));
+            vbr_stage2a_k_row_bands_buf_size[device] = bands_bytes;
+        }
+        const ggml_tensor * K_row_bands_root = K_row_bands;
+        while (K_row_bands_root->view_src) {
+            K_row_bands_root = K_row_bands_root->view_src;
+        }
+        const cudaMemcpyKind band_copy_kind =
+            (K_row_bands_root->buffer == nullptr || ggml_backend_buffer_is_host(K_row_bands_root->buffer)) ?
+                cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
+        const char * band_data = (const char *) K_row_bands->data;
+        CUDA_CHECK(cudaMemcpyAsync(vbr_stage2a_k_row_bands_buf[device], band_data, bands_bytes, band_copy_kind, stream));
+
+        static int vbr_stage2a_debug_count = 0;
+        static int vbr_stage2a_debug_enabled = -1;
+        if (vbr_stage2a_debug_enabled < 0) {
+            const char * e = getenv("TURBO_VBR_STAGE2A_DEBUG");
+            vbr_stage2a_debug_enabled = e && e[0] && strcmp(e, "0") != 0;
+        }
+        static int64_t vbr_stage2a_debug_last_ne1 = -1;
+        if (vbr_stage2a_debug_enabled && (vbr_stage2a_debug_count < 8 || K->ne[1] != vbr_stage2a_debug_last_ne1)) {
+            vbr_stage2a_debug_count++;
+            vbr_stage2a_debug_last_ne1 = K->ne[1];
+            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+            CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+            fprintf(stderr,
+                    "STAGE2A_CUDA K_type=%s KP_type=%s bands=%lld stride=%lld capture=%d K_ne=[%lld,%lld,%lld,%lld] KP_ne=[%lld,%lld,%lld,%lld] K_view=%zu KP_view=%zu K_nb=[%zu,%zu,%zu,%zu] KP_nb=[%zu,%zu,%zu,%zu]\n",
+                    ggml_type_name(K->type),
+                    ggml_type_name(K_promoted->type),
+                    (long long) K_row_bands->ne[1],
+                    (long long) K_row_bands->ne[0],
+                    (int) capture_status,
+                    (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
+                    (long long) K_promoted->ne[0], (long long) K_promoted->ne[1], (long long) K_promoted->ne[2], (long long) K_promoted->ne[3],
+                    K->view_offs, K_promoted->view_offs,
+                    K->nb[0], K->nb[1], K->nb[2], K->nb[3],
+                    K_promoted->nb[0], K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3]);
+        }
+
+        dim3 grid_copy(K->ne[1], K->ne[2], K->ne[3]);
+        if (K_promoted->type == GGML_TYPE_BF16) {
+            k_vbr_stage2a_copy_promoted_rows_bf16<<<grid_copy, K->ne[0], 0, stream>>>(
+                k_fp16, (const char *) K_promoted->data, vbr_stage2a_k_row_bands_buf[device], K_row_bands->ne[1],
+                K_row_bands->ne[0], K->ne[0], K->ne[1], K_promoted->ne[1], K->ne[2],
+                K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3]);
+        } else if (K_promoted->type == GGML_TYPE_F16) {
+            k_vbr_stage2a_copy_promoted_rows_native_f16<<<grid_copy, K->ne[0], 0, stream>>>(
+                k_fp16, (const char *) K_promoted->data, vbr_stage2a_k_row_bands_buf[device], K_row_bands->ne[1],
+                K_row_bands->ne[0], K->ne[0], K->ne[1], K_promoted->ne[1], K->ne[2],
+                K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3]);
+        } else {
+            const ggml_tensor * kp_root = K_promoted;
+            while (kp_root->view_src) kp_root = kp_root->view_src;
+            const size_t kp_size = (size_t) ggml_nelements(kp_root) * sizeof(half);
+            if (kp_size > kv_dequant_k_promoted_buf_size[device]) {
+                if (kv_dequant_k_promoted_buf[device]) CUDA_CHECK(cudaFree(kv_dequant_k_promoted_buf[device]));
+                CUDA_CHECK(cudaMalloc(&kv_dequant_k_promoted_buf[device], kp_size));
+                kv_dequant_k_promoted_buf_size[device] = kp_size;
+            }
+            half * kp_fp16 = kv_dequant_k_promoted_buf[device];
+
+            dim3 grid_kp(K_promoted->ne[1], K_promoted->ne[2], K_promoted->ne[3]);
+            if (K_promoted->type == GGML_TYPE_TURBO3_TCQ) {
+                static bool tcq_fattn_kp_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+                static int tcq_hot_kp = -1; if (tcq_hot_kp < 0) tcq_hot_kp = getenv("TURBO_TCQ_HOTSWAP") ? 1 : 0;
+                if (!tcq_fattn_kp_cb_loaded[device] || tcq_hot_kp) {
+                    tcq_fattn_kp_cb_loaded[device] = true;
+                    turbo_tcq_load_kv_decode();
+                }
+                k_turbo3_tcq_dequant_f16_inv_fwht<<<grid_kp, 128, 0, stream>>>(
+                    (const char *)K_promoted->data, kp_fp16, K_promoted->ne[0], K_promoted->ne[1], K_promoted->ne[2],
+                    K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3], d_tcq_decode_alpha_k);
+            } else if (K_promoted->type == GGML_TYPE_TURBO2_TCQ) {
+                static bool tcq2_fattn_kp_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+                static int tcq2_hot_kp = -1; if (tcq2_hot_kp < 0) tcq2_hot_kp = getenv("TURBO_TCQ_HOTSWAP") ? 1 : 0;
+                if (!tcq2_fattn_kp_cb_loaded[device] || tcq2_hot_kp) {
+                    tcq2_fattn_kp_cb_loaded[device] = true;
+                    turbo2_tcq_load_kv_decode();
+                }
+                k_turbo2_tcq_dequant_f16_inv_fwht<<<grid_kp, 128, 0, stream>>>(
+                    (const char *)K_promoted->data, kp_fp16, K_promoted->ne[0], K_promoted->ne[1], K_promoted->ne[2],
+                    K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3], d_tcq_decode_alpha_k);
+            } else if (K_promoted->type == GGML_TYPE_TURBO1_TCQ) {
+                k_turbo1_tcq_dequant_f16<<<grid_kp, 128, 0, stream>>>(
+                    (const char *)K_promoted->data, kp_fp16, K_promoted->ne[0], K_promoted->ne[1], K_promoted->ne[2],
+                    K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3], d_tcq_decode_alpha_k, 0);
+            } else if (K_promoted->type == GGML_TYPE_TURBO4_0) {
+                k_turbo4_dequant_f16_inv_fwht<<<grid_kp, 128, 0, stream>>>(
+                    (const char *)K_promoted->data, kp_fp16, K_promoted->ne[0], K_promoted->ne[1], K_promoted->ne[2],
+                    K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3]);
+            } else if (K_promoted->type == GGML_TYPE_TURBO8_0) {
+                k_turbo8_dequant_f16_inv_fwht<<<grid_kp, 128, 0, stream>>>(
+                    (const char *)K_promoted->data, kp_fp16, K_promoted->ne[0], K_promoted->ne[1], K_promoted->ne[2],
+                    K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3]);
+            } else if (K_promoted->type == GGML_TYPE_Q8_0) {
+                k_q8_0_dequant_f16_tkhe<<<grid_kp, K_promoted->ne[0], 0, stream>>>(
+                    (const char *)K_promoted->data, kp_fp16, K_promoted->ne[0], K_promoted->ne[1], K_promoted->ne[2],
+                    K_promoted->nb[1], K_promoted->nb[2], K_promoted->nb[3]);
+            }
+
+            k_vbr_stage2a_copy_promoted_rows_f16<<<grid_copy, K->ne[0], 0, stream>>>(
+                k_fp16, kp_fp16, vbr_stage2a_k_row_bands_buf[device], K_row_bands->ne[1],
+                K_row_bands->ne[0], K->ne[0], K->ne[1], K_promoted->ne[1], K->ne[2]);
+        }
+    }
+
     // Allocate and dequant V to fp16 (turbo2/3/4, q8_0, or bf16)
     if (turbo_v || q8_v || bf16_v) {
         // Size for full cache (kv_size from root) so we never realloc mid-session.
         const ggml_tensor * v_root = V;
         while (v_root->view_src) v_root = v_root->view_src;
-        const size_t v_size = (size_t)v_root->ne[0] * v_root->ne[1] * v_root->ne[2] * sizeof(half);
+        const size_t v_size = (size_t) ggml_nelements(v_root) * sizeof(half);
         if (v_size > kv_dequant_v_buf_size[device]) {
             if (kv_dequant_v_buf[device]) CUDA_CHECK(cudaFree(kv_dequant_v_buf[device]));
             CUDA_CHECK(cudaMalloc(&kv_dequant_v_buf[device], v_size));
@@ -1137,6 +1806,23 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         } else if (V->type == GGML_TYPE_TURBO8_0) {
             k_turbo8_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+        } else if (V->type == GGML_TYPE_TURBO1_CQ) {
+            k_turbo1_cq_dequant_f16<<<grid_v, 128, 0, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+        } else if (V->type == GGML_TYPE_TURBO1_TCQ) {
+            k_turbo1_tcq_dequant_f16<<<grid_v, 128, 0, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]), 1);
+        } else if (V->type == GGML_TYPE_TURBO1) {
+            // turbo1 V: per-row inverse FWHT → original domain (no graph un-rotation). Diagnostic:
+            // the rotated-V + single graph-FWHT path (turbo8-style) is broken for turbo1 V only.
+            k_turbo1_dequant_f16_inv_fwht<<<grid_v, 128, 0, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+        } else if (V->type == GGML_TYPE_TURBO1_NSN) {
+            const int vl_nsn = atoi(V->name + 9);
+            const float * o_v = (vl_nsn >= 0 && vl_nsn < PFHEAD_MAX_L)
+                ? turbo1_nsn_o_buf(device, 0) + (size_t) vl_nsn * PFHEAD_MAX_C : nullptr;
+            k_turbo1_nsn_dequant_f16<<<grid_v, 128, 0, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], o_v);
         } else if (V->type == GGML_TYPE_BF16) {
             // bf16 V (mixed K/V): cast to f16 in original domain. Not rotated, and the graph-level
             // inverse WHT is gated on V being a turbo type (llama-graph.cpp), so none is applied.
@@ -1148,6 +1834,117 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             // so no spurious un-rotation is applied here.
             k_q8_0_dequant_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+        }
+    }
+
+    if (vbr_stage2a_v) {
+        GGML_ASSERT(v_fp16 != nullptr);
+
+        const size_t bands_bytes = (size_t) V_row_bands->ne[0] * V_row_bands->ne[1] * sizeof(int32_t);
+        if (bands_bytes > vbr_stage2a_v_row_bands_buf_size[device]) {
+            if (vbr_stage2a_v_row_bands_buf[device]) CUDA_CHECK(cudaFree(vbr_stage2a_v_row_bands_buf[device]));
+            CUDA_CHECK(cudaMalloc(&vbr_stage2a_v_row_bands_buf[device], bands_bytes));
+            vbr_stage2a_v_row_bands_buf_size[device] = bands_bytes;
+        }
+        const ggml_tensor * V_row_bands_root = V_row_bands;
+        while (V_row_bands_root->view_src) {
+            V_row_bands_root = V_row_bands_root->view_src;
+        }
+        const cudaMemcpyKind band_copy_kind =
+            (V_row_bands_root->buffer == nullptr || ggml_backend_buffer_is_host(V_row_bands_root->buffer)) ?
+                cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
+        const char * band_data = (const char *) V_row_bands->data;
+        CUDA_CHECK(cudaMemcpyAsync(vbr_stage2a_v_row_bands_buf[device], band_data, bands_bytes, band_copy_kind, stream));
+
+        dim3 grid_copy(V->ne[1], V->ne[2], V->ne[3]);
+        const bool v_base_rotated = vbr_stage2a_v_type_uses_rotated_domain(V->type);
+        const bool v_promoted_rotated = vbr_stage2a_v_type_uses_rotated_domain(V_promoted->type);
+        const bool v_promoted_needs_rot_to_orig = !v_base_rotated && v_promoted_rotated;
+        const bool v_promoted_needs_orig_to_rot = v_base_rotated && !v_promoted_rotated;
+
+        if (V_promoted->type == GGML_TYPE_BF16 && !v_promoted_needs_rot_to_orig && !v_promoted_needs_orig_to_rot) {
+            k_vbr_stage2a_copy_promoted_rows_bf16<<<grid_copy, V->ne[0], 0, stream>>>(
+                v_fp16, (const char *) V_promoted->data, vbr_stage2a_v_row_bands_buf[device], V_row_bands->ne[1],
+                V_row_bands->ne[0], V->ne[0], V->ne[1], V_promoted->ne[1], V->ne[2],
+                V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
+        } else if (V_promoted->type == GGML_TYPE_F16 && !v_promoted_needs_rot_to_orig && !v_promoted_needs_orig_to_rot) {
+            k_vbr_stage2a_copy_promoted_rows_native_f16<<<grid_copy, V->ne[0], 0, stream>>>(
+                v_fp16, (const char *) V_promoted->data, vbr_stage2a_v_row_bands_buf[device], V_row_bands->ne[1],
+                V_row_bands->ne[0], V->ne[0], V->ne[1], V_promoted->ne[1], V->ne[2],
+                V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
+        } else {
+            const ggml_tensor * vp_root = V_promoted;
+            while (vp_root->view_src) vp_root = vp_root->view_src;
+            const size_t vp_size = (size_t) ggml_nelements(vp_root) * sizeof(half);
+            if (vp_size > kv_dequant_v_promoted_buf_size[device]) {
+                if (kv_dequant_v_promoted_buf[device]) CUDA_CHECK(cudaFree(kv_dequant_v_promoted_buf[device]));
+                CUDA_CHECK(cudaMalloc(&kv_dequant_v_promoted_buf[device], vp_size));
+                kv_dequant_v_promoted_buf_size[device] = vp_size;
+            }
+            half * vp_fp16 = kv_dequant_v_promoted_buf[device];
+
+            dim3 grid_vp(V_promoted->ne[1], V_promoted->ne[2], V_promoted->ne[3]);
+            if (V_promoted->type == GGML_TYPE_TURBO3_TCQ) {
+                static bool tcq_fattn_vp_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+                static int tcq_hot_vp = -1; if (tcq_hot_vp < 0) tcq_hot_vp = getenv("TURBO_TCQ_HOTSWAP") ? 1 : 0;
+                if (!tcq_fattn_vp_cb_loaded[device] || tcq_hot_vp) {
+                    tcq_fattn_vp_cb_loaded[device] = true;
+                    turbo_tcq_load_kv_decode();
+                }
+                k_turbo3_tcq_dequant_f16<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
+                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
+                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3], tcq_compute_alpha_v(V_promoted->type, V_promoted->ne[1]), 1);
+            } else if (V_promoted->type == GGML_TYPE_TURBO2_TCQ) {
+                static bool tcq2_fattn_vp_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+                static int tcq2_hot_vp = -1; if (tcq2_hot_vp < 0) tcq2_hot_vp = getenv("TURBO_TCQ_HOTSWAP") ? 1 : 0;
+                if (!tcq2_fattn_vp_cb_loaded[device] || tcq2_hot_vp) {
+                    tcq2_fattn_vp_cb_loaded[device] = true;
+                    turbo2_tcq_load_kv_decode();
+                }
+                k_turbo2_tcq_dequant_f16<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
+                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
+                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3], tcq_compute_alpha_v(V_promoted->type, V_promoted->ne[1]), 1);
+            } else if (V_promoted->type == GGML_TYPE_TURBO1_TCQ) {
+                k_turbo1_tcq_dequant_f16<<<grid_vp, 128, 0, stream>>>(
+                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
+                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3], tcq_compute_alpha_v(V_promoted->type, V_promoted->ne[1]), 1);
+            } else if (V_promoted->type == GGML_TYPE_TURBO4_0) {
+                k_turbo4_dequant_f16<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
+                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
+                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
+            } else if (V_promoted->type == GGML_TYPE_TURBO8_0) {
+                k_turbo8_dequant_f16<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
+                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
+                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
+            } else if (V_promoted->type == GGML_TYPE_Q8_0) {
+                k_q8_0_dequant_f16_tkhe<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
+                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
+                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
+            } else if (V_promoted->type == GGML_TYPE_BF16) {
+                k_bf16_to_f16_tkhe<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
+                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
+                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
+            } else if (V_promoted->type == GGML_TYPE_F16) {
+                k_vbr_stage2a_cast_native_f16_tkhe<<<grid_vp, V_promoted->ne[0], 0, stream>>>(
+                    (const char *)V_promoted->data, vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2],
+                    V_promoted->nb[1], V_promoted->nb[2], V_promoted->nb[3]);
+            }
+
+            if (v_promoted_needs_rot_to_orig || v_promoted_needs_orig_to_rot) {
+                GGML_ASSERT(V_promoted->ne[0] % 128 == 0);
+                dim3 grid_rot((unsigned int)(V_promoted->ne[0] / 128), V_promoted->ne[1], V_promoted->ne[2] * V_promoted->ne[3]);
+                if (v_promoted_needs_rot_to_orig) {
+                    k_vbr_stage2a_v_rotated_to_original_f16<<<grid_rot, 128, 0, stream>>>(
+                        vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2], V_promoted->ne[3]);
+                } else {
+                    k_vbr_stage2a_v_original_to_rotated_f16<<<grid_rot, 128, 0, stream>>>(
+                        vp_fp16, V_promoted->ne[0], V_promoted->ne[1], V_promoted->ne[2], V_promoted->ne[3]);
+                }
+            }
+
+            k_vbr_stage2a_copy_promoted_rows_f16<<<grid_copy, V->ne[0], 0, stream>>>(
+                v_fp16, vp_fp16, vbr_stage2a_v_row_bands_buf[device], V_row_bands->ne[1],
+                V_row_bands->ne[0], V->ne[0], V->ne[1], V_promoted->ne[1], V->ne[2]);
         }
     }
 
@@ -1173,11 +1970,20 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         V_f16.nb[3] = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
     }
 
-    // Rotate Q for turbo pre-rotate-queries (only when K is in rotated space)
-    // turbo4/turbo8 K is dequanted via inverse FWHT → original domain, so Q stays unrotated
+    // Rotate Q for turbo pre-rotate-queries (only when K is in rotated space).
+    // turbo4/turbo8 and TCQ K are dequanted via inverse FWHT -> original domain, so Q stays unrotated.
     const ggml_tensor * Q = dst->src[0];
     float * q_rotated = nullptr;
-    if (turbo_k && K->type != GGML_TYPE_TURBO4_0 && K->type != GGML_TYPE_TURBO8_0 && Q->ne[0] % 128 == 0) {
+    if (turbo_k &&
+            K->type != GGML_TYPE_TURBO4_0 &&
+            K->type != GGML_TYPE_TURBO8_0 &&
+            K->type != GGML_TYPE_TURBO3_TCQ &&
+            K->type != GGML_TYPE_TURBO2_TCQ &&
+            K->type != GGML_TYPE_TURBO1 &&
+            K->type != GGML_TYPE_TURBO1_NSN &&
+            K->type != GGML_TYPE_TURBO1_CQ &&
+            K->type != GGML_TYPE_TURBO1_TCQ &&
+            Q->ne[0] % 128 == 0) {
         const size_t q_size = ggml_nelements(Q) * sizeof(float);
         if (q_size > q_rot_buf_size[device]) {
             if (q_rot_buf[device]) CUDA_CHECK(cudaFree(q_rot_buf[device]));
@@ -1203,6 +2009,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     }
     dst->src[1] = k_fp16 ? &K_f16 : orig_k;
     dst->src[2] = v_fp16 ? &V_f16 : orig_v;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 
     // Dispatch to MMA kernel (sees rotated Q, fp16 K/V, uses tensor cores)
     ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
@@ -1443,7 +2250,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     {
         auto is_turbo_type = [](ggml_type t) {
             return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO8_0 ||
-                   t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
+                   t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ || t == GGML_TYPE_TURBO1 || t == GGML_TYPE_TURBO1_NSN || t == GGML_TYPE_TURBO1_CQ || t == GGML_TYPE_TURBO1_TCQ;
         };
         // Asymmetric turbo K/V (e.g. q8_0 K + turbo4 V) is handled by the turbo dequant-to-f16
         // FA paths (ggml_cuda_turbo_prefill_attend for prefill, do_decode_dequant for decode).
@@ -1474,6 +2281,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_TURBO8_0:
         case GGML_TYPE_TURBO3_TCQ:
         case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO1:
+        case GGML_TYPE_TURBO1_NSN:
+        case GGML_TYPE_TURBO1_CQ:
+        case GGML_TYPE_TURBO1_TCQ:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -1490,7 +2301,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0 ||
         K->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO8_0 ||
         K->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO3_TCQ ||
-        K->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO2_TCQ) {
+        K->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO2_TCQ ||
+        K->type == GGML_TYPE_TURBO1    || V->type == GGML_TYPE_TURBO1 ||
+        K->type == GGML_TYPE_TURBO1_NSN || K->type == GGML_TYPE_TURBO1_CQ || V->type == GGML_TYPE_TURBO1_NSN || V->type == GGML_TYPE_TURBO1_CQ ||
+        K->type == GGML_TYPE_TURBO1_TCQ || V->type == GGML_TYPE_TURBO1_TCQ) {
         if (Q->ne[0] <= 512 && Q->ne[0] % 64 == 0)
             return BEST_FATTN_KERNEL_VEC;
         return BEST_FATTN_KERNEL_NONE;
@@ -1640,12 +2454,16 @@ static void cert_dump_q(ggml_backend_cuda_context & ctx, const ggml_tensor * dst
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    turbo1_tcq_load_cb_fattn();  // E7: turbo1_tcq K/V decode codebooks (TURBO1_TCQ_CB_K/_V, cold-start = turbo2 anchor)
+
+    turbo1_load_dither_fattn();  // E6: one-time TURBO1_DITHER env → fattn decode constants
 
     cert_dump_q(ctx, dst);
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+    const bool vbr_stage2a = dst->src[5] != nullptr || dst->src[6] != nullptr || dst->src[7] != nullptr || dst->src[8] != nullptr;
 
     // Turbo prefill: dequant to fp16 and use tensor core MMA for batched attention.
     // turbo4 K uses inverse FWHT during dequant — mixes centroids in float32 shmem before
@@ -1656,8 +2474,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         if (e) fprintf(stderr, "TURBO_PREFILL_VEC=%s: forcing vec prefill for turbo types\n", e);
         return e != nullptr;
     }();
-    const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ ||
-                          V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ;
+    const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1 || K->type == GGML_TYPE_TURBO1_NSN || K->type == GGML_TYPE_TURBO1_CQ || K->type == GGML_TYPE_TURBO1_TCQ ||
+                          V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1 || V->type == GGML_TYPE_TURBO1_NSN || V->type == GGML_TYPE_TURBO1_CQ || V->type == GGML_TYPE_TURBO1_TCQ;
+
+    if (vbr_stage2a) {
+        GGML_ASSERT(turbo_kv);
+        GGML_ASSERT(Q->ne[0] <= 256);
+        ggml_cuda_turbo_prefill_attend(ctx, dst);
+        return;
+    }
 
     // Fused MMA turbo: reads raw turbo bytes directly in the MMA kernel, no intermediate fp16 buffers.
     // Phase 1: turbo4_0 matched K/V at D=128. Set GGML_TURBO_MMA_FUSED=0 to disable.
@@ -1669,12 +2494,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
         return true;
     }();
-    const bool turbo_matched = K->type == V->type && turbo_kv;
+    // turbo1 has no fused MMA-turbo instance (dequant-to-f16 codec only); exclude it so it
+    // does not enter the fused path and fall through with no kernel launched.
+    const bool turbo_matched = K->type == V->type && turbo_kv && K->type != GGML_TYPE_TURBO1 && K->type != GGML_TYPE_TURBO1_NSN && K->type != GGML_TYPE_TURBO1_CQ && K->type != GGML_TYPE_TURBO1_TCQ;
+    const bool turbo1_tcq_matched = K->type == GGML_TYPE_TURBO1_TCQ && V->type == GGML_TYPE_TURBO1_TCQ && Q->ne[0] == 128;
     // Asymmetric fused "q6 sweet spot" (6.124 bpw): turbo8 K + turbo4 V. Only this pair is
     // instantiated, and only at D=256 (dense Qwen geometry). Both stay WHT-rotated like the
     // matched path (Q pre-rotated below, V un-rotated at graph level).
     const bool turbo_fused_asym = K->type == GGML_TYPE_TURBO8_0 && V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256;
-    if (turbo_mma_fused && (turbo_matched || turbo_fused_asym) && Q->ne[1] <= 4 &&
+    if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) && Q->ne[1] <= 4 &&
         (Q->ne[0] == 128 || Q->ne[0] == 256) &&
         turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         cudaStream_t stream = ctx.stream();
@@ -1699,10 +2527,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             }
         }
 
-        // Pre-rotate Q: all turbo K types stay in WHT-rotated domain, so Q must be rotated.
+        // Pre-rotate Q: most fused turbo K types stay in WHT-rotated domain. The turbo1_tcq
+        // fused loader emits original-domain K/V after inverse FWHT, matching its unfused path.
         ggml_tensor Q_rot_fused;
         ggml_tensor * orig_q_fused = nullptr;
-        if (Q->ne[0] % 128 == 0) {
+        const bool fused_k_original_domain = K->type == GGML_TYPE_TURBO1_TCQ;
+        if (!fused_k_original_domain && Q->ne[0] % 128 == 0) {
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
             if (q_size > q_rot_buf_size[device]) {
                 if (q_rot_buf[device]) CUDA_CHECK(cudaFree(q_rot_buf[device]));
@@ -1719,7 +2549,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
 
         // TCQ decode alpha for V dequant
-        if (V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ) {
+        if (V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1_TCQ) {
             load_tcq_decode_alpha(device);
             if (d_tcq_decode_alpha_v_static == 0.0f) {
                 float alpha = tcq_compute_alpha_v(V->type, V->ne[1]);
@@ -1742,6 +2572,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
+        else if (K->type == GGML_TYPE_TURBO1_TCQ && V->type == GGML_TYPE_TURBO1_TCQ) {
+            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<128, 128, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO1_TCQ>(ctx, dst);
+        }
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_0)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO2_0,   GGML_TYPE_TURBO2_0)
 #undef TURBO_FUSED_DISPATCH
@@ -1792,8 +2625,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // K and V are turbo (Gemma 4 ISWA global layers with K=V — Bug A2). Mixed q8_0+turbo
         // at D=512 stays on native VEC path because post-dequant q8_0 K + f16 V has no
         // working VEC template at D=512.
-        const bool turbo_k_only = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ;
-        const bool turbo_v_only = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ;
+        const bool turbo_k_only = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1 || K->type == GGML_TYPE_TURBO1_NSN || K->type == GGML_TYPE_TURBO1_CQ || K->type == GGML_TYPE_TURBO1_TCQ;
+        const bool turbo_v_only = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1 || V->type == GGML_TYPE_TURBO1_NSN || V->type == GGML_TYPE_TURBO1_CQ || V->type == GGML_TYPE_TURBO1_TCQ;
         // Mixed f16/q8_0 + turbo at D=512: dequant K (and turbo V) to f16 so FA dispatches as
         // F16/F16 D=512 (which exists). Without this, the native VEC templates needed are
         // either missing (F16↔turbo) or have buggy SASS on sm_120 PTX-JIT (Q8_0↔turbo4 etc).
@@ -1805,7 +2638,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // VEC path (would hit BEST_FATTN_KERNEL_VEC → unregistered template → GGML_ABORT), so
         // force dequant whenever turbo8 is on either side, regardless of the override. Other
         // turbo types do have native VEC kernels and honor the override.
-        const bool turbo8_involved = K->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO8_0;
+        // turbo8 and turbo1 have no native VEC kernel (dequant-to-f16 only) — force dequant even
+        // under GGML_TURBO_DECODE_NATIVE so we never route them to an unregistered VEC template.
+        const bool turbo8_involved = K->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO8_0 ||
+                                     K->type == GGML_TYPE_TURBO1   || V->type == GGML_TYPE_TURBO1 ||
+                                     K->type == GGML_TYPE_TURBO1_NSN || K->type == GGML_TYPE_TURBO1_CQ || K->type == GGML_TYPE_TURBO1_TCQ || V->type == GGML_TYPE_TURBO1_NSN || V->type == GGML_TYPE_TURBO1_CQ || V->type == GGML_TYPE_TURBO1_TCQ;
         const bool do_decode_dequant = (!turbo_decode_native || turbo8_involved) && turbo_kv && (Q->ne[0] <= 256 || (Q->ne[0] <= 512 && both_dequantable_512));
 
         half * k_fp16_dec = nullptr;
@@ -1833,7 +2670,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 // (including layers with smaller caches) reuse the same allocation.
                 const ggml_tensor * k_root = K;
                 while (k_root->view_src) k_root = k_root->view_src;
-                const size_t k_max_bytes = (size_t)k_root->ne[0] * k_root->ne[1] * k_root->ne[2] * sizeof(half);
+                const size_t k_max_bytes = (size_t) ggml_nelements(k_root) * sizeof(half);
                 if (k_max_bytes > kv_dequant_k_buf_size[device_dec]) {
                     if (kv_dequant_k_buf[device_dec]) CUDA_CHECK(cudaFree(kv_dequant_k_buf[device_dec]));
                     CUDA_CHECK(cudaMalloc(&kv_dequant_k_buf[device_dec], k_max_bytes));
@@ -1876,6 +2713,21 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 } else if (K->type == GGML_TYPE_TURBO8_0) {
                     k_turbo8_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                } else if (K->type == GGML_TYPE_TURBO1) {
+                    k_turbo1_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                } else if (K->type == GGML_TYPE_TURBO1_CQ) {
+                    k_turbo1_cq_dequant_f16<<<grid_k, 128, 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                } else if (K->type == GGML_TYPE_TURBO1_TCQ) {
+                    k_turbo1_tcq_dequant_f16<<<grid_k, 128, 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k, 0);
+                } else if (K->type == GGML_TYPE_TURBO1_NSN) {
+                    const int kl_nsn = atoi(K->name + 9);
+                    const float * o_k = (kl_nsn >= 0 && kl_nsn < PFHEAD_MAX_L)
+                        ? turbo1_nsn_o_buf(device_dec, 1) + (size_t) kl_nsn * PFHEAD_MAX_C : nullptr;
+                    k_turbo1_nsn_dequant_f16<<<grid_k, 128, 0, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], o_k);
                 } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
                     k_turbo3_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
@@ -1907,7 +2759,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 // Same kv_size-based sizing as K above — see comment there.
                 const ggml_tensor * v_root = V;
                 while (v_root->view_src) v_root = v_root->view_src;
-                const size_t v_max_bytes = (size_t)v_root->ne[0] * v_root->ne[1] * v_root->ne[2] * sizeof(half);
+                const size_t v_max_bytes = (size_t) ggml_nelements(v_root) * sizeof(half);
                 if (v_max_bytes > kv_dequant_v_buf_size[device_dec]) {
                     if (kv_dequant_v_buf[device_dec]) CUDA_CHECK(cudaFree(kv_dequant_v_buf[device_dec]));
                     CUDA_CHECK(cudaMalloc(&kv_dequant_v_buf[device_dec], v_max_bytes));
@@ -1932,6 +2784,21 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 } else if (V->type == GGML_TYPE_TURBO8_0) {
                     k_turbo8_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                } else if (V->type == GGML_TYPE_TURBO1) {
+                    k_turbo1_dequant_f16_inv_fwht<<<grid_v, 128, 0, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                } else if (V->type == GGML_TYPE_TURBO1_CQ) {
+                    k_turbo1_cq_dequant_f16<<<grid_v, 128, 0, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                } else if (V->type == GGML_TYPE_TURBO1_TCQ) {
+                    k_turbo1_tcq_dequant_f16<<<grid_v, 128, 0, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]), 1);
+                } else if (V->type == GGML_TYPE_TURBO1_NSN) {
+                    const int vl_nsn = atoi(V->name + 9);
+                    const float * o_v = (vl_nsn >= 0 && vl_nsn < PFHEAD_MAX_L)
+                        ? turbo1_nsn_o_buf(device_dec, 0) + (size_t) vl_nsn * PFHEAD_MAX_C : nullptr;
+                    k_turbo1_nsn_dequant_f16<<<grid_v, 128, 0, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], o_v);
                 } else if (V->type == GGML_TYPE_TURBO3_0) {
                     k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);

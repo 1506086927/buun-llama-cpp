@@ -4,10 +4,12 @@
 
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -199,6 +201,124 @@ static void common_params_fit_impl(
         }
     }
 
+    auto sum_context_bytes = [&](const dmds_t & dmds) {
+        int64_t result = 0;
+        if (nd == 0) {
+            result += dmds.back().mb.context;
+        } else {
+            for (size_t id = 0; id < nd; id++) {
+                result += dmds[id].mb.context;
+            }
+        }
+        return result;
+    };
+
+    auto round_ctx_down = [](uint64_t n_ctx) {
+        n_ctx -= n_ctx % 256;
+        n_ctx = std::max<uint64_t>(n_ctx, 256);
+        n_ctx = std::min<uint64_t>(n_ctx, std::numeric_limits<uint32_t>::max());
+        return (uint32_t) n_ctx;
+    };
+
+    auto vbr_estimate_ctx_from_total_budget = [&](uint64_t budget_bytes, const dmds_t & dmds_full) {
+        if (!cparams->vbr_enabled || cparams->n_ctx != 0 || hp_nct == 0 || budget_bytes == 0) {
+            return uint32_t(0);
+        }
+
+        const int64_t ctx_full = sum_context_bytes(dmds_full);
+        if (ctx_full <= 0) {
+            return uint32_t(0);
+        }
+
+        const uint32_t n_ctx_probe = std::min<uint32_t>(hp_nct, std::max<uint32_t>(256, std::min<uint32_t>(n_ctx_min, hp_nct)));
+        if (n_ctx_probe >= hp_nct) {
+            return round_ctx_down((uint64_t) budget_bytes * hp_nct / (uint64_t) ctx_full);
+        }
+
+        cparams->n_ctx = n_ctx_probe;
+        const dmds_t dmds_probe = common_get_device_memory_data(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        cparams->n_ctx = 0;
+
+        const int64_t ctx_probe = sum_context_bytes(dmds_probe);
+        if (ctx_probe <= 0 || ctx_full <= ctx_probe) {
+            return round_ctx_down((uint64_t) budget_bytes * hp_nct / (uint64_t) ctx_full);
+        }
+
+        uint64_t n_ctx_est = n_ctx_probe;
+        if (budget_bytes > (uint64_t) ctx_probe) {
+            n_ctx_est += (budget_bytes - (uint64_t) ctx_probe) * (hp_nct - n_ctx_probe) / (uint64_t) (ctx_full - ctx_probe);
+        } else {
+            n_ctx_est = (uint64_t) budget_bytes * n_ctx_probe / (uint64_t) ctx_probe;
+        }
+
+        return round_ctx_down(n_ctx_est);
+    };
+
+    auto vbr_estimate_ctx_from_remaining = [&](const dmds_t & dmds_full, const std::vector<int64_t> & projected_free_per_device, int64_t projected_free_host) {
+        if (!cparams->vbr_enabled || cparams->n_ctx != 0 || cparams->vbr_vram_budget_bytes != 0 || hp_nct == 0) {
+            return uint32_t(0);
+        }
+
+        const uint32_t n_ctx_probe = std::min<uint32_t>(hp_nct, std::max<uint32_t>(256, std::min<uint32_t>(n_ctx_min, hp_nct)));
+        if (n_ctx_probe >= hp_nct) {
+            return uint32_t(0);
+        }
+
+        cparams->n_ctx = n_ctx_probe;
+        const dmds_t dmds_probe = common_get_device_memory_data(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        cparams->n_ctx = 0;
+
+        uint64_t n_ctx_est = std::numeric_limits<uint64_t>::max();
+        auto update_estimate = [&](int64_t ctx_full, int64_t ctx_probe, int64_t projected_free, int64_t margin) {
+            if (ctx_full <= 0) {
+                return;
+            }
+            const int64_t ctx_budget = ctx_full + projected_free - margin;
+            if (ctx_budget <= ctx_full || ctx_budget <= 0) {
+                return;
+            }
+
+            uint64_t local_est = hp_nct;
+            if (ctx_probe > 0 && ctx_full > ctx_probe) {
+                local_est = n_ctx_probe + (uint64_t) (ctx_budget - ctx_probe) * (hp_nct - n_ctx_probe) / (uint64_t) (ctx_full - ctx_probe);
+            } else {
+                local_est = (uint64_t) ctx_budget * hp_nct / (uint64_t) ctx_full;
+            }
+            n_ctx_est = std::min(n_ctx_est, local_est);
+        };
+
+        if (nd == 0) {
+            update_estimate(dmds_full.back().mb.context, dmds_probe.back().mb.context, projected_free_host, margins[0]);
+        } else {
+            for (size_t id = 0; id < nd; id++) {
+                update_estimate(dmds_full[id].mb.context, dmds_probe[id].mb.context, projected_free_per_device[id], margins[id]);
+            }
+        }
+
+        if (n_ctx_est == std::numeric_limits<uint64_t>::max() || n_ctx_est <= hp_nct) {
+            return uint32_t(0);
+        }
+
+        return round_ctx_down(n_ctx_est);
+    };
+
+    auto vbr_select_ctx = [&](const dmds_t & dmds_full, const std::vector<int64_t> & projected_free_per_device, int64_t projected_free_host) {
+        uint32_t vbr_n_ctx = 0;
+        if (cparams->vbr_vram_budget_bytes != 0) {
+            vbr_n_ctx = vbr_estimate_ctx_from_total_budget(cparams->vbr_vram_budget_bytes, dmds_full);
+        } else {
+            vbr_n_ctx = vbr_estimate_ctx_from_remaining(dmds_full, projected_free_per_device, projected_free_host);
+        }
+        if (vbr_n_ctx == 0) {
+            return false;
+        }
+
+        cparams->n_ctx = vbr_n_ctx;
+        LOG_TRC("%s: VBR selected n_ctx = %" PRIu32 " from %s\n",
+            __func__, cparams->n_ctx, cparams->vbr_vram_budget_bytes != 0 ? "explicit KV VRAM budget" : "remaining memory budget");
+        return true;
+    };
+
     int64_t sum_free            = 0;
     int64_t sum_projected_free  = 0;
     int64_t sum_projected_used  = 0;
@@ -213,6 +333,9 @@ static void common_params_fit_impl(
         LOG_INF("%s: projected to use %" PRId64 " MiB of host memory vs. %" PRId64 " MiB of total host memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (sum_projected_free >= margins[0]) {
+            if (vbr_select_ctx(dmds_full, projected_free_per_device, sum_projected_free)) {
+                return;
+            }
             LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of system memory, no changes needed\n",
                 __func__, sum_projected_free/MiB, margins[0]/MiB);
             return;
@@ -243,6 +366,9 @@ static void common_params_fit_impl(
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (nd == 1) {
             if (projected_free_per_device[0] >= margins[0]) {
+                if (vbr_select_ctx(dmds_full, projected_free_per_device, 0)) {
+                    return;
+                }
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
                 return;
@@ -256,6 +382,9 @@ static void common_params_fit_impl(
                 }
             }
             if (!changes_needed) {
+                if (vbr_select_ctx(dmds_full, projected_free_per_device, 0)) {
+                    return;
+                }
                 LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
                 return;
             }

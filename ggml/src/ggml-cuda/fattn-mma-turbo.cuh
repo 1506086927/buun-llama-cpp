@@ -92,8 +92,16 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
             turbo2_tcq_load_kv_decode();
         }
     }
-    if constexpr (type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ ||
-                  type_V == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO2_TCQ) {
+    if constexpr (type_K == GGML_TYPE_TURBO1_TCQ || type_V == GGML_TYPE_TURBO1_TCQ) {
+        static bool cb1_loaded = false;
+        static int cb1_hot = -1; if (cb1_hot < 0) cb1_hot = getenv("TURBO1_TCQ_HOTSWAP") ? 1 : 0;
+        if (!cb1_loaded || cb1_hot) {
+            cb1_loaded = true;
+            turbo1_tcq_load_kv_encode();
+        }
+    }
+    if constexpr (type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ || type_K == GGML_TYPE_TURBO1_TCQ ||
+                  type_V == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO1_TCQ) {
         const ggml_tensor * V = dst->src[2];
         const int64_t n_kv = V->ne[1] > 0 ? V->ne[1] : 1;
         const float ln_ctx = logf((float)n_kv);
@@ -116,6 +124,8 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
             alpha_v = 1.02f;  // flat optimum for the coord-descent codebook (K=iter374/V=iter500)
         } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
             alpha_v = 1.06f;  // flat optimum for the coord-descent codebook (K=iter195/V=iter208)
+        } else if constexpr (type_V == GGML_TYPE_TURBO1_TCQ) {
+            alpha_v = 1.14f;  // flat optimum for the turbo1_tcq K/V codebook pair.
         }
         CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha_v, sizeof(float)));
 
@@ -166,6 +176,7 @@ DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
+DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO1_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_0)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_0)
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO2_0,   GGML_TYPE_TURBO2_0)

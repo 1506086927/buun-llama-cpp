@@ -616,6 +616,24 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    std::string vbr_budget = "dynamic"; // VBR target budget: dynamic or a fixed tier/bit width
+    std::string vbr_min_bits = "auto";  // VBR aggregate effective bits/value floor for dynamic capacity planning
+    std::string vbr_vram_budget = "auto"; // VBR KV VRAM budget: auto or explicit byte/suffixed size
+    std::string vbr_policy = "auto";    // VBR policy ladder JSON/path; auto checks VBR_POLICY_LADDER env
+    std::string vbr_selected_family;     // selected VBR ladder family, static or dynamic
+    std::string vbr_selected_policy;     // selected VBR measured policy/rung name
+    std::string vbr_selected_schedule;   // selected VBR schedule path
+    double vbr_min_bits_value = 0.0;     // requested aggregate floor in effective bits/value, 0 == auto/none; not a per-codec ban
+    double vbr_capacity_bits = 0.0;      // selected supported capacity floor in effective bits/value, 0 == auto/none
+    double vbr_selected_bpv = 0.0;       // measured BPV of the selected policy/rung
+    double vbr_selected_kld = 0.0;       // measured KLD of the selected policy/rung
+    uint64_t vbr_vram_budget_bytes = 0;  // explicit VBR KV VRAM budget in bytes, 0 == auto
+    bool vbr_budget_explicit = false;   // whether --vbr-budget/--vbr-bits was provided
+    bool vbr_min_bits_explicit = false; // whether --vbr-min-bits/--vbr-floor was provided
+    bool vbr_vram_budget_explicit = false; // whether --vbr-vram/--vbr-vram-budget was provided
+    bool vbr_policy_explicit = false;   // whether --vbr-policy was provided
+    bool vbr_cache_type_k = false;      // whether K was selected via the VBR cache-type alias
+    bool vbr_cache_type_v = false;      // whether V was selected via the VBR cache-type alias
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

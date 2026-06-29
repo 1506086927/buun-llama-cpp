@@ -3,6 +3,8 @@
 #include "turbo-quant-cuda.cuh"
 #include <cstring>
 #include <cerrno>
+#include <cctype>
+#include <string>
 #include <vector>
 
 static void load_turbo4_alpha(int device) {
@@ -194,6 +196,9 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
 
     ggml_cuda_pdl_sync();
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    if (dst_row < 0) {
+        return;
+    }
 
     const float * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
     block_type * dst_row_ptr = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_type);
@@ -256,6 +261,79 @@ static void set_rows_cuda_quant(
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
             ne01_fd, ne02_fd, ne11_fd, ne12_fd, kmean_mu);
     }
+}
+
+// === TURBO1_NSN: runtime per-chunk per-head centering buffer (shared encode<->decode) ===
+// SINGLE instance per device + K/V, defined here (set-rows.cu), read by fattn.cu via the extern
+// decl in turbo-quant-cuda.cuh. Sized [PFHEAD_MAX_L layers][PFHEAD_MAX_C channels]; o[layer][i00+j]
+// = mean over the token chunk of the token-normalized vn for that head's channel.
+float * turbo1_nsn_o_buf(int device, int is_k) {
+    static float * bk[16] = {};
+    static float * bv[16] = {};
+    if (device < 0 || device >= 16) return nullptr;
+    float ** b = is_k ? bk : bv;
+    if (!b[device]) {
+        CUDA_CHECK(cudaMalloc(&b[device], (size_t) PFHEAD_MAX_L * PFHEAD_MAX_C * sizeof(float)));
+        CUDA_CHECK(cudaMemset(b[device], 0, (size_t) PFHEAD_MAX_L * PFHEAD_MAX_C * sizeof(float)));
+    }
+    return b[device];
+}
+
+// Pass 1: per-(head,channel) mean o over the token chunk, on token-normalized vectors.
+// grid.x = n_heads (ne00/128), block = 128 threads (channel within head).
+static __global__ void k_turbo1_nsn_reduce_o(
+        const float * __restrict__ src0, float * __restrict__ o_out,
+        const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03) {
+    const int head = blockIdx.x;
+    const int tid  = threadIdx.x;
+    const int c    = head * 128 + tid;
+    __shared__ float sh[128];
+    float accum = 0.0f;
+    int64_t cnt = 0;
+    for (int64_t i3 = 0; i3 < ne03; i3++)
+    for (int64_t i2 = 0; i2 < ne02; i2++)
+    for (int64_t i1 = 0; i1 < ne01; i1++) {
+        const float * row = src0 + i1*s01 + i2*s02 + i3*s03;
+        const float v = row[c];
+        sh[tid] = v * v;
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; __syncthreads(); }
+        const float norm = sqrtf(sh[0]);
+        __syncthreads();
+        const float inv = norm > 1e-12f ? 1.0f / norm : 0.0f;
+        accum += v * 11.31370849898476f * inv; // vn = v * sqrt(128) / ||v_head||
+        cnt++;
+    }
+    o_out[c] = cnt > 0 ? accum / (float) cnt : 0.0f;
+}
+
+// Pass 2: quantize each 128-block using o (mirrors k_set_rows_quant index math).
+template<typename idx_t>
+static __global__ void k_set_rows_turbo1_nsn(
+        const float * __restrict__ src0, const idx_t * __restrict__ src1, block_turbo1_nsn * __restrict__ dst,
+        const int64_t ne_total, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s10, const int64_t s11, const int64_t s12, const int64_t s1, const int64_t s2, const int64_t s3,
+        const uint3 ne00, const uint3 ne01, const uint3 ne02, const uint3 ne11_fd, const uint3 ne12_fd,
+        const float * __restrict__ o_layer) {
+    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    if (i >= ne_total) return;
+    const int64_t i_base = i * 128;
+    uint32_t tmp = (uint32_t) i_base;
+    uint2 dm;
+    dm = fast_div_modulo(tmp, ne00); const int64_t i00 = dm.y; tmp = dm.x;
+    dm = fast_div_modulo(tmp, ne01); const int64_t i01 = dm.y; tmp = dm.x;
+    dm = fast_div_modulo(tmp, ne02); const int64_t i02 = dm.y; const int64_t i03 = dm.x;
+    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
+    const int64_t i10 = i01;
+    ggml_cuda_pdl_sync();
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    const float * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
+    block_turbo1_nsn * dst_row_ptr = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_turbo1_nsn);
+    const float * src_block = src0_row + i00;
+    block_turbo1_nsn * dst_block = dst_row_ptr + i00 / 128;
+    quantize_f32_turbo1_nsn_block(src_block, dst_block, o_layer + i00);
 }
 
 // Affine-tap mean vector for a turbo4/turbo8 set_rows dst (per-layer slice of the K or V mean
@@ -321,6 +399,9 @@ static __global__ void k_set_rows(const src_t * __restrict__ src0,
     ggml_cuda_pdl_sync();
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
     ggml_cuda_pdl_lc();
+    if (dst_row < 0) {
+        return;
+    }
 
     const src_t * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
     dst_t * dst_row_ptr    = dst + dst_row*s1 + i02*s2 + i03*s3;
@@ -389,17 +470,105 @@ static void ensure_tcq_bt_buf(int device, int64_t bytes_needed) {
 // Stores KV as f16, but injects per-row quantization error per a static
 // (position, layer, K/V) -> tier schedule from TURBO_RAGGED_SCHEDULE. Measures the
 // KLD cost of per-row precision without any ragged storage or mixed-dtype fattn.
+#define RAGGED_TIER_TURBO1_TCQ 11
+#define RAGGED_TIER_TURBO2_TCQ 22
+#define RAGGED_TIER_TURBO3_TCQ 33
+
+static bool ragged_has_turbo1_tcq[GGML_CUDA_MAX_DEVICES] = {};
+static bool ragged_has_turbo2_tcq[GGML_CUDA_MAX_DEVICES] = {};
+static bool ragged_has_turbo3_tcq[GGML_CUDA_MAX_DEVICES] = {};
+
 static bool ragged_schedule_active() {
     const char * e = getenv("TURBO_RAGGED_SCHEDULE");
     return e && e[0];
 }
 
+static bool ragged_read_schedule_file(const char * path, std::string & out) {
+    FILE * f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "RAGGED schedule: cannot open %s (%s)\n", path, strerror(errno));
+        return false;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fprintf(stderr, "RAGGED schedule: cannot seek %s (%s)\n", path, strerror(errno));
+        fclose(f);
+        return false;
+    }
+    const long n = ftell(f);
+    if (n < 0) {
+        fprintf(stderr, "RAGGED schedule: cannot size %s (%s)\n", path, strerror(errno));
+        fclose(f);
+        return false;
+    }
+    rewind(f);
+    out.resize((size_t) n);
+    if (n > 0) {
+        const size_t got = fread(&out[0], 1, (size_t) n, f);
+        if (got != (size_t) n) {
+            fprintf(stderr, "RAGGED schedule: short read %s (%zu/%ld bytes)\n", path, got, n);
+            fclose(f);
+            out.clear();
+            return false;
+        }
+    }
+    fclose(f);
+    return true;
+}
+
+static bool ragged_load_schedule_text(const char * env, std::string & out) {
+    if (!env || !env[0]) return false;
+    if (env[0] == '@') {
+        return ragged_read_schedule_file(env + 1, out);
+    }
+    if (!strchr(env, '=') && !strchr(env, ';')) {
+        return ragged_read_schedule_file(env, out);
+    }
+    out = env;
+    return true;
+}
+
 static int ragged_parse_tier(const char * s) {
-    while (*s == ' ') s++;
+    while (*s && isspace((unsigned char) *s)) s++;
+
+    char norm[64];
+    int n = 0;
+    for (const char * p = s; *p && !isspace((unsigned char) *p) && n < (int) sizeof(norm) - 1; p++) {
+        if (*p == '_' || *p == '-') continue;
+        norm[n++] = (char) tolower((unsigned char) *p);
+    }
+    norm[n] = 0;
+
+    if (strcmp(norm, "t1tcq") == 0 || strcmp(norm, "1tcq") == 0 ||
+        strcmp(norm, "tcq1") == 0 || strcmp(norm, "turbo1tcq") == 0) {
+        return RAGGED_TIER_TURBO1_TCQ;
+    }
+    if (strcmp(norm, "t3tcq") == 0 || strcmp(norm, "3tcq") == 0 ||
+        strcmp(norm, "tcq3") == 0 || strcmp(norm, "turbo3tcq") == 0) {
+        return RAGGED_TIER_TURBO3_TCQ;
+    }
+    if (strcmp(norm, "t2tcq") == 0 || strcmp(norm, "2tcq") == 0 ||
+        strcmp(norm, "tcq2") == 0 || strcmp(norm, "turbo2tcq") == 0) {
+        return RAGGED_TIER_TURBO2_TCQ;
+    }
+
     if (*s == 't' || *s == 'T') s++;
     if (*s == 'f' || *s == 'F') return 16;   // fp16 / f16
     const int v = atoi(s);
     return (v == 16 || v == 8 || v == 4 || v == 3 || v == 2) ? v : 16;
+}
+
+static const char * ragged_tier_name(int tier) {
+    switch (tier) {
+        case 16: return "f16";
+        case 8:  return "t8";
+        case 4:  return "t4";
+        case 3:  return "t3";
+        case 2:  return "t2";
+        case RAGGED_TIER_TURBO1_TCQ: return "t1tcq";
+        case RAGGED_TIER_TURBO3_TCQ: return "t3tcq";
+        case RAGGED_TIER_TURBO2_TCQ: return "t2tcq";
+        default: return "unknown";
+    }
 }
 
 static bool ragged_is_kv_cache(const char * name, int * layer, int * is_k) {
@@ -465,7 +634,7 @@ static void cert_dump_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 
 // Parse TURBO_RAGGED_SCHEDULE once per device and upload to constant memory.
 // Format: "default=t4;band=LO-HI:TIER[:Llo-Lhi][:cLo-Hi][:k|v];...". TIER in
-// {fp16,t8,t4,t3}. cLo-Hi = coord-block (128-FWHT) range within a row; for the
+// {fp16,t8,t4,t3,t2,t1tcq,t2tcq,t3tcq}. cLo-Hi = coord-block (128-FWHT) range within a row; for the
 // per-head axis, head h occupies cb [h*d_head/128, (h+1)*d_head/128).
 static void load_ragged_schedule(int device) {
     static bool loaded[GGML_CUDA_MAX_DEVICES] = {};
@@ -474,19 +643,32 @@ static void load_ragged_schedule(int device) {
     const char * env = getenv("TURBO_RAGGED_SCHEDULE");
     if (!env || !env[0]) return;
 
-    ragged_band bands[128];
-    int nbands = 0;
-    int default_tier = 16;
+    std::string schedule;
+    if (!ragged_load_schedule_text(env, schedule)) return;
 
-    char buf[8192];
-    strncpy(buf, env, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = 0;
+    ragged_band bands[RAGGED_MAX_BANDS];
+    int nbands = 0;
+    int dropped_bands = 0;
+    int default_tier = 16;
+    bool has_t1tcq = false;
+    bool has_t2tcq = false;
+    bool has_t3tcq = false;
+
+    std::vector<char> buf(schedule.begin(), schedule.end());
+    buf.push_back('\0');
     char * sp = nullptr;
-    for (char * tok = strtok_r(buf, ";", &sp); tok; tok = strtok_r(nullptr, ";", &sp)) {
-        while (*tok == ' ') tok++;
+    for (char * tok = strtok_r(buf.data(), ";", &sp); tok; tok = strtok_r(nullptr, ";", &sp)) {
+        while (*tok && isspace((unsigned char) *tok)) tok++;
         if (strncmp(tok, "default=", 8) == 0) {
             default_tier = ragged_parse_tier(tok + 8);
-        } else if (strncmp(tok, "band=", 5) == 0 && nbands < 128) {
+            has_t1tcq = has_t1tcq || default_tier == RAGGED_TIER_TURBO1_TCQ;
+            has_t2tcq = has_t2tcq || default_tier == RAGGED_TIER_TURBO2_TCQ;
+            has_t3tcq = has_t3tcq || default_tier == RAGGED_TIER_TURBO3_TCQ;
+        } else if (strncmp(tok, "band=", 5) == 0) {
+            if (nbands >= RAGGED_MAX_BANDS) {
+                dropped_bands++;
+                continue;
+            }
             ragged_band b = { 0, 2000000000, 0, 100000, 0, 100000, 0, 16 };
             char * sp2 = nullptr;
             int fi = 0;
@@ -496,6 +678,9 @@ static void load_ragged_schedule(int device) {
                     if (sscanf(fld, "%d-%d", &lo, &hi) == 2) { b.pos_lo = lo; b.pos_hi = hi; }
                 } else if (fi == 1) {
                     b.tier = ragged_parse_tier(fld);
+                    has_t1tcq = has_t1tcq || b.tier == RAGGED_TIER_TURBO1_TCQ;
+                    has_t2tcq = has_t2tcq || b.tier == RAGGED_TIER_TURBO2_TCQ;
+                    has_t3tcq = has_t3tcq || b.tier == RAGGED_TIER_TURBO3_TCQ;
                 } else if (fld[0] == 'L' || fld[0] == 'l') {
                     int a, c;
                     if (sscanf(fld + 1, "%d-%d", &a, &c) == 2) { b.lay_lo = a; b.lay_hi = c; }
@@ -514,11 +699,19 @@ static void load_ragged_schedule(int device) {
     if (nbands > 0) cudaMemcpyToSymbol(d_ragged_bands, bands, sizeof(ragged_band) * nbands);
     cudaMemcpyToSymbol(d_ragged_nbands, &nbands, sizeof(int));
     cudaMemcpyToSymbol(d_ragged_default_tier, &default_tier, sizeof(int));
-    fprintf(stderr, "RAGGED schedule (device %d): default_tier=%d, %d bands\n", device, default_tier, nbands);
+    ragged_has_turbo1_tcq[device] = has_t1tcq;
+    ragged_has_turbo2_tcq[device] = has_t2tcq;
+    ragged_has_turbo3_tcq[device] = has_t3tcq;
+    fprintf(stderr, "RAGGED schedule (device %d): default_tier=%s(%d), %d bands\n",
+            device, ragged_tier_name(default_tier), default_tier, nbands);
+    if (dropped_bands > 0) {
+        fprintf(stderr, "RAGGED schedule: dropped %d bands after RAGGED_MAX_BANDS=%d\n",
+                dropped_bands, RAGGED_MAX_BANDS);
+    }
     for (int i = 0; i < nbands; i++) {
-        fprintf(stderr, "  band[%d] pos[%d,%d) lay[%d,%d] cb[%d,%d) kv=%d tier=%d\n",
+        fprintf(stderr, "  band[%d] pos[%d,%d) lay[%d,%d] cb[%d,%d) kv=%d tier=%s(%d)\n",
                 i, bands[i].pos_lo, bands[i].pos_hi, bands[i].lay_lo, bands[i].lay_hi,
-                bands[i].cb_lo, bands[i].cb_hi, bands[i].kv, bands[i].tier);
+                bands[i].cb_lo, bands[i].cb_hi, bands[i].kv, ragged_tier_name(bands[i].tier), bands[i].tier);
     }
 }
 
@@ -551,6 +744,18 @@ static void load_ragged_content_mask(int device) {
     }
     fclose(f);
 
+    bool has_t1tcq = false;
+    bool has_t2tcq = false;
+    bool has_t3tcq = false;
+    for (size_t i = 0; i < n; i++) {
+        has_t1tcq = has_t1tcq || host[i] == RAGGED_TIER_TURBO1_TCQ;
+        has_t2tcq = has_t2tcq || host[i] == RAGGED_TIER_TURBO2_TCQ;
+        has_t3tcq = has_t3tcq || host[i] == RAGGED_TIER_TURBO3_TCQ;
+    }
+    ragged_has_turbo1_tcq[device] = ragged_has_turbo1_tcq[device] || has_t1tcq;
+    ragged_has_turbo2_tcq[device] = ragged_has_turbo2_tcq[device] || has_t2tcq;
+    ragged_has_turbo3_tcq[device] = ragged_has_turbo3_tcq[device] || has_t3tcq;
+
     unsigned char * dptr = nullptr;
     cudaMalloc(&dptr, n);
     cudaMemcpy(dptr, host, n, cudaMemcpyHostToDevice);
@@ -578,7 +783,7 @@ static __global__ void k_set_rows_ragged_roundtrip(
         const int64_t s1, const int64_t s2, const int64_t s3,
         const uint3 bpr_fd, const uint3 ne01_fd, const uint3 ne02_fd,
         const uint3 ne11_fd, const uint3 ne12_fd,
-        const int layer, const int is_k) {
+        const int layer, const int is_k, const int v_rotated, const float * __restrict__ kvmean_mu) {
     const int64_t bidx = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
     if (bidx >= n_blk_total) return;
 
@@ -592,21 +797,335 @@ static __global__ void k_set_rows_ragged_roundtrip(
     const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
     const int64_t i10 = i01;
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    if (dst_row < 0) return;
 
     const int tier = ragged_lookup_tier(dst_row, layer, is_k, (int) cb);
 
     const src_t * src_blk = src0 + i01*s01 + i02*s02 + i03*s03 + cb*128;
     half * dst_blk = dst + dst_row*s1 + i02*s2 + i03*s3 + cb*128;
+    const bool write_rotated_v = !is_k && v_rotated;
 
     if (tier >= 16) {
+        if (write_rotated_v) {
+            float src_local[128];
+            for (int j = 0; j < 128; j++) {
+                float v = ggml_cuda_cast<float>(src_blk[j]);
+                if (kvmean_mu != nullptr) v -= kvmean_mu[cb*128 + j];
+                src_local[j] = v;
+            }
+            turbo_rotate_forward_cuda(src_local, d_turbo_wht_signs1, d_turbo_wht_signs2);
+            for (int j = 0; j < 128; j++) dst_blk[j] = __float2half(src_local[j]);
+            return;
+        }
         for (int j = 0; j < 128; j++) dst_blk[j] = ggml_cuda_cast<half>(src_blk[j]);
         return;
     }
     float src_local[128];
-    for (int j = 0; j < 128; j++) src_local[j] = ggml_cuda_cast<float>(src_blk[j]);
+    for (int j = 0; j < 128; j++) {
+        float v = ggml_cuda_cast<float>(src_blk[j]);
+        if (kvmean_mu != nullptr) v -= kvmean_mu[cb*128 + j];
+        src_local[j] = v;
+    }
     float out[128];
-    turbo_roundtrip_block_to_orig(src_local, out, tier);
+    turbo_roundtrip_block_to_orig(src_local, out, tier, is_k);
+    if (write_rotated_v) {
+        turbo_rotate_forward_cuda(out, d_turbo_wht_signs1, d_turbo_wht_signs2);
+    } else if (!is_k && kvmean_mu != nullptr) {
+        for (int j = 0; j < 128; j++) out[j] += kvmean_mu[cb*128 + j];
+    }
     for (int j = 0; j < 128; j++) dst_blk[j] = __float2half(out[j]);
+}
+
+static void * ragged_tcq_tmp3[GGML_CUDA_MAX_DEVICES] = {};
+static void * ragged_tcq_tmp2[GGML_CUDA_MAX_DEVICES] = {};
+static void * ragged_tcq_tmp1[GGML_CUDA_MAX_DEVICES] = {};
+static int64_t ragged_tcq_tmp3_bytes[GGML_CUDA_MAX_DEVICES] = {};
+static int64_t ragged_tcq_tmp2_bytes[GGML_CUDA_MAX_DEVICES] = {};
+static int64_t ragged_tcq_tmp1_bytes[GGML_CUDA_MAX_DEVICES] = {};
+
+static bool ragged_v_rotated_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * e = getenv("TURBO_RAGGED_V_ROTATED");
+        enabled = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+static void ensure_ragged_tmp(int device, void ** ptr, int64_t * cap, int64_t bytes_needed) {
+    GGML_UNUSED(device);
+    if (bytes_needed <= *cap) return;
+    if (*ptr) cudaFree(*ptr);
+    cudaMalloc(ptr, bytes_needed);
+    *cap = bytes_needed;
+}
+
+static float ragged_tcq_decode_alpha(int tier, int is_k) {
+    static bool loaded = false;
+    static float alpha_k = 1.0f;
+    static float alpha_v_override = 0.0f;
+    if (!loaded) {
+        loaded = true;
+        if (const char * s = getenv("TURBO_TCQ_DECODE_ALPHA_K")) {
+            char * end;
+            const float a = strtof(s, &end);
+            if (end != s && a > 0.0f && a < 10.0f) alpha_k = a;
+        }
+        if (const char * s = getenv("TURBO_TCQ_DECODE_ALPHA_V")) {
+            char * end;
+            const float a = strtof(s, &end);
+            if (end != s && a > 0.0f && a < 10.0f) alpha_v_override = a;
+        }
+    }
+    if (is_k) return alpha_k;
+    if (alpha_v_override > 0.0f) return alpha_v_override;
+    if (tier == RAGGED_TIER_TURBO1_TCQ) return 1.14f;
+    return tier == RAGGED_TIER_TURBO2_TCQ ? 1.06f : 1.02f;
+}
+
+template<typename idx_t>
+static int ragged_tcq1_shared_bt(int device) {
+    static int use_shared[GGML_CUDA_MAX_DEVICES] = {};
+    static bool checked[GGML_CUDA_MAX_DEVICES] = {};
+    if (checked[device]) return use_shared[device];
+    checked[device] = true;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const char * env = getenv("TURBO_TCQ_SHARED_BT");
+    if (!env || atoi(env) != 0) {
+        constexpr int bytes = 128 * 128;
+        int max_shared_optin = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        if (max_shared_optin >= bytes) {
+            CUDA_SET_SHARED_MEMORY_LIMIT(k_set_rows_turbo1_tcq<idx_t>, bytes);
+            use_shared[device] = 1;
+        }
+    }
+#endif
+    return use_shared[device];
+}
+
+template<typename idx_t>
+static int ragged_tcq3_shared_bt(int device) {
+    static int use_shared[GGML_CUDA_MAX_DEVICES] = {};
+    static bool checked[GGML_CUDA_MAX_DEVICES] = {};
+    if (checked[device]) return use_shared[device];
+    checked[device] = true;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const char * env = getenv("TURBO_TCQ_SHARED_BT");
+    if (!env || atoi(env) != 0) {
+        constexpr int bytes = 128 * 64;
+        int max_shared_optin = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        if (max_shared_optin >= bytes) {
+            CUDA_SET_SHARED_MEMORY_LIMIT(k_set_rows_turbo3_tcq<idx_t>, bytes);
+            use_shared[device] = 1;
+        }
+    }
+#endif
+    return use_shared[device];
+}
+
+template<typename idx_t>
+static int ragged_tcq2_shared_bt(int device) {
+    static int use_shared[GGML_CUDA_MAX_DEVICES] = {};
+    static bool checked[GGML_CUDA_MAX_DEVICES] = {};
+    if (checked[device]) return use_shared[device];
+    checked[device] = true;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const char * env = getenv("TURBO_TCQ_SHARED_BT");
+    if (!env || atoi(env) != 0) {
+        constexpr int bytes = 128 * 64;
+        int max_shared_optin = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        if (max_shared_optin >= bytes) {
+            CUDA_SET_SHARED_MEMORY_LIMIT(k_set_rows_turbo2_tcq<idx_t>, bytes);
+            use_shared[device] = 1;
+        }
+    }
+#endif
+    return use_shared[device];
+}
+
+template<typename idx_t>
+static __global__ void k_ragged_turbo3_tcq_overlay(
+        const idx_t * __restrict__ src1, const block_turbo3_tcq * __restrict__ qtmp, half * __restrict__ dst,
+        const int64_t n_blk_total,
+        const int64_t s10, const int64_t s11, const int64_t s12,
+        const int64_t qs1, const int64_t qs2, const int64_t qs3,
+        const int64_t s1, const int64_t s2, const int64_t s3,
+        const uint3 bpr_fd, const uint3 ne01_fd, const uint3 ne02_fd,
+        const uint3 ne11_fd, const uint3 ne12_fd,
+        const int layer, const int is_k, const int v_rotated, const float alpha, const float * __restrict__ kvmean_mu) {
+    const int64_t bidx = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    if (bidx >= n_blk_total) return;
+
+    uint32_t tmp = (uint32_t) bidx;
+    uint2 dm;
+    dm = fast_div_modulo(tmp, bpr_fd);  const int64_t cb  = dm.y; tmp = dm.x;
+    dm = fast_div_modulo(tmp, ne01_fd); const int64_t i01 = dm.y; tmp = dm.x;
+    dm = fast_div_modulo(tmp, ne02_fd); const int64_t i02 = dm.y; const int64_t i03 = dm.x;
+
+    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
+    const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+    if (dst_row < 0) return;
+
+    if (ragged_lookup_tier(dst_row, layer, is_k, (int) cb) != RAGGED_TIER_TURBO3_TCQ) return;
+
+    const block_turbo3_tcq * blk = (const block_turbo3_tcq *)((const char *)qtmp + dst_row*qs1 + i02*qs2 + i03*qs3) + cb;
+    half * dst_blk = dst + dst_row*s1 + i02*s2 + i03*s3 + cb*128;
+
+    float xr[128];
+    const float norm = __half2float(blk->norm) * alpha;
+    for (int t = 0; t < 128; t++) {
+        const int bit_pos = t * 3;
+        const int byte_idx = bit_pos / 8;
+        const int bit_off = bit_pos % 8;
+        const uint16_t raw = (uint16_t)blk->qs[byte_idx] | ((uint16_t)blk->qs[byte_idx + 1] << 8);
+        const int state = (raw >> bit_off) & 0x1FF;
+        xr[t] = (is_k ? d_turbo3_tcq_codebook : d_turbo3_tcq_codebook_v)[state];
+    }
+    if (!is_k && v_rotated) {
+        for (int j = 0; j < 128; j++) dst_blk[j] = __float2half(xr[j] * norm);
+        return;
+    }
+    turbo_rotate_forward_cuda(xr, d_turbo_wht_signs2, d_turbo_wht_signs1);
+    for (int j = 0; j < 128; j++) {
+        float v = xr[j] * d_innerq_channel_scale_inv[j] * norm;
+        if (!is_k && kvmean_mu != nullptr) v += kvmean_mu[cb*128 + j];
+        dst_blk[j] = __float2half(v);
+    }
+}
+
+template<typename idx_t>
+static __global__ void k_ragged_turbo2_tcq_overlay(
+        const idx_t * __restrict__ src1, const block_turbo2_tcq * __restrict__ qtmp, half * __restrict__ dst,
+        const int64_t n_blk_total,
+        const int64_t s10, const int64_t s11, const int64_t s12,
+        const int64_t qs1, const int64_t qs2, const int64_t qs3,
+        const int64_t s1, const int64_t s2, const int64_t s3,
+        const uint3 bpr_fd, const uint3 ne01_fd, const uint3 ne02_fd,
+        const uint3 ne11_fd, const uint3 ne12_fd,
+        const int layer, const int is_k, const int v_rotated, const float alpha, const float * __restrict__ kvmean_mu) {
+    const int64_t bidx = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    if (bidx >= n_blk_total) return;
+
+    uint32_t tmp = (uint32_t) bidx;
+    uint2 dm;
+    dm = fast_div_modulo(tmp, bpr_fd);  const int64_t cb  = dm.y; tmp = dm.x;
+    dm = fast_div_modulo(tmp, ne01_fd); const int64_t i01 = dm.y; tmp = dm.x;
+    dm = fast_div_modulo(tmp, ne02_fd); const int64_t i02 = dm.y; const int64_t i03 = dm.x;
+
+    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
+    const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+    if (dst_row < 0) return;
+
+    if (ragged_lookup_tier(dst_row, layer, is_k, (int) cb) != RAGGED_TIER_TURBO2_TCQ) return;
+
+    const block_turbo2_tcq * blk = (const block_turbo2_tcq *)((const char *)qtmp + dst_row*qs1 + i02*qs2 + i03*qs3) + cb;
+    half * dst_blk = dst + dst_row*s1 + i02*s2 + i03*s3 + cb*128;
+
+    float xr[128];
+    const float norm = __half2float(blk->norm) * alpha;
+    for (int t = 0; t < 128; t++) {
+        const int bit_pos = t * 2;
+        const int byte_idx = bit_pos / 8;
+        const int bit_off = bit_pos % 8;
+        const uint16_t raw = (uint16_t)blk->qs[byte_idx] | ((uint16_t)blk->qs[byte_idx + 1] << 8);
+        const int state = (raw >> bit_off) & 0xFF;
+        xr[t] = (is_k ? d_turbo2_tcq_codebook : d_turbo2_tcq_codebook_v)[state];
+    }
+    if (!is_k && v_rotated) {
+        for (int j = 0; j < 128; j++) dst_blk[j] = __float2half(xr[j] * norm);
+        return;
+    }
+    turbo_rotate_forward_cuda(xr, d_turbo_wht_signs2, d_turbo_wht_signs1);
+    for (int j = 0; j < 128; j++) {
+        float v = xr[j] * d_innerq_channel_scale_inv[j] * norm;
+        if (!is_k && kvmean_mu != nullptr) v += kvmean_mu[cb*128 + j];
+        dst_blk[j] = __float2half(v);
+    }
+}
+
+static __device__ __forceinline__ float ragged_fwht128_butterfly_inplace(float val, float * smem) {
+    const int tid = threadIdx.x;
+
+    #pragma unroll
+    for (int h = 1; h <= 16; h *= 2) {
+        const float other = __shfl_xor_sync(0xFFFFFFFFULL, val, h);
+        val = (tid & h) ? (other - val) : (val + other);
+    }
+
+    smem[tid] = val;
+    __syncthreads();
+    val = (tid & 32) ? (smem[tid - 32] - val) : (val + smem[tid + 32]);
+    __syncthreads();
+
+    smem[tid] = val;
+    __syncthreads();
+    val = (tid & 64) ? (smem[tid - 64] - val) : (val + smem[tid + 64]);
+    __syncthreads();
+
+    return val;
+}
+
+static __device__ __forceinline__ void ragged_fwht128_store_half(float val, half * dst_base) {
+    const int tid = threadIdx.x;
+    const float neighbor = __shfl_xor_sync(0xFFFFFFFFULL, val, 1);
+    if ((tid & 1) == 0) {
+        const half2 packed = __floats2half2_rn(val, neighbor);
+        *((half2 *)(dst_base + tid)) = packed;
+    }
+}
+
+template<typename idx_t>
+static __global__ void k_ragged_turbo1_tcq_overlay(
+        const idx_t * __restrict__ src1, const block_turbo1_tcq * __restrict__ qtmp, half * __restrict__ dst,
+        const int64_t n_blk_total,
+        const int64_t s10, const int64_t s11, const int64_t s12,
+        const int64_t qs1, const int64_t qs2, const int64_t qs3,
+        const int64_t s1, const int64_t s2, const int64_t s3,
+        const uint3 bpr_fd, const uint3 ne01_fd, const uint3 ne02_fd,
+        const uint3 ne11_fd, const uint3 ne12_fd,
+        const int layer, const int is_k, const int v_rotated, const float alpha) {
+    const int64_t bidx = blockIdx.x;
+    if (bidx >= n_blk_total) return;
+    const int tid = threadIdx.x;
+
+    uint32_t tmp = (uint32_t) bidx;
+    uint2 dm;
+    dm = fast_div_modulo(tmp, bpr_fd);  const int64_t cb  = dm.y; tmp = dm.x;
+    dm = fast_div_modulo(tmp, ne01_fd); const int64_t i01 = dm.y; tmp = dm.x;
+    dm = fast_div_modulo(tmp, ne02_fd); const int64_t i02 = dm.y; const int64_t i03 = dm.x;
+
+    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
+    const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+    if (dst_row < 0) return;
+
+    if (ragged_lookup_tier(dst_row, layer, is_k, (int) cb) != RAGGED_TIER_TURBO1_TCQ) return;
+
+    const block_turbo1_tcq * blk = (const block_turbo1_tcq *)((const char *)qtmp + dst_row*qs1 + i02*qs2 + i03*qs3) + cb;
+    half * dst_blk = dst + dst_row*s1 + i02*s2 + i03*s3 + cb*128;
+
+    const float norm = __half2float(blk->norm) * alpha;
+    const float * cbk = is_k ? d_turbo1_tcq_codebook : d_turbo1_tcq_codebook_v;
+    const int byte_idx = tid >> 3;
+    const int bit_off = tid & 7;
+    const uint16_t raw = (uint16_t)blk->qs[byte_idx] | ((uint16_t)blk->qs[byte_idx + 1] << 8);
+    const int state = (raw >> bit_off) & 0xFF;
+    const float recon = norm * cbk[state];
+    if (!is_k && v_rotated) {
+        ragged_fwht128_store_half(recon, dst_blk);
+        return;
+    }
+
+    __shared__ float smem[128];
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    float val = ragged_fwht128_butterfly_inplace(recon * d_turbo_wht_signs2[tid], smem);
+    val = val * inv_sqrt_128 * d_turbo_wht_signs1[tid] * d_innerq_channel_scale_inv[tid];
+    ragged_fwht128_store_half(val, dst_blk);
 }
 
 template<typename src_t, typename idx_t>
@@ -634,6 +1153,12 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         if (ragged_schedule_active() && ragged_is_kv_cache(dst->name, &rg_layer, &rg_is_k) && (ne00 % 128 == 0)) {
             load_ragged_schedule(ctx.device);
             load_ragged_content_mask(ctx.device);
+            load_turbo4_alpha(ctx.device);
+            static bool ragged_innerq_ready[GGML_CUDA_MAX_DEVICES] = {};
+            if (!ragged_innerq_ready[ctx.device]) {
+                turbo_innerq_init(); // identity scales unless a real turbo SET_ROWS run calibrates them
+                ragged_innerq_ready[ctx.device] = true;
+            }
             const int64_t bpr = ne00 / 128;
             const int64_t n_blk_total = bpr * ne01 * ne02 * ne03;
             const int num_blocks = (n_blk_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
@@ -646,10 +1171,108 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
                 const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
                 const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
+                const int ragged_v_rotated = (!rg_is_k && ragged_v_rotated_enabled()) ? 1 : 0;
+                const float * kvmean_mu = nullptr;
+                if (rg_layer >= 0 && rg_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
+                    const float * tbl = rg_is_k ? turbo_kmean_table(ctx.device) : turbo_vmean_table_enc(ctx.device);
+                    if (tbl) kvmean_mu = tbl + (size_t) rg_layer * PFHEAD_MAX_C;
+                }
                 k_set_rows_ragged_roundtrip<src_t, idx_t><<<num_blocks, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
                     src0_d, src1_d, (half*)dst->data, n_blk_total,
                     s01, s02, s03, s10, s11, s12, s1, s2, s3,
-                    bpr_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd, rg_layer, rg_is_k);
+                    bpr_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd, rg_layer, rg_is_k, ragged_v_rotated, kvmean_mu);
+
+                if (ragged_has_turbo3_tcq[ctx.device] || ragged_has_turbo2_tcq[ctx.device] || ragged_has_turbo1_tcq[ctx.device]) {
+                    const int64_t tmp_groups = bpr * ne1 * ne2 * ne3;
+                    const int64_t s01_f = nb01/sizeof(float), s02_f = nb02/sizeof(float), s03_f = nb03/sizeof(float);
+                    const int64_t s10_i = nb10/sizeof(idx_t), s11_i = nb11/sizeof(idx_t), s12_i = nb12/sizeof(idx_t);
+                    const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
+                    if (ragged_has_turbo1_tcq[ctx.device]) {
+                        static bool tcq1_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+                        static int tcq1_hot_e = -1; if (tcq1_hot_e < 0) tcq1_hot_e = getenv("TURBO1_TCQ_HOTSWAP") ? 1 : 0;
+                        if (!tcq1_cb_loaded[ctx.device] || tcq1_hot_e) {
+                            turbo1_tcq_load_kv_encode();
+                            tcq1_cb_loaded[ctx.device] = true;
+                        }
+                        const int64_t qs1 = bpr * (int64_t) sizeof(block_turbo1_tcq);
+                        const int64_t qs2 = ne1 * qs1;
+                        const int64_t qs3 = ne2 * qs2;
+                        ensure_ragged_tmp(ctx.device, &ragged_tcq_tmp1[ctx.device], &ragged_tcq_tmp1_bytes[ctx.device],
+                                tmp_groups * (int64_t) sizeof(block_turbo1_tcq));
+                        const int use_shared = ragged_tcq1_shared_bt<idx_t>(ctx.device);
+                        if (!use_shared) ensure_tcq_bt_buf(ctx.device, n_blk_total * 128 * 128);
+                        k_set_rows_turbo1_tcq<idx_t><<<(int)n_blk_total, 256, use_shared ? 128 * 128 : 0, stream>>>(
+                            (const float *) src0_d, src1_d, (block_turbo1_tcq *) ragged_tcq_tmp1[ctx.device],
+                            n_blk_total, tcq_bt_buf[ctx.device], use_shared, rg_is_k,
+                            s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, qs1, qs2, qs3,
+                            ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+                        k_ragged_turbo1_tcq_overlay<idx_t><<<(int)n_blk_total, 128, 0, stream>>>(
+                            src1_d, (const block_turbo1_tcq *) ragged_tcq_tmp1[ctx.device], (half *) dst->data, n_blk_total,
+                            s10_i, s11_i, s12_i, qs1, qs2, qs3, s1, s2, s3,
+                            bpr_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd, rg_layer, rg_is_k, ragged_v_rotated,
+                            ragged_tcq_decode_alpha(RAGGED_TIER_TURBO1_TCQ, rg_is_k));
+                    }
+
+                    if (ragged_has_turbo3_tcq[ctx.device]) {
+                        static bool tcq3_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+                        static int tcq3_hot_e = -1; if (tcq3_hot_e < 0) tcq3_hot_e = getenv("TURBO_TCQ_HOTSWAP") ? 1 : 0;
+                        if (!tcq3_cb_loaded[ctx.device] || tcq3_hot_e) {
+                            turbo_tcq_load_kv_encode();
+                            if (!tcq3_cb_loaded[ctx.device]) {
+                                tcq3_cb_loaded[ctx.device] = true;
+                                load_tcq_norm_alpha(ctx.device);
+                                init_tcq_error_dump(ctx.device);
+                            }
+                        }
+                        const int64_t qs1 = bpr * (int64_t) sizeof(block_turbo3_tcq);
+                        const int64_t qs2 = ne1 * qs1;
+                        const int64_t qs3 = ne2 * qs2;
+                        ensure_ragged_tmp(ctx.device, &ragged_tcq_tmp3[ctx.device], &ragged_tcq_tmp3_bytes[ctx.device],
+                                tmp_groups * (int64_t) sizeof(block_turbo3_tcq));
+                        const int use_shared = ragged_tcq3_shared_bt<idx_t>(ctx.device);
+                        if (!use_shared) ensure_tcq_bt_buf(ctx.device, n_blk_total * 128 * 64);
+                        k_set_rows_turbo3_tcq<idx_t><<<(int)n_blk_total, 512, use_shared ? 128 * 64 : 0, stream>>>(
+                            (const float *) src0_d, src1_d, (block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device],
+                            n_blk_total, tcq_bt_buf[ctx.device], use_shared, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                            s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, rg_is_k, kvmean_mu, qs1, qs2, qs3,
+                            ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+                        k_ragged_turbo3_tcq_overlay<idx_t><<<num_blocks, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
+                            src1_d, (const block_turbo3_tcq *) ragged_tcq_tmp3[ctx.device], (half *) dst->data, n_blk_total,
+                            s10_i, s11_i, s12_i, qs1, qs2, qs3, s1, s2, s3,
+                            bpr_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd, rg_layer, rg_is_k, ragged_v_rotated,
+                            ragged_tcq_decode_alpha(RAGGED_TIER_TURBO3_TCQ, rg_is_k), kvmean_mu);
+                    }
+
+                    if (ragged_has_turbo2_tcq[ctx.device]) {
+                        static bool tcq2_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+                        static int tcq2_hot_e = -1; if (tcq2_hot_e < 0) tcq2_hot_e = getenv("TURBO_TCQ_HOTSWAP") ? 1 : 0;
+                        if (!tcq2_cb_loaded[ctx.device] || tcq2_hot_e) {
+                            turbo2_tcq_load_kv_encode();
+                            if (!tcq2_cb_loaded[ctx.device]) {
+                                tcq2_cb_loaded[ctx.device] = true;
+                                load_tcq_norm_alpha(ctx.device);
+                                init_tcq_error_dump(ctx.device);
+                            }
+                        }
+                        const int64_t qs1 = bpr * (int64_t) sizeof(block_turbo2_tcq);
+                        const int64_t qs2 = ne1 * qs1;
+                        const int64_t qs3 = ne2 * qs2;
+                        ensure_ragged_tmp(ctx.device, &ragged_tcq_tmp2[ctx.device], &ragged_tcq_tmp2_bytes[ctx.device],
+                                tmp_groups * (int64_t) sizeof(block_turbo2_tcq));
+                        const int use_shared = ragged_tcq2_shared_bt<idx_t>(ctx.device);
+                        if (!use_shared) ensure_tcq_bt_buf(ctx.device, n_blk_total * 128 * 64);
+                        k_set_rows_turbo2_tcq<idx_t><<<(int)n_blk_total, 256, use_shared ? 128 * 64 : 0, stream>>>(
+                            (const float *) src0_d, src1_d, (block_turbo2_tcq *) ragged_tcq_tmp2[ctx.device],
+                            n_blk_total, tcq_bt_buf[ctx.device], use_shared, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                            s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, rg_is_k, kvmean_mu, qs1, qs2, qs3,
+                            ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+                        k_ragged_turbo2_tcq_overlay<idx_t><<<num_blocks, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
+                            src1_d, (const block_turbo2_tcq *) ragged_tcq_tmp2[ctx.device], (half *) dst->data, n_blk_total,
+                            s10_i, s11_i, s12_i, qs1, qs2, qs3, s1, s2, s3,
+                            bpr_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd, rg_layer, rg_is_k, ragged_v_rotated,
+                            ragged_tcq_decode_alpha(RAGGED_TIER_TURBO2_TCQ, rg_is_k), kvmean_mu);
+                    }
+                }
             }
         } else {
             set_rows_cuda(
@@ -799,6 +1422,50 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_turbo8_0*)dst->data,
             ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
             nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream, turbo_tap_mu(ctx, dst, ne00));
+    } else if (dst->type == GGML_TYPE_TURBO1) {
+        turbo1_set_scale_mode_from_env();
+        turbo1_set_is_k(strncmp(dst->name, "cache_k_l", 9) == 0 ? 1 : 0);
+        set_rows_cuda_quant<idx_t, block_turbo1, QK_TURBO1, quantize_f32_turbo1_block>(
+            src0_d, src1_d, (block_turbo1*)dst->data,
+            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream, turbo_tap_mu(ctx, dst, ne00));
+    } else if (dst->type == GGML_TYPE_TURBO1_CQ) {
+        turbo1_set_scale_mode_from_env();
+        turbo1_set_is_k(strncmp(dst->name, "cache_k_l", 9) == 0 ? 1 : 0);
+        set_rows_cuda_quant<idx_t, block_turbo1_cq, QK_TURBO1_CQ, quantize_f32_turbo1_cq_block>(
+            src0_d, src1_d, (block_turbo1_cq*)dst->data,
+            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream, nullptr);
+    } else if (dst->type == GGML_TYPE_TURBO1_NSN) {
+        GGML_ASSERT(ne00 % QK_TURBO1_NSN == 0);
+        turbo1_set_scale_mode_from_env();
+        const bool is_k = strncmp(dst->name, "cache_k_l", 9) == 0;
+        turbo1_set_is_k(is_k ? 1 : 0);
+        const int pf_layer = (is_k || strncmp(dst->name, "cache_v_l", 9) == 0) ? atoi(dst->name + 9) : 0;
+        float * o_buf = turbo1_nsn_o_buf(ctx.device, is_k ? 1 : 0);
+        float * o_layer = (o_buf && pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C)
+                          ? o_buf + (size_t) pf_layer * PFHEAD_MAX_C : nullptr;
+        const int64_t s01 = nb01/sizeof(float), s02 = nb02/sizeof(float), s03 = nb03/sizeof(float);
+        const int64_t s10 = nb10/sizeof(idx_t), s11 = nb11/sizeof(idx_t), s12 = nb12/sizeof(idx_t);
+        if (o_layer) {
+            // Pass 1: per-(head,channel) mean over the token chunk (token-normalized).
+            k_turbo1_nsn_reduce_o<<<(int)(ne00 / 128), 128, 0, stream>>>(
+                src0_d, o_layer, ne01, ne02, ne03, s01, s02, s03);
+        }
+        // Pass 2: quantize each block using o (same stream → ordered after pass 1).
+        const int64_t ne_total = (ne00 * ne01 * ne02 * ne03) / QK_TURBO1_NSN;
+        const int num_blocks = (int)((ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE);
+        const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
+        const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
+        const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
+        const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
+        const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
+        if (ne_total > 0 && o_layer) {
+            k_set_rows_turbo1_nsn<idx_t><<<num_blocks, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
+                src0_d, src1_d, (block_turbo1_nsn*)dst->data, ne_total,
+                s01, s02, s03, s10, s11, s12, (int64_t) nb1, (int64_t) nb2, (int64_t) nb3,
+                ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd, o_layer);
+        }
     } else if (dst->type == GGML_TYPE_TURBO3_TCQ) {
         GGML_ASSERT(ne00 % QK_TURBO3_TCQ == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO3_TCQ;
@@ -927,6 +1594,53 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, kvmean_mu, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }
+    } else if (dst->type == GGML_TYPE_TURBO1_TCQ) {
+        GGML_ASSERT(ne00 % QK_TURBO1_TCQ == 0);
+        const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO1_TCQ;
+        {
+            static bool tcq1_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+            static int tcq1_hot_e = -1; if (tcq1_hot_e < 0) tcq1_hot_e = getenv("TURBO1_TCQ_HOTSWAP") ? 1 : 0;
+            if (!tcq1_cb_loaded[ctx.device] || tcq1_hot_e) {
+                turbo1_tcq_load_kv_encode();
+                tcq1_cb_loaded[ctx.device] = true;
+            }
+        }
+        const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
+        const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);
+        const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
+        if (ne_total_groups > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
+            static int tcq1_use_shared_bt[GGML_CUDA_MAX_DEVICES] = {};
+            static bool tcq1_bt_checked[GGML_CUDA_MAX_DEVICES] = {};
+            constexpr int tcq1_bt_shared_bytes = 128 * 128;   // k=1: 128 low-7-bit pred groups (vs 128*64 for k=2)
+            if (!tcq1_bt_checked[ctx.device]) {
+                tcq1_bt_checked[ctx.device] = true;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                const char * tcq_shared_bt_env = getenv("TURBO_TCQ_SHARED_BT");
+                if (!tcq_shared_bt_env || atoi(tcq_shared_bt_env) != 0) {
+                    int max_shared_optin = 0;
+                    CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, ctx.device));
+                    if (max_shared_optin >= tcq1_bt_shared_bytes) {
+                        CUDA_SET_SHARED_MEMORY_LIMIT(k_set_rows_turbo1_tcq<idx_t>, tcq1_bt_shared_bytes);
+                        tcq1_use_shared_bt[ctx.device] = 1;
+                    }
+                }
+#endif
+            }
+            if (!tcq1_use_shared_bt[ctx.device]) {
+                ensure_tcq_bt_buf(ctx.device, ne_total_groups * 128 * 128);
+            }
+            const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
+            const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
+            const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
+            const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
+            const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
+            const int shared_bytes = tcq1_use_shared_bt[ctx.device] ? tcq1_bt_shared_bytes : 0;
+            k_set_rows_turbo1_tcq<idx_t><<<(int)ne_total_groups, 256, shared_bytes, stream>>>(
+                src0_d, src1_d, (block_turbo1_tcq *)dst->data,
+                ne_total_groups, tcq_bt_buf[ctx.device], tcq1_use_shared_bt[ctx.device], iq_is_k,
+                s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, nb1, nb2, nb3,
+                ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+        }
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }
@@ -960,7 +1674,7 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 
     // Post-rotation extraction: thread-safe one-time init
-    if (h_extract_state == 0 && (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO8_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ)) {
+    if (h_extract_state == 0 && (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO8_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ || dst->type == GGML_TYPE_TURBO1 || dst->type == GGML_TYPE_TURBO1_NSN || dst->type == GGML_TYPE_TURBO1_CQ || dst->type == GGML_TYPE_TURBO1_TCQ)) {
         std::call_once(h_extract_init_flag, []() {
             const char * env = getenv("TURBO_EXTRACT");
             if (env && atoi(env) > 0) {
@@ -976,8 +1690,10 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         turbo_extract_check_done();
     }
 
-    // InnerQ: one-time init on first turbo SET_ROWS call
-    if (innerq_state == 0 && (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO8_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ)) {
+    // InnerQ: one-time init on first turbo SET_ROWS call. turbo1 must be here too: its K
+    // inverse-FWHT decode multiplies by d_innerq_channel_scale_inv_fattn, which stays
+    // zero-initialized (→ K decoded as all-zeros) unless turbo_innerq_init() uploads identity.
+    if (innerq_state == 0 && (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO8_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ || dst->type == GGML_TYPE_TURBO1 || dst->type == GGML_TYPE_TURBO1_NSN || dst->type == GGML_TYPE_TURBO1_CQ || dst->type == GGML_TYPE_TURBO1_TCQ)) {
         static const char * env = getenv("TURBO_INNERQ");
         if (env && atoi(env) > 0) {
             turbo_innerq_init();

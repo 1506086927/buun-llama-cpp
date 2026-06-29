@@ -435,7 +435,11 @@ extern "C" {
         GGML_TYPE_TURBO3_TCQ = 45, // TurboQuant 3-bit KV cache: TCQ (Trellis-Coded Quantization)
         GGML_TYPE_TURBO2_TCQ = 46, // TurboQuant 2-bit KV cache: TCQ (k=2, L=8, 256 states)
         GGML_TYPE_TURBO8_0 = 47, // TurboQuant 8-bit KV cache: FWHT + uniform 256-level grid + per-block absmax, no QJL
-        GGML_TYPE_COUNT   = 48,
+        GGML_TYPE_TURBO1   = 48, // TurboQuant 1-bit KV cache: FWHT + sign + per-group fp16 scale
+        GGML_TYPE_TURBO1_NSN = 49, // turbo1 + NSNQuant double-norm + per-chunk per-head centering (1.25 bpw)
+        GGML_TYPE_TURBO1_CQ = 50, // turbo1 Coupled-Quant: FWHT + per-8ch 256-codeword VQ (1.125 bpw)
+        GGML_TYPE_TURBO1_TCQ = 51, // turbo1 Trellis-Coded: FWHT + k=1/L=8 trellis, separate K/V 256-state codebooks (1.25 bpw)
+        GGML_TYPE_COUNT   = 52,
     };
 
     // precision
@@ -2444,6 +2448,26 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Optional segmented-K source for exact row-band VBR policies.
+    // k_promoted: promoted-tier K storage for selected row bands. It may have
+    //             either the same logical row count as K or a compact physical
+    //             row count described by k_row_bands.
+    // k_row_bands: I32 [4, n_bands], each column is
+    //              [logical_row0, logical_row1, physical_row0, physical_row1);
+    //              [2, n_bands] legacy descriptors use logical rows as physical
+    //              rows. Unused bands are encoded as negative row bounds.
+    GGML_API void ggml_flash_attn_ext_add_vbr_k(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_promoted,
+            struct ggml_tensor * k_row_bands);
+
+    // Optional segmented-V source for exact row-band VBR policies.
+    // v_promoted and v_row_bands follow the same row-band contract as K.
+    GGML_API void ggml_flash_attn_ext_add_vbr_v(
+            struct ggml_tensor * a,
+            struct ggml_tensor * v_promoted,
+            struct ggml_tensor * v_row_bands);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

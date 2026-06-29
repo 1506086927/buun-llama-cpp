@@ -5229,6 +5229,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_TURBO8_0:
                     case GGML_TYPE_TURBO3_TCQ:
                     case GGML_TYPE_TURBO2_TCQ:
+                    case GGML_TYPE_TURBO1:
+                    case GGML_TYPE_TURBO1_NSN:
+                    case GGML_TYPE_TURBO1_CQ:
+                    case GGML_TYPE_TURBO1_TCQ:
                         return true;
                     default:
                         return false;
@@ -5246,7 +5250,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0 ||
                        op->type == GGML_TYPE_TURBO8_0 ||
                        op->type == GGML_TYPE_TURBO3_TCQ ||
-                       op->type == GGML_TYPE_TURBO2_TCQ) &&
+                       op->type == GGML_TYPE_TURBO2_TCQ ||
+                       op->type == GGML_TYPE_TURBO1 ||
+                       op->type == GGML_TYPE_TURBO1_NSN ||
+                       op->type == GGML_TYPE_TURBO1_CQ ||
+                       op->type == GGML_TYPE_TURBO1_TCQ) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;

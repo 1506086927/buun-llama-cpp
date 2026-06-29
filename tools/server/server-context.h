@@ -24,6 +24,18 @@ struct server_context_meta {
     json json_ui_settings;            // Primary: new name
     json json_webui_settings;            // Deprecated: use json_ui_settings instead (kept for backward compat)
     int slot_n_ctx;
+    bool vbr_enabled;
+    bool vbr_dynamic;
+    bool vbr_type_k;
+    bool vbr_type_v;
+    double vbr_min_bits;
+    double vbr_capacity_bits;
+    double vbr_selected_bpv;
+    double vbr_selected_kld;
+    uint64_t vbr_vram_budget_bytes;
+    std::string vbr_selected_family;
+    std::string vbr_selected_policy;
+    std::string vbr_selected_schedule;
     enum llama_pooling_type pooling_type;
 
     // chat params

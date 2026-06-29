@@ -18,6 +18,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstring>
 #include <cinttypes>
@@ -25,6 +26,7 @@
 #include <memory>
 #include <random>
 #include <filesystem>
+#include <string>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -39,6 +41,32 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static bool server_env_truthy(const char * name) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    std::string s(value);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return std::tolower(c);
+    });
+    return s != "0" && s != "false" && s != "off" && s != "no";
+}
+
+static bool server_vbr_stage2a_active(const common_params & params) {
+    const bool vbr_enabled =
+        params.vbr_cache_type_k ||
+        params.vbr_cache_type_v ||
+        params.vbr_budget_explicit ||
+        params.vbr_min_bits_explicit ||
+        params.vbr_vram_budget_explicit ||
+        params.vbr_policy_explicit;
+
+    return vbr_enabled &&
+        (server_env_truthy("VBR_STAGE2A") || server_env_truthy("TURBO_VBR_STAGE2A"));
+}
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -1300,8 +1328,18 @@ private:
 
         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
         if (n_ctx_slot > n_ctx_train) {
-            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
-            n_ctx_slot = n_ctx_train;
+            const bool vbr_enabled =
+                params_base.vbr_cache_type_k ||
+                params_base.vbr_cache_type_v ||
+                params_base.vbr_budget_explicit ||
+                params_base.vbr_min_bits_explicit ||
+                params_base.vbr_vram_budget_explicit;
+            if (vbr_enabled) {
+                SRV_WRN("the VBR slot context (%d) exceeds the training context of the model (%d) - keeping VBR capacity\n", n_ctx_slot, n_ctx_train);
+            } else {
+                SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
+                n_ctx_slot = n_ctx_train;
+            }
         }
 
         slots.clear();
@@ -1439,6 +1477,21 @@ private:
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
+        }
+
+        if (server_vbr_stage2a_active(params_base)) {
+            if (params_base.cache_ram_mib != 0) {
+                params_base.cache_ram_mib = 0;
+                SRV_WRN("%s\n", "prompt cache state storage is not supported by VBR Stage2A, it will be disabled");
+            }
+            if (params_base.n_ctx_checkpoints > 0) {
+                params_base.n_ctx_checkpoints = 0;
+                SRV_WRN("%s\n", "context checkpoints are not supported by VBR Stage2A, they will be disabled");
+            }
+            if (params_base.n_cache_reuse) {
+                params_base.n_cache_reuse = 0;
+                SRV_WRN("%s\n", "cache_reuse is not supported by VBR Stage2A, it will be disabled");
+            }
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -4620,6 +4673,18 @@ server_context_meta server_context::get_meta() const {
         /* json_ui_settings       */ impl->json_ui_settings,
         /* json_webui_settings    */ impl->json_webui_settings,  // Deprecated
         /* slot_n_ctx             */ impl->get_slot_n_ctx(),
+        /* vbr_enabled            */ impl->params_base.vbr_cache_type_k || impl->params_base.vbr_cache_type_v || impl->params_base.vbr_budget_explicit || impl->params_base.vbr_min_bits_explicit || impl->params_base.vbr_vram_budget_explicit,
+        /* vbr_dynamic            */ (impl->params_base.vbr_cache_type_k || impl->params_base.vbr_cache_type_v || impl->params_base.vbr_budget_explicit || impl->params_base.vbr_min_bits_explicit || impl->params_base.vbr_vram_budget_explicit) && (impl->params_base.vbr_budget == "dynamic" || impl->params_base.vbr_budget == "auto"),
+        /* vbr_type_k             */ impl->params_base.vbr_cache_type_k,
+        /* vbr_type_v             */ impl->params_base.vbr_cache_type_v,
+        /* vbr_min_bits           */ impl->params_base.vbr_min_bits_value,
+        /* vbr_capacity_bits      */ impl->params_base.vbr_capacity_bits,
+        /* vbr_selected_bpv       */ impl->params_base.vbr_selected_bpv,
+        /* vbr_selected_kld       */ impl->params_base.vbr_selected_kld,
+        /* vbr_vram_budget_bytes  */ impl->params_base.vbr_vram_budget_bytes,
+        /* vbr_selected_family    */ impl->params_base.vbr_selected_family,
+        /* vbr_selected_policy    */ impl->params_base.vbr_selected_policy,
+        /* vbr_selected_schedule  */ impl->params_base.vbr_selected_schedule,
         /* pooling_type           */ llama_pooling_type(impl->ctx_tgt),
 
         /* chat_params            */ impl->chat_params,
@@ -5191,6 +5256,22 @@ void server_routes::init_routes() {
             { "total_slots",                 params.n_parallel },
             { "model_alias",                 meta->model_name },
             { "model_path",                  meta->model_path },
+            { "vbr",                         json {
+                {"enabled",           meta->vbr_enabled},
+                {"dynamic",           meta->vbr_dynamic},
+                {"type_k",            meta->vbr_type_k},
+                {"type_v",            meta->vbr_type_v},
+                {"floor_bpv",         meta->vbr_min_bits},
+                {"requested_floor_bpv", meta->vbr_min_bits},
+                {"capacity_floor_bpv",  meta->vbr_capacity_bits},
+                {"realized_bpv",      meta->vbr_capacity_bits},
+                {"selected_family",    meta->vbr_selected_family},
+                {"selected_policy",    meta->vbr_selected_policy},
+                {"selected_bpv",       meta->vbr_selected_bpv},
+                {"selected_kld",       meta->vbr_selected_kld},
+                {"selected_schedule",  meta->vbr_selected_schedule},
+                {"vram_budget_bytes", meta->vbr_vram_budget_bytes},
+            } },
             { "modalities",                  json {
                 {"vision", meta->has_inp_image},
                 {"audio",  meta->has_inp_audio},
@@ -5706,6 +5787,22 @@ json server_routes::get_model_info() const {
             {"n_vocab",     meta->model_vocab_n_tokens},
             {"n_ctx",       meta->slot_n_ctx},
             {"n_ctx_train", meta->model_n_ctx_train},
+            {"vbr",         {
+                {"enabled",           meta->vbr_enabled},
+                {"dynamic",           meta->vbr_dynamic},
+                {"type_k",            meta->vbr_type_k},
+                {"type_v",            meta->vbr_type_v},
+                {"floor_bpv",         meta->vbr_min_bits},
+                {"requested_floor_bpv", meta->vbr_min_bits},
+                {"capacity_floor_bpv",  meta->vbr_capacity_bits},
+                {"realized_bpv",      meta->vbr_capacity_bits},
+                {"selected_family",    meta->vbr_selected_family},
+                {"selected_policy",    meta->vbr_selected_policy},
+                {"selected_bpv",       meta->vbr_selected_bpv},
+                {"selected_kld",       meta->vbr_selected_kld},
+                {"selected_schedule",  meta->vbr_selected_schedule},
+                {"vram_budget_bytes", meta->vbr_vram_budget_bytes},
+            }},
             {"n_embd",      meta->model_n_embd_inp},
             {"n_params",    meta->model_n_params},
             {"size",        meta->model_size},

@@ -2,6 +2,7 @@
 #include "cp-async.cuh"
 #include "mma.cuh"
 #include "fattn-common.cuh"
+#include "turbo-quant-cuda.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -728,6 +729,94 @@ static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
     }
 }
 
+static __device__ __forceinline__ float fwht128_butterfly_linear(float val, float * smem, const int tid) {
+#pragma unroll
+    for (int h = 1; h <= 16; h *= 2) {
+        const float other = __shfl_xor_sync(0xFFFFFFFFULL, val, h);
+        val = (tid & h) ? (other - val) : (val + other);
+    }
+
+    if (tid < 128) {
+        smem[tid] = val;
+    }
+    __syncthreads();
+    if (tid < 128) {
+        val = (tid & 32) ? (smem[tid - 32] - val) : (val + smem[tid + 32]);
+    }
+    __syncthreads();
+
+    if (tid < 128) {
+        smem[tid] = val;
+    }
+    __syncthreads();
+    if (tid < 128) {
+        val = (tid & 64) ? (smem[tid - 64] - val) : (val + smem[tid + 64]);
+    }
+    __syncthreads();
+
+    return val;
+}
+
+template <int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check, bool is_value>
+static __device__ __forceinline__ void flash_attn_ext_turbo1_tcq_load_tile(
+        const char * __restrict__ raw,
+        half2      * __restrict__ tile,
+        const float * __restrict__ cb,
+        const int stride_bytes,
+        const int i_sup) {
+    static_assert(D % QK_TURBO1_TCQ == 0, "turbo1_tcq fused loader requires 128-wide groups");
+    static_assert(nthreads >= 128, "turbo1_tcq fused loader requires at least 128 threads");
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_row = D / QK_TURBO1_TCQ;
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+
+    __shared__ float fwht_smem[128];
+    const float alpha = is_value ? d_tcq_decode_alpha_v_fattn : d_tcq_decode_alpha_k_fattn;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+
+    for (int row = 0; row < nbatch_fa; ++row) {
+        if (oob_check && row >= i_sup) {
+            for (int b = tid; b < D/2; b += nthreads) {
+                tile[row * stride_tile + b] = make_half2(0.0f, 0.0f);
+            }
+            __syncthreads();
+            continue;
+        }
+
+        const char * row_ptr = raw + (int64_t)row * stride_bytes;
+
+#pragma unroll
+        for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
+            float val = 0.0f;
+            if (tid < 128) {
+                const block_turbo1_tcq * blk = (const block_turbo1_tcq *)(row_ptr) + blk_idx;
+                const int byte_idx = tid >> 3;
+                const int bit_off  = tid & 7;
+                const uint16_t packed = (uint16_t)blk->qs[byte_idx] | ((uint16_t)blk->qs[byte_idx + 1] << 8);
+                const int state = (packed >> bit_off) & 0xFF;
+                const float norm = __half2float(blk->norm) * alpha;
+                val = norm * cb[state] * d_turbo_wht_signs2_fattn[tid];
+            }
+
+            val = fwht128_butterfly_linear(val, fwht_smem, tid);
+
+            if (tid < 128) {
+                fwht_smem[tid] = val * inv_sqrt_128 * d_turbo_wht_signs1_fattn[tid] *
+                    d_innerq_channel_scale_inv_fattn[tid];
+            }
+            __syncthreads();
+
+            if (tid < 64) {
+                tile[row * stride_tile + blk_idx * 64 + tid] = __floats2half2_rn(
+                    fwht_smem[2 * tid + 0],
+                    fwht_smem[2 * tid + 1]);
+            }
+            __syncthreads();
+        }
+    }
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
     typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ,
@@ -829,6 +918,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
                 flash_attn_ext_turbo8_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>(
                     K_raw + int64_t(k_VKQ_0) * stride_K, tile_K, stride_K, k_VKQ_sup);
+            } else if constexpr (type_K == GGML_TYPE_TURBO1_TCQ) {
+                const char * K_raw = (const char *)K_h2;
+                constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
+                flash_attn_ext_turbo1_tcq_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_turbo, oob_check, false>(
+                    K_raw + int64_t(k_VKQ_0) * stride_K, tile_K, smem_cb, stride_K, k_VKQ_sup);
             } else {
                 const char * K_raw = (const char *)K_h2;
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
@@ -1201,6 +1295,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_turbo8_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>(
                     V_raw + int64_t(k_VKQ_0) * stride_V, tile_V, stride_V, k_VKQ_sup);
                 __syncthreads();
+            } else if constexpr (type_V == GGML_TYPE_TURBO1_TCQ) {
+                const char * V_raw = (const char *)V_h2;
+                constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
+                flash_attn_ext_turbo1_tcq_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_turbo, oob_check, true>(
+                    V_raw + int64_t(k_VKQ_0) * stride_V, tile_V, smem_cb_v, stride_V, k_VKQ_sup);
+                __syncthreads();
             } else {
                 const char * V_raw = (const char *)V_h2;
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
@@ -1424,13 +1524,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     constexpr bool is_tcq3_cb = (type_K == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO3_TCQ);
     constexpr bool is_tcq2_cb = (type_K == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO2_TCQ);
-    constexpr int  cb_size    = is_tcq3_cb ? 512 : (is_tcq2_cb ? 256 : 1);
+    constexpr bool is_tcq1_cb = (type_K == GGML_TYPE_TURBO1_TCQ || type_V == GGML_TYPE_TURBO1_TCQ);
+    constexpr int  cb_size    = is_tcq3_cb ? 512 : ((is_tcq2_cb || is_tcq1_cb) ? 256 : 1);
     __shared__ float smem_cb[cb_size];
     __shared__ float smem_cb_v[cb_size];   // separate V codebook: V may use a different book than K (asymmetric K/V)
-    if constexpr (is_tcq3_cb || is_tcq2_cb) {
-        const float * cb_src   = is_tcq3_cb ? d_turbo3_tcq_codebook_fattn   : d_turbo2_tcq_codebook_fattn;
+    if constexpr (is_tcq3_cb || is_tcq2_cb || is_tcq1_cb) {
+        const float * cb_src   = is_tcq3_cb ? d_turbo3_tcq_codebook_fattn   : (is_tcq2_cb ? d_turbo2_tcq_codebook_fattn   : d_turbo1_tcq_codebook);
         // K reads the K book, V reads the separate V book (asymmetric K/V split).
-        const float * cb_src_v = is_tcq3_cb ? d_turbo3_tcq_codebook_v_fattn : d_turbo2_tcq_codebook_v_fattn;
+        const float * cb_src_v = is_tcq3_cb ? d_turbo3_tcq_codebook_v_fattn : (is_tcq2_cb ? d_turbo2_tcq_codebook_v_fattn : d_turbo1_tcq_codebook_v);
         for (int i = threadIdx.y * warp_size + threadIdx.x; i < cb_size; i += nwarps * warp_size) {
             smem_cb[i]   = cb_src[i];
             smem_cb_v[i] = cb_src_v[i];

@@ -50,6 +50,8 @@ extern void turbo_innerq_update_fattn_scales(const float * scale_inv);
 extern void turbo_innerq_init_fattn();
 extern void turbo_q_calibrate_init();
 extern void turbo_q_calibrate_finalize();
+// turbo1_nsn per-chunk per-head centering buffer (defined in set-rows.cu, read by fattn.cu).
+extern float * turbo1_nsn_o_buf(int device, int is_k);
 
 // TCQ error dump: save post-FWHT normalized values and output symbols for autocorrelation analysis
 static __device__ float   * d_tcq_dump_x_buf   = nullptr; // [max_groups][128] original values
@@ -912,15 +914,257 @@ void dequantize_turbo8_0(const void * vx, const int64_t ib, const int iqs, float
     v.y = d_turbo_centroids_8bit[x[ib].qs[iqs + 64]] * norm;
 }
 
+// E1 sign-scale selector (host-set from TURBO1_SCALE env): 0=norm-corr(sigma, energy-preserving,
+// E0 default), 1=mean|x| (= sqrt(2/pi)*sigma, MSE-optimal), 2=absmax. Per-group scale for the
+// 1-bit sign code; decode is unchanged (sign * d).
+static __constant__ int d_turbo1_scale_mode;
+
+// E4 sigma-delta noise shaping (host-set from TURBO1_SDELTA env): 0=off (plain per-coord sign),
+// 1=1st-order error feedback, 2=2nd-order. Sequential over the 128 FWHT-ordered coords; shapes
+// quantization noise to high frequency bins. Decode unchanged (sign * d).
+static __constant__ int d_turbo1_sdelta;
+
+// K/V tag for TURBO_EXTRACT harvest (set per set_rows launch from dst name): 1=K cache, 0=V cache.
+// Lets the offline NSNQuant prototype separate K (dot-product proxy) from V (reconstruction).
+static __constant__ int d_turbo1_is_k;
+
+// E6 subtractive TPDF dither (host-set from TURBO1_DITHER>0): add dither u before sign at encode,
+// subtract the SAME u at decode (seeded by the block's memory address, identical encode<->decode).
+// d_turbo1_dither_w = TPDF half-width in the unit-sigma domain (levels +-1). Decode side has its own
+// __constant__ copy in fattn.cu set from the same env.
+static __constant__ int   d_turbo1_dither;
+static __constant__ float d_turbo1_dither_w;
+
+// Deterministic TPDF dither in [-w, w] from (seed, j) via splitmix64. SAME function in fattn.cu.
+static __device__ __forceinline__ float turbo1_tpdf(unsigned long long seed, int j, float w) {
+    unsigned long long s = seed + (unsigned long long)(j + 1) * 0x9E3779B97F4A7C15ULL;
+    s = (s ^ (s >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    s = (s ^ (s >> 27)) * 0x94D049BB133111EBULL;
+    s =  s ^ (s >> 31);
+    float u1 = (float)(unsigned int)(s & 0xFFFFFFFFu) * (1.0f / 4294967296.0f);
+    float u2 = (float)(unsigned int)(s >> 32)         * (1.0f / 4294967296.0f);
+    return (u1 + u2 - 1.0f) * w; // triangular over [-w, w]
+}
+static void turbo1_set_is_k(int is_k) {
+    cudaMemcpyToSymbol(d_turbo1_is_k, &is_k, sizeof(int));
+}
+
+// === TURBO1: SET_ROWS quantize (1-bit sign + per-group fp16 scale) ===
+static __device__ __forceinline__
+void quantize_f32_turbo1_block(const float * src, block_turbo1 * dst) {
+    float norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) norm_sq += src[j] * src[j];
+    float norm = sqrtf(norm_sq);
+    float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+    float x[128];
+    for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
+    // Forward FWHT rotation before quantization
+    turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
+    // Post-rotation extraction (if enabled); tag K=1 / V=0 for the offline NSNQuant prototype.
+    turbo_extract_append(x, d_turbo1_is_k);
+    // 1-bit sign quantization: bit set = negative. Per-group scale (x is unit-L2 here):
+    //   mode 0 (default): norm-correction = sigma = 1/sqrt(128) (energy-preserving)
+    //   mode 1: mean(|x|) = sqrt(2/pi)*sigma (MSE-optimal, ~0.8x)
+    //   mode 2: absmax(|x|)
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    float scale;
+    if (d_turbo1_scale_mode == 1) {
+        float abssum = 0.0f;
+        for (int j = 0; j < 128; j++) abssum += fabsf(x[j]);
+        scale = abssum * (1.0f / 128.0f);
+    } else if (d_turbo1_scale_mode == 2) {
+        float am = 0.0f;
+        for (int j = 0; j < 128; j++) am = fmaxf(am, fabsf(x[j]));
+        scale = am;
+    } else if (d_turbo1_scale_mode == 3 && d_turbo1_is_k) {
+        // E5 RaBitQ unbiased inner-product scale (K only): d = norm/Sum|x_rot| so Q.K_recon is an
+        // unbiased estimate of Q.K (RaBitQ Eq.13: divide by <o_bar,o> = Sum|x|/sqrt(128); folds the
+        // per-group correction factor into d for free). ~1.25x sigma. V keeps sigma (norm matters).
+        float abssum = 0.0f;
+        for (int j = 0; j < 128; j++) abssum += fabsf(x[j]);
+        scale = abssum > 1e-12f ? (1.0f / abssum) : inv_sqrt_128;  // d = norm / Sum|x_rot|
+    } else {
+        scale = inv_sqrt_128;
+    }
+    for (int j = 0; j < QK_TURBO1 / 8; j++) dst->qs[j] = 0;
+    if (d_turbo1_dither) {
+        // Subtractive TPDF dither: sign(x' + u), x' in unit-sigma domain (levels +-1). Decode
+        // subtracts the same u (block-address seed). constexpr sqrt(128) = 11.3137.
+        const unsigned long long seed = (unsigned long long)(unsigned long)dst;
+        for (int j = 0; j < 128; j++) {
+            const float xs = x[j] * 11.31370849898476f;
+            const float u  = turbo1_tpdf(seed, j, d_turbo1_dither_w);
+            if (xs + u < 0.0f) dst->qs[j >> 3] |= (uint8_t)(1u << (j & 7));
+        }
+    } else if (d_turbo1_sdelta == 0) {
+        // Plain per-coordinate sign.
+        for (int j = 0; j < 128; j++) {
+            if (x[j] < 0.0f) dst->qs[j >> 3] |= (uint8_t)(1u << (j & 7));
+        }
+    } else {
+        // Sigma-delta: sequential sign with quantization-error feedback. recon = sign*scale.
+        // 1st-order carries e1; 2nd-order carries a second integrator e2.
+        float e1 = 0.0f, e2 = 0.0f;
+        const bool second = (d_turbo1_sdelta == 2);
+        for (int j = 0; j < 128; j++) {
+            float v = x[j] + e1 + (second ? e2 : 0.0f);
+            float q = (v < 0.0f) ? -1.0f : 1.0f;
+            if (q < 0.0f) dst->qs[j >> 3] |= (uint8_t)(1u << (j & 7));
+            float err = v - q * scale;   // residual after this coord
+            if (second) e2 += e1;         // second integrator accumulates first
+            e1 = err;
+        }
+    }
+    dst->d = __float2half(norm * scale);
+}
+
+// Host: upload the E1 scale mode from TURBO1_SCALE env (once). Safe default 0.
+static void turbo1_set_scale_mode_from_env() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const char * e = getenv("TURBO1_SCALE");
+    int mode = e ? atoi(e) : 0;
+    cudaMemcpyToSymbol(d_turbo1_scale_mode, &mode, sizeof(int));
+    if (e) fprintf(stderr, "turbo1: TURBO1_SCALE=%d (0=sigma 1=mean|x| 2=absmax)\n", mode);
+    const char * sd = getenv("TURBO1_SDELTA");
+    int sdm = sd ? atoi(sd) : 0;
+    cudaMemcpyToSymbol(d_turbo1_sdelta, &sdm, sizeof(int));
+    if (sd) fprintf(stderr, "turbo1: TURBO1_SDELTA=%d (0=off 1=1st-order 2=2nd-order)\n", sdm);
+    // E6 subtractive dither: TURBO1_DITHER = TPDF half-width (e.g. 1.0). 0/unset = off.
+    const char * dz = getenv("TURBO1_DITHER");
+    float dw = dz ? (float)atof(dz) : 0.0f;
+    int don = dw > 0.0f ? 1 : 0;
+    cudaMemcpyToSymbol(d_turbo1_dither, &don, sizeof(int));
+    cudaMemcpyToSymbol(d_turbo1_dither_w, &dw, sizeof(float));
+    if (dz) fprintf(stderr, "turbo1: TURBO1_DITHER w=%.3f (subtractive TPDF, 0=off)\n", dw);
+}
+
+// === TURBO1_NSN: encode (NSNQuant double-norm + per-chunk per-head centering, then 1-bit sign) ===
+// o[128] = per-channel mean of the token-normalized vectors (vn) for THIS head, over the token chunk
+// (computed in a prior reduction pass). Faithful NSNQuant: token-norm -> center -> renorm -> FWHT -> sign.
+static __device__ __forceinline__
+void quantize_f32_turbo1_nsn_block(const float * src, block_turbo1_nsn * dst, const float * o) {
+    constexpr float inv_sqrt_128 = 0.08838834764831845f; // 1/sqrt(128)
+    // s1 = ||v|| / sqrt(128) ; vn = v / s1
+    float norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) norm_sq += src[j] * src[j];
+    float norm = sqrtf(norm_sq);
+    float s1 = norm * inv_sqrt_128;
+    float inv_s1 = s1 > 1e-12f ? 1.0f / s1 : 0.0f;
+    // center: vns = vn - o ; renorm scale s2 = ||vns|| / sqrt(128)
+    float vns[128];
+    float ns_sq = 0.0f;
+    for (int j = 0; j < 128; j++) {
+        float vn = src[j] * inv_s1;
+        float t  = vn - o[j];
+        vns[j] = t;
+        ns_sq += t * t;
+    }
+    float ns_norm = sqrtf(ns_sq);
+    float s2 = ns_norm * inv_sqrt_128;
+    float inv_ns = ns_norm > 1e-12f ? 1.0f / ns_norm : 0.0f;
+    // unit vector -> FWHT -> sign
+    float x[128];
+    for (int j = 0; j < 128; j++) x[j] = vns[j] * inv_ns;
+    turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
+    turbo_extract_append(x, d_turbo1_is_k);
+    for (int j = 0; j < QK_TURBO1_NSN / 8; j++) dst->qs[j] = 0;
+    for (int j = 0; j < 128; j++) {
+        if (x[j] < 0.0f) dst->qs[j >> 3] |= (uint8_t)(1u << (j & 7));
+    }
+    dst->s1 = __float2half(s1);
+    dst->s2 = __float2half(s2);
+}
+
+// === TURBO1_NSN: GET_ROWS dequantize (rotated-domain reconstruction, no centering re-add) ===
+// Note: get_rows is not used for KV decode (fattn is); this is a structural stub that returns the
+// centered-normalized reconstruction without o (callers that need v must add s1*o separately).
+#define QR_TURBO1_NSN 2
+static __device__ __forceinline__
+void dequantize_turbo1_nsn(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_turbo1_nsn * x = (const block_turbo1_nsn *)vx;
+    constexpr float sqrt_128 = 11.31370849898476f;
+    const float a = __half2float(x[ib].s1) * __half2float(x[ib].s2) * sqrt_128 * 0.08838834764831845f;
+    { const int j = iqs;
+      const uint8_t bit = (x[ib].qs[j >> 3] >> (j & 7)) & 1u;
+      v.x = bit ? -a : a; }
+    { const int j = iqs + 64;
+      const uint8_t bit = (x[ib].qs[j >> 3] >> (j & 7)) & 1u;
+      v.y = bit ? -a : a; }
+}
+
+// === TURBO1_CQ: Coupled Quantization codebook (256 codewords x 8 dims, trained on post-FWHT KV) ===
+#include "turbo1_cq_codebook.h"   // defines macro TURBO1_CQ_CB_INIT = { ...2048 floats... }
+static __constant__ float d_turbo1_cq_cb[256*8] = TURBO1_CQ_CB_INIT;
+
+// Encode: normalize -> FWHT -> per 8-channel group, nearest of 256 codewords -> 8-bit index.
+// Norm-correction: d = ||v|| / ||concat(codewords)|| so reconstruction L2 matches the original.
+static __device__ __forceinline__
+void quantize_f32_turbo1_cq_block(const float * src, block_turbo1_cq * dst) {
+    float norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) norm_sq += src[j] * src[j];
+    float norm = sqrtf(norm_sq);
+    float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+    float x[128];
+    for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
+    turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
+    turbo_extract_append(x, d_turbo1_is_k);
+    float recon_sq = 0.0f;
+    for (int g = 0; g < 16; g++) {
+        const float * xg = x + g * 8;
+        int   best  = 0;
+        float bestd = 3.4e38f;
+        for (int cw = 0; cw < 256; cw++) {
+            const float * c = d_turbo1_cq_cb + cw * 8;
+            float dsum = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) { float e = xg[k] - c[k]; dsum += e * e; }
+            if (dsum < bestd) { bestd = dsum; best = cw; }
+        }
+        dst->qs[g] = (uint8_t) best;
+        const float * c = d_turbo1_cq_cb + best * 8;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) recon_sq += c[k] * c[k];
+    }
+    float recon_norm = sqrtf(recon_sq);
+    dst->d = __float2half((recon_norm > 1e-10f) ? norm / recon_norm : norm * 0.08838834764831845f);
+}
+
+// === TURBO1_CQ: GET_ROWS dequantize (rotated-domain codebook lookup; not used for KV) ===
+#define QR_TURBO1_CQ 2
+static __device__ __forceinline__
+void dequantize_turbo1_cq(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_turbo1_cq * x = (const block_turbo1_cq *)vx;
+    const float d = __half2float(x[ib].d);
+    { const int j = iqs;      v.x = d * d_turbo1_cq_cb[(int)x[ib].qs[j >> 3] * 8 + (j & 7)]; }
+    { const int j = iqs + 64; v.y = d * d_turbo1_cq_cb[(int)x[ib].qs[j >> 3] * 8 + (j & 7)]; }
+}
+
+// === TURBO1: GET_ROWS dequantize ===
+#define QR_TURBO1 2
+static __device__ __forceinline__
+void dequantize_turbo1(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_turbo1 * x = (const block_turbo1 *)vx;
+    const float d = __half2float(x[ib].d);
+    { const int j = iqs;
+      const uint8_t bit = (x[ib].qs[j >> 3] >> (j & 7)) & 1u;
+      v.x = bit ? -d : d; }
+    { const int j = iqs + 64;
+      const uint8_t bit = (x[ib].qs[j >> 3] >> (j & 7)) & 1u;
+      v.y = bit ? -d : d; }
+}
+
 // === RAGGED reconstruct-to-fp16 quality harness (EXP-16) ===
 // A static (position, layer, K/V) -> precision-tier schedule, applied at KV write.
 // Degraded rows are round-tripped quant->dequant and stored as f16; protected rows
 // stay exact f16. No ragged storage / no mixed-dtype fattn — this measures the
 // QUALITY (KLD) cost of per-row precision only. tier codes: 16=f16 (lossless),
-// 8=turbo8, 4=turbo4, 3=turbo3 (group-norm over the 128-coord head_dim group).
+// 8=turbo8, 4=turbo4, 3=t3, 2=t2, 11=t1tcq, 22=t2tcq, 33=t3tcq.
 // kv: 0=any, 1=K-only, 2=V-only. Last matching band wins.
+#define RAGGED_MAX_BANDS 768
 struct ragged_band { int pos_lo, pos_hi, lay_lo, lay_hi, cb_lo, cb_hi, kv, tier; };
-static __constant__ ragged_band d_ragged_bands[128];
+static __constant__ ragged_band d_ragged_bands[RAGGED_MAX_BANDS];
 static __constant__ int d_ragged_nbands = 0;
 static __constant__ int d_ragged_default_tier = 16;
 
@@ -957,22 +1201,23 @@ int ragged_lookup_tier(int64_t pos, int layer, int is_k, int cb) {
 // f16 makes a standard f16 Q.K reproduce the real rotated-space turbo score:
 // Q . R^-1(norm*c) == (HQ) . (norm*c).
 static __device__ __forceinline__
-void turbo_roundtrip_block_to_orig(const float * src, float * out, int tier) {
+void turbo_roundtrip_block_to_orig(const float * src, float * out, int tier, int is_k) {
     float xr[128];
-    float2 v;
+    float post_norm = 1.0f;
     if (tier == 8) {
         block_turbo8_0 blk;
         quantize_f32_turbo8_0_block(src, &blk);
-        for (int iqs = 0; iqs < 64; iqs++) {
-            dequantize_turbo8_0(&blk, 0, iqs, v);
-            xr[iqs] = v.x; xr[iqs + 64] = v.y;
+        post_norm = __half2float(blk.norm);
+        for (int j = 0; j < 128; j++) {
+            xr[j] = d_turbo_centroids_8bit[blk.qs[j]];
         }
     } else if (tier == 4) {
         block_turbo4_0 blk;
         quantize_f32_turbo4_0_block(src, &blk);
-        for (int iqs = 0; iqs < 64; iqs++) {
-            dequantize_turbo4_0(&blk, 0, iqs, v);
-            xr[iqs] = v.x; xr[iqs + 64] = v.y;
+        post_norm = __half2float(blk.norm);
+        for (int j = 0; j < 128; j++) {
+            const uint8_t idx = (j & 1) ? (blk.qs[j / 2] >> 4) : (blk.qs[j / 2] & 0xF);
+            xr[j] = d_turbo_centroids_4bit[idx];
         }
     } else if (tier == 2) { // 2-bit, shared 128-group norm (mirror of the turbo2 set_rows kernel,
                             // inlined here because turbo_find_nearest_2bit is defined further down).
@@ -996,20 +1241,25 @@ void turbo_roundtrip_block_to_orig(const float * src, float * out, int tier) {
         }
         const float rnorm = sqrtf(rnsq);
         const float cnorm = (rnorm > 1e-10f) ? gnorm / rnorm : gnorm;
-        for (int j = 0; j < 128; j++) xr[j] = d_turbo_centroids_2bit[idxs[j]] * cnorm;
+        post_norm = cnorm;
+        for (int j = 0; j < 128; j++) xr[j] = d_turbo_centroids_2bit[idxs[j]];
     } else { // tier == 3 (4 sub-blocks of QK_TURBO3, shared group norm)
         block_turbo3_0 blk[QK_TURBO3_GROUP / QK_TURBO3];
         quantize_f32_turbo3_0_block(src, blk);
+        post_norm = __half2float(blk[0].norm);
         for (int ib = 0; ib < QK_TURBO3_GROUP / QK_TURBO3; ib++) {
-            for (int iqs = 0; iqs < QK_TURBO3 / 2; iqs++) {
-                dequantize_turbo3_0(blk, ib, iqs, v);
-                xr[ib * QK_TURBO3 + iqs]                 = v.x;
-                xr[ib * QK_TURBO3 + iqs + QK_TURBO3 / 2] = v.y;
+            for (int j = 0; j < QK_TURBO3; j++) {
+                const uint8_t low2 = (blk[ib].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+                const uint8_t hi1  = (blk[ib].signs[j / 8] >> (j % 8)) & 0x1;
+                xr[ib * QK_TURBO3 + j] = d_turbo_centroids_3bit[low2 | (hi1 << 2)];
             }
         }
     }
     turbo_rotate_forward_cuda(xr, d_turbo_wht_signs2, d_turbo_wht_signs1);
-    for (int j = 0; j < 128; j++) out[j] = xr[j];
+    for (int j = 0; j < 128; j++) {
+        const float v = xr[j] * post_norm;
+        out[j] = is_k ? v * d_innerq_channel_scale_inv[j] : v;
+    }
 }
 
 // === TURBO2: find nearest 2-bit centroid ===
@@ -1303,6 +1553,7 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
     const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
     const int64_t i11 = fastmodulo((uint32_t)i02, ne11_fd);
     const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+    if (dst_row < 0) return;
     const float * grp_src = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
     block_turbo3_tcq * dst_blk = (block_turbo3_tcq *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3)
                                   + (i00 / QK_TURBO3_TCQ);
@@ -1731,6 +1982,7 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
     const int64_t i11 = fastmodulo((uint32_t)i02, ne11_fd);
     const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+    if (dst_row < 0) return;
     const float * grp_src = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
     block_turbo2_tcq * dst_blk = (block_turbo2_tcq *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3)
                                + (i00 / QK_TURBO2_TCQ);
@@ -2010,4 +2262,355 @@ void dequantize_turbo2_tcq(const void * vx, const int64_t ib, const int iqs, flo
         const int state = (raw >> bit_off) & 0xFF;
         v.y = d_turbo2_tcq_codebook[state] * norm;
     }
+}
+
+// =====================================================================================
+// TURBO1_TCQ: 1-bit Trellis-Coded Quantization (k=1, L=8, 256 states, free initial state)
+// Encode mirrors k_set_rows_turbo2_tcq but with the k=1 right-shift recurrence
+// ns = (prev >> 1) | (out << 7): 2 predecessors sharing sid's low 7 bits, 1 output bit/step.
+// Bitstream = 7 init-prefix bits + 128 1-bit outputs = 135 bits = 17 bytes. Separate K/V
+// 256-state codebooks (TURBO1_TCQ_CB_K / TURBO1_TCQ_CB_V); cold-start = turbo2_tcq anchor.
+// Decode = turbo1_cq-style per-row inverse FWHT (k_turbo1_tcq_dequant_f16 in fattn.cu).
+// =====================================================================================
+// Baked-in turbo1_tcq codebooks (product_mono k=1/L=8, trained on uncentered post-FWHT Qwen3.6-27B KV).
+// K = seed5/iter135, V = seed1/iter490; joint median KLD 0.0509 @8192/24ch (vs 0.0569 cq-way, 0.0691 anchor).
+// TURBO1_TCQ_CB_K/_V env still override these at runtime for future sweeps.
+static __constant__ float d_turbo1_tcq_codebook[256]   = {  // K encode
+    -0.05690895f, -0.05690895f, +0.06699874f, +0.15792155f, +0.03688013f, +0.04268654f, -0.14011213f, -0.02965679f,
+    -0.02438163f, -0.02438163f, -0.19953799f, -0.09293428f, -0.03144405f, -0.02849112f, +0.08199784f, +0.08199784f,
+    +0.09005091f, +0.09005091f, -0.05940611f, -0.05580222f, -0.07773691f, +0.06265988f, -0.01465418f, -0.00772985f,
+    -0.07816899f, -0.02297225f, +0.05464951f, +0.05464951f, +0.04231037f, +0.04641661f, -0.08938144f, -0.08938144f,
+    +0.00365320f, +0.10741787f, -0.16739547f, -0.04616742f, -0.14219233f, -0.00901757f, -0.08096506f, -0.01814358f,
+    +0.01111611f, +0.01161552f, -0.03937600f, -0.01077888f, +0.05573412f, +0.12505241f, -0.06129042f, -0.06129042f,
+    +0.01023831f, +0.01023831f, -0.12061471f, -0.12061471f, -0.04995122f, +0.02263966f, +0.03203409f, +0.11107059f,
+    -0.07132407f, +0.12659174f, +0.01221013f, +0.04215888f, -0.10731849f, -0.10731849f, +0.05396174f, +0.05396174f,
+    -0.08873346f, -0.02921234f, -0.08342038f, +0.01016524f, -0.04502235f, -0.02802503f, +0.08100778f, +0.09756171f,
+    +0.07306496f, +0.07941060f, +0.06482599f, +0.17851813f, -0.17608380f, -0.13157773f, -0.02980503f, -0.02493151f,
+    -0.08945329f, -0.04105385f, +0.06271980f, +0.06271980f, +0.04196313f, +0.04196313f, -0.07387091f, -0.07387091f,
+    -0.17707518f, -0.00678580f, -0.10799771f, -0.01689552f, +0.13846508f, +0.13846508f, +0.00282240f, +0.00900819f,
+    -0.06046259f, +0.00667074f, +0.08675562f, +0.08675562f, +0.03267998f, +0.08196472f, -0.05092679f, -0.05092679f,
+    -0.14121383f, -0.01879669f, -0.05341130f, -0.00773192f, -0.08829777f, +0.02199137f, +0.02482944f, +0.10630896f,
+    -0.04461808f, -0.04461808f, +0.07664362f, +0.07906501f, +0.02414565f, +0.14515512f, -0.12866446f, -0.05883218f,
+    +0.07126531f, +0.07126531f, -0.09748757f, -0.04700467f, -0.00578264f, -0.00578264f, -0.05956273f, +0.09283913f,
+    +0.07512030f, +0.07512030f, -0.05542693f, -0.02299234f, -0.12123095f, -0.04918547f, +0.00890487f, +0.06046228f,
+    +0.07268346f, +0.08064783f, -0.08709023f, -0.00295277f, +0.09379439f, +0.09379439f, -0.05568655f, -0.05568655f,
+    -0.07594635f, -0.07594635f, +0.06194503f, +0.08429574f, +0.00319491f, +0.18098263f, +0.01526845f, +0.02230061f,
+    +0.01046284f, +0.07030793f, -0.03586691f, +0.12040213f, -0.11210962f, -0.09723122f, +0.02993215f, +0.02993215f,
+    -0.16422588f, -0.04235943f, +0.01761191f, +0.03886831f, -0.01567245f, +0.12241358f, +0.03636941f, +0.03636941f,
+    -0.10172297f, -0.02071226f, +0.02888141f, +0.09684418f, -0.09620761f, -0.02462198f, +0.03707082f, +0.07376128f,
+    -0.06408252f, +0.08888291f, +0.01361814f, +0.04392439f, +0.02771172f, +0.02771172f, -0.12401393f, -0.04075170f,
+    +0.01655904f, +0.01655904f, -0.11275508f, -0.11275508f, +0.03323539f, +0.03323539f, -0.10384015f, +0.19677565f,
+    +0.01188133f, +0.01514807f, +0.02290127f, +0.13536246f, +0.07205503f, +0.15930237f, -0.07375064f, -0.05046035f,
+    -0.08193663f, -0.08193663f, -0.03241898f, +0.04459962f, -0.01891778f, -0.01165876f, +0.09547786f, +0.14283878f,
+    +0.02682622f, +0.12911709f, -0.05600601f, -0.05600601f, -0.16854414f, -0.08491614f, +0.04553003f, +0.04553003f,
+    +0.00329509f, +0.08321664f, -0.00810051f, +0.10836335f, -0.00792713f, -0.00792713f, -0.13737200f, -0.09546821f,
+    +0.06686576f, +0.17066576f, -0.05565165f, -0.04070367f, -0.09663567f, -0.04676020f, +0.09122299f, +0.09122299f,
+    +0.02007535f, +0.11729758f, +0.00424169f, +0.00424169f, +0.01952964f, +0.13675623f, -0.11927815f, -0.01915905f,
+    +0.08001547f, +0.08001547f, -0.05414105f, -0.05414105f, -0.15429053f, -0.06953919f, +0.02160413f, +0.05599044f,
+    -0.06471479f, -0.06471479f, +0.05585973f, +0.13141583f, -0.02186239f, +0.02123550f, -0.02659754f, +0.04245459f,
+};
+static __constant__ float d_turbo1_tcq_codebook_v[256] = {  // V encode
+    -0.05822275f, -0.04057012f, +0.07030253f, +0.07030253f, +0.00910952f, +0.13381734f, -0.15394895f, -0.03654402f,
+    -0.06419166f, -0.06419166f, -0.00322056f, -0.00322056f, -0.04590228f, -0.02467079f, +0.07511869f, +0.07511869f,
+    +0.05966081f, +0.06482045f, -0.05617626f, -0.05617626f, -0.10456542f, -0.04816543f, -0.03039524f, +0.03820165f,
+    -0.02399842f, -0.02399842f, +0.03528102f, +0.11460238f, +0.01120800f, +0.01120800f, -0.12139006f, -0.12139006f,
+    +0.06143143f, +0.15165478f, -0.00829714f, +0.03238043f, -0.07274882f, -0.07274882f, +0.01648950f, +0.04747831f,
+    -0.13129655f, -0.08037784f, -0.01519387f, -0.01374798f, +0.09782079f, +0.09782079f, -0.04960374f, -0.04960374f,
+    -0.02048401f, -0.02048401f, -0.14179772f, -0.10473511f, +0.05546302f, +0.07371018f, +0.01881939f, +0.14756195f,
+    -0.04088041f, +0.00697273f, +0.02537729f, +0.03056769f, -0.13503331f, -0.09729782f, +0.05183329f, +0.18428555f,
+    -0.17827763f, -0.15089703f, -0.03956327f, -0.01698648f, -0.03595189f, -0.03595189f, +0.07393072f, +0.07393072f,
+    +0.08052437f, +0.17165796f, +0.00083603f, +0.03242609f, -0.16325922f, -0.12540159f, -0.01560353f, +0.00438857f,
+    -0.06914193f, -0.05732659f, +0.04068601f, +0.05820430f, +0.00498649f, +0.09965154f, -0.11689261f, -0.11689261f,
+    +0.04313961f, +0.11466423f, -0.07856513f, -0.00676461f, +0.14289343f, +0.14289343f, -0.01477776f, +0.00207787f,
+    -0.08715416f, -0.08715416f, +0.05999934f, +0.05999934f, +0.08748800f, +0.08748800f, -0.03674424f, -0.03598228f,
+    +0.04614007f, +0.04614007f, -0.10481524f, -0.10481524f, -0.03229756f, -0.03229756f, +0.02437326f, +0.10609587f,
+    -0.04459647f, -0.04459647f, +0.08320531f, +0.08320531f, +0.09055579f, +0.09055579f, -0.09849767f, -0.03800276f,
+    +0.02997772f, +0.02997772f, -0.10893033f, -0.10893033f, -0.05067614f, +0.01131399f, -0.02704101f, +0.09590967f,
+    +0.08146118f, +0.08146118f, -0.07268019f, -0.05547163f, -0.15487537f, -0.03218244f, +0.03206071f, +0.07322103f,
+    -0.01254456f, -0.01254456f, +0.10675898f, +0.11011963f, +0.07422783f, +0.07422783f, -0.05873942f, -0.05318457f,
+    -0.08198534f, -0.08198534f, +0.03441365f, +0.06745050f, +0.00344696f, +0.02957109f, +0.10733211f, +0.17381467f,
+    -0.12887627f, +0.06219940f, -0.02732148f, -0.00106800f, -0.11212935f, +0.11931811f, +0.01623658f, +0.01623658f,
+    -0.05334378f, +0.00559292f, -0.17833017f, -0.06168034f, +0.04205889f, +0.05851458f, -0.06669462f, -0.06669462f,
+    +0.00689281f, +0.04394012f, +0.08635867f, +0.11145297f, -0.09817721f, -0.05329924f, +0.05398905f, +0.07623540f,
+    +0.11233878f, +0.17313740f, +0.00950995f, +0.01250056f, -0.05599560f, -0.03859993f, -0.07366411f, +0.00118889f,
+    +0.02521585f, +0.02521585f, -0.11893971f, -0.10650937f, +0.05810528f, +0.05810528f, -0.16678603f, -0.04473093f,
+    -0.01108021f, -0.00942814f, +0.07052016f, +0.14542146f, +0.07294562f, +0.07294562f, -0.06669298f, -0.06669298f,
+    -0.03622010f, +0.02799591f, -0.11604622f, -0.06511734f, -0.00890048f, -0.00399124f, +0.13813104f, +0.13813104f,
+    +0.03711793f, +0.08076523f, -0.05968392f, -0.05968392f, -0.16921099f, -0.07368306f, +0.01830781f, +0.03795826f,
+    -0.03008453f, -0.03008453f, +0.04872094f, +0.16440891f, -0.00369157f, -0.00369157f, -0.15617938f, -0.09730178f,
+    +0.04716997f, +0.04716997f, -0.07361570f, -0.06438473f, -0.04917597f, -0.03088157f, +0.08131150f, +0.08131150f,
+    -0.07323092f, +0.16313137f, +0.02744950f, +0.02744950f, +0.03818675f, +0.08015263f, -0.10156032f, -0.01302207f,
+    +0.05073140f, +0.05073140f, -0.05120790f, -0.05120790f, -0.05612922f, -0.05612922f, +0.06819829f, +0.08482070f,
+    -0.10348321f, +0.11792021f, +0.00979673f, +0.03041706f, +0.00188910f, +0.00188910f, -0.06026103f, +0.05430736f,
+};
+
+static inline void turbo1_tcq_load_kv_encode() {
+    auto load_file = [](const char * p, float * out) -> bool {
+        FILE * f = fopen(p, "rb"); if (!f) return false;
+        bool ok = fread(out, sizeof(float), 256, f) == 256; fclose(f); return ok;
+    };
+    auto file_mtime = [](const char * p) -> long { struct stat st; return (p && stat(p, &st) == 0) ? (long)st.st_mtime : 0; };
+    int dev = 0; cudaGetDevice(&dev);
+    static int hot = -1; if (hot < 0) hot = getenv("TURBO1_TCQ_HOTSWAP") ? 1 : 0;
+    static bool init[GGML_CUDA_MAX_DEVICES] = {};
+    static long mk[GGML_CUDA_MAX_DEVICES] = {}, mv[GGML_CUDA_MAX_DEVICES] = {};
+    const char * cb = getenv("TURBO1_TCQ_CB");
+    const char * kp = getenv("TURBO1_TCQ_CB_K"); if (!kp) kp = cb;
+    const char * vp = getenv("TURBO1_TCQ_CB_V"); if (!vp) vp = cb;
+    const bool first = !init[dev];
+    const long nk = (hot || first) ? file_mtime(kp) : mk[dev];
+    const long nv = (hot || first) ? file_mtime(vp) : mv[dev];
+    const bool do_k = first || (hot && nk != mk[dev]);
+    const bool do_v = first || (hot && nv != mv[dev]);
+    if (!do_k && !do_v) return;
+    float buf[256];
+    // cold-start default = baked-in best codebook (seed5/iter135 K, seed1/iter490 V); only env overrides it.
+    if (do_k && kp && load_file(kp, buf)) { cudaMemcpyToSymbol(d_turbo1_tcq_codebook,   buf, 256*sizeof(float)); mk[dev] = nk; }
+    if (do_v && vp && load_file(vp, buf)) { cudaMemcpyToSymbol(d_turbo1_tcq_codebook_v, buf, 256*sizeof(float)); mv[dev] = nv; }
+    init[dev] = true;
+    if (first)
+        fprintf(stderr, "TCQ1 encode: K/V codebooks (K=%s V=%s) hotswap=%d\n", kp?kp:"baked-in", vp?vp:"baked-in", hot);
+}
+
+// 1-bit TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis (k=1, L=8).
+// Stores FWHT-rotated trellis codes; decode (k_turbo1_tcq_dequant_f16) does the inverse FWHT.
+template<typename idx_t>
+static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo1_tcq(
+        const float * __restrict__ src0, const idx_t * __restrict__ src1,
+        block_turbo1_tcq * __restrict__ dst, const int64_t ne_total_groups,
+        uint8_t * __restrict__ bt_buf,
+        const int use_shared_bt,
+        const int iq_is_k,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s10, const int64_t s11, const int64_t s12,
+        const int64_t s1, const int64_t s2, const int64_t s3,
+        const uint3 ne00_fd, const uint3 ne01_fd, const uint3 ne02_fd,
+        const uint3 ne11_fd, const uint3 ne12_fd) {
+
+    const int grp = blockIdx.x;
+    if (grp >= ne_total_groups) return;
+    const int sid = threadIdx.x; // 0..255 = trellis state
+
+    const int64_t i_base = int64_t(grp) * QK_TURBO1_TCQ;
+    uint32_t tmp = (uint32_t)i_base; uint2 div_mod;
+    div_mod = fast_div_modulo(tmp, ne00_fd); const int64_t i00 = div_mod.y; tmp = div_mod.x;
+    div_mod = fast_div_modulo(tmp, ne01_fd); const int64_t i01 = div_mod.y; tmp = div_mod.x;
+    div_mod = fast_div_modulo(tmp, ne02_fd); const int64_t i02 = div_mod.y; const int64_t i03 = div_mod.x;
+    const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t)i02, ne11_fd);
+    const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+    const float * grp_src = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
+    block_turbo1_tcq * dst_blk = (block_turbo1_tcq *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3)
+                               + (i00 / QK_TURBO1_TCQ);
+
+    extern __shared__ uint8_t bt_shared[];
+    __shared__ float x[128];
+    __shared__ float cost[256];
+    __shared__ float cost_b[256];        // double-buffering for Viterbi
+    __shared__ int   warp_min_idx[8];
+    __shared__ float warp_min_cost[8];
+    __shared__ float pred_min_cost[128]; // one per low-7-bit predecessor group (k=1)
+    __shared__ int   shared_initial_state;
+
+    if (sid < 128) x[sid] = grp_src[sid];
+    __syncthreads();
+
+    // Norm reduction
+    cost[sid] = (sid < 128) ? x[sid] * x[sid] : 0.0f;
+    __syncthreads();
+    for (int stride = 128; stride >= 32; stride >>= 1) {
+        if (sid < stride) cost[sid] += cost[sid + stride];
+        __syncthreads();
+    }
+    if (sid < 32) {
+        float v = cost[sid];
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 1);
+        if (sid == 0) cost[0] = v;
+    }
+    __syncthreads();
+    float grp_norm = sqrtf(cost[0]);
+    float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+
+    if (sid < 128) x[sid] *= inv_norm;
+    __syncthreads();
+
+    // FWHT: signs1 -> butterfly -> inv_sqrt_128 -> signs2 (same as turbo2_tcq encode).
+    if (sid < 128) {
+        float v = x[sid] * d_turbo_wht_signs1[sid];
+        const int lane = sid & 31;
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float other = __shfl_xor_sync(0xFFFFFFFFULL, v, h);
+            v = (lane & h) ? (other - v) : (v + other);
+        }
+        x[sid] = v;
+    }
+    __syncthreads();
+    if (sid < 64) {
+        const int j = ((sid >> 5) << 6) + (sid & 31);
+        float a = x[j], b = x[j + 32];
+        x[j] = a + b; x[j + 32] = a - b;
+    }
+    __syncthreads();
+    if (sid < 64) {
+        float a = x[sid], b = x[sid + 64];
+        x[sid] = a + b; x[sid + 64] = a - b;
+    }
+    __syncthreads();
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    if (sid < 128) x[sid] *= inv_sqrt_128 * d_turbo_wht_signs2[sid];
+    __syncthreads();
+
+    if (sid == 0) turbo_extract_append(x, iq_is_k ? 0 : 100);   // post-FWHT harvest, tagged K=0/V=100
+    if (sid == 0) cost[0] = grp_norm;
+    __syncthreads();
+    float saved_norm = cost[0];
+
+    // Viterbi forward pass: double-buffered cost (1 sync/step)
+    uint8_t * bt = use_shared_bt ? bt_shared : bt_buf + (int64_t)blockIdx.x * (128 * 128);
+    cost[sid] = 0.0f;
+    __syncthreads();
+
+    const float * cbk = iq_is_k ? d_turbo1_tcq_codebook : d_turbo1_tcq_codebook_v;
+    for (int t = 0; t < 128; t++) {
+        float * cost_rd = (t & 1) ? cost_b : cost;
+        float * cost_wr = (t & 1) ? cost   : cost_b;
+
+        float xt = x[t];
+
+        // Right-shift trellis (k=1, L=8): ns = (prev >> 1) | (out << 7).
+        // Best predecessor depends only on sid's low 7 bits -> 128 minima, 2-way scan.
+        if (sid < 128) {
+            const int base_prev = sid << 1;
+            float best = cost_rd[base_prev];
+            int best_p = 0;
+            float c1 = cost_rd[base_prev | 1];
+            if (c1 < best) { best = c1; best_p = 1; }
+            pred_min_cost[sid] = best;
+            bt[t * 128 + sid] = (uint8_t) best_p;
+        }
+        __syncthreads();
+
+        const int pred_idx = sid & 0x7F;
+        float dist = xt - cbk[sid];
+        dist = dist * dist;
+
+        cost_wr[sid] = pred_min_cost[pred_idx] + dist;
+        __syncthreads();
+    }
+    // After 128 steps (even count): final costs in cost[]
+
+    // Warp argmin over 256 costs
+    {
+        float my_cost = cost[sid];
+        int my_idx = sid;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_cost = __shfl_xor_sync(0xFFFFFFFFULL, my_cost, offset);
+            int other_idx = __shfl_xor_sync(0xFFFFFFFFULL, my_idx, offset);
+            if (other_cost < my_cost) { my_cost = other_cost; my_idx = other_idx; }
+        }
+        if (sid % 32 == 0) {
+            warp_min_cost[sid / 32] = my_cost;
+            warp_min_idx[sid / 32] = my_idx;
+        }
+    }
+    __syncthreads();
+    if (sid < 32) {
+        float best = (sid < 8) ? warp_min_cost[sid] : 3.4028234663852886e38f;
+        int best_idx = (sid < 8) ? warp_min_idx[sid] : 0;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_cost = __shfl_down_sync(0xFFFFFFFFULL, best, offset);
+            int other_idx = __shfl_down_sync(0xFFFFFFFFULL, best_idx, offset);
+            if (other_cost < best) { best = other_cost; best_idx = other_idx; }
+        }
+        if (sid == 0) shared_initial_state = best_idx;
+    }
+    __syncthreads();
+
+    // Backtrack (sequential): emit 1 output bit/step
+    uint8_t * outputs = (uint8_t *)x;
+    if (sid == 0) {
+        int state = shared_initial_state;
+        for (int t = 127; t >= 0; t--) {
+            outputs[t] = (uint8_t)(state >> 7);
+            int p = bt[t * 128 + (state & 0x7F)];
+            state = ((state & 0x7F) << 1) | p;
+        }
+        shared_initial_state = state;
+    }
+    __syncthreads();
+
+    // Parallel recon norm: state at step sid = 8 outputs (1 bit each); sid<7 walk from initial
+    float my_recon_sq = 0.0f;
+    if (sid < 128) {
+        int cur_state;
+        if (sid < 7) {
+            cur_state = shared_initial_state;
+            for (int t = 0; t <= sid; t++)
+                cur_state = (cur_state >> 1) | (((int)outputs[t]) << 7);
+        } else {
+            cur_state = 0;
+#pragma unroll
+            for (int b = 0; b < 8; b++)
+                cur_state |= ((int)outputs[sid - 7 + b] & 0x1) << b;
+        }
+        float c = cbk[cur_state];
+        my_recon_sq = c * c;
+    }
+    cost[sid] = my_recon_sq;
+    __syncthreads();
+    for (int stride = 128; stride >= 32; stride >>= 1) {
+        if (sid < stride) cost[sid] += cost[sid + stride];
+        __syncthreads();
+    }
+    if (sid < 32) {
+        float v = cost[sid];
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 1);
+        if (sid == 0) cost[0] = v;
+    }
+    __syncthreads();
+    float recon_norm = sqrtf(cost[0]);
+    float corrected_norm = (recon_norm > 1e-10f) ? saved_norm / recon_norm : saved_norm;
+
+    // Parallel bitpack: 7 init-state bits then 128 1-bit output symbols (17 bytes).
+    if (sid < 17) {
+        const int init_bits = (shared_initial_state >> 1) & 0x7F;  // 7 bits
+        uint8_t packed = 0;
+#pragma unroll
+        for (int bit = 0; bit < 8; bit++) {
+            const int pos = sid * 8 + bit;
+            int v = 0;
+            if (pos < 7) {
+                v = (init_bits >> pos) & 1;
+            } else {
+                const int sym_idx = pos - 7;
+                if (sym_idx < 128) v = outputs[sym_idx] & 1;
+            }
+            packed |= (uint8_t)(v << bit);
+        }
+        dst_blk->qs[sid] = packed;
+    }
+    if (sid == 0) dst_blk->norm = __float2half(corrected_norm);
+}
+
+// === TURBO1_TCQ: GET_ROWS dequantize (rotated-domain trellis lookup; not used for KV) ===
+#define QR_TURBO1_TCQ 2
+static __device__ __forceinline__
+void dequantize_turbo1_tcq(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_turbo1_tcq * x = (const block_turbo1_tcq *)vx;
+    const float norm = __half2float(x[ib].norm);
+    { const int bp = iqs;      const uint16_t raw = (uint16_t)x[ib].qs[bp>>3] | ((uint16_t)x[ib].qs[(bp>>3)+1] << 8);
+      v.x = norm * d_turbo1_tcq_codebook[(raw >> (bp & 7)) & 0xFF]; }
+    { const int bp = iqs + 64; const uint16_t raw = (uint16_t)x[ib].qs[bp>>3] | ((uint16_t)x[ib].qs[(bp>>3)+1] << 8);
+      v.y = norm * d_turbo1_tcq_codebook[(raw >> (bp & 7)) & 0xFF]; }
 }

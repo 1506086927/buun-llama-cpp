@@ -5021,7 +5021,11 @@ static void ggml_compute_forward_set_rows_f32(
 
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+                if (i1 < 0) {
+                    continue;
+                }
+
+                GGML_ASSERT(i1 < ne1);
 
                 from_float(
                         (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
@@ -8984,6 +8988,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (dst->src[5] || dst->src[6]) {
+        GGML_ABORT("VBR segmented-K flash attention is not implemented on CPU");
+    }
+
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:

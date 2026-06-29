@@ -2,6 +2,9 @@
 #include "common.h"
 #include "download.h"
 
+#include <cstdlib>
+#include <fstream>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -9,6 +12,10 @@
 
 #undef NDEBUG
 #include <cassert>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 int main(void) {
     common_params params;
@@ -82,6 +89,42 @@ int main(void) {
         return res;
     };
 
+#ifndef _WIN32
+    auto clear_vbr_runtime_env = []() {
+        for (const char * name : {
+                "VBR_LAYER_SCHEDULE",
+                "TURBO_VBR_LAYER_SCHEDULE",
+                "VBR_LAYER_SCHEDULE_FROM_POLICY",
+                "TURBO_VBR_LAYER_SCHEDULE_FROM_POLICY",
+                "VBR_LAYER_STRICT",
+                "TURBO_VBR_LAYER_STRICT",
+                "VBR_SCHEDULE_CTX",
+                "TURBO_VBR_SCHEDULE_CTX",
+                "VBR_STAGE2A",
+                "TURBO_VBR_STAGE2A",
+                "VBR_STAGE2A_ATTEND",
+                "TURBO_VBR_STAGE2A_ATTEND",
+                "VBR_STAGE2A_COMPACT",
+                "TURBO_VBR_STAGE2A_COMPACT",
+                "VBR_STAGE2A_DYNAMIC_RECENT",
+                "TURBO_VBR_STAGE2A_DYNAMIC_RECENT",
+                "VBR_POLICY_LADDER",
+                "TURBO_VBR_POLICY_LADDER",
+                "VBR_MODE",
+                "TURBO_VBR_MODE",
+                "VBR_BUDGET",
+                "TURBO_VBR_BUDGET",
+                "VBR_MIN_BITS",
+                "TURBO_VBR_MIN_BITS",
+                "VBR_CAPACITY_BITS",
+                "TURBO_VBR_CAPACITY_BITS",
+                "VBR_VRAM_BUDGET",
+                "TURBO_VBR_VRAM_BUDGET"}) {
+            unsetenv(name);
+        }
+    };
+#endif
+
     std::vector<std::string> argv;
 
     printf("test-arg-parser: test invalid usage\n\n");
@@ -140,6 +183,166 @@ int main(void) {
     assert(params.lora_adapters[1].path == "file2,2.gguf");
     assert(params.lora_adapters[2].path == "file3\"3\".gguf");
     assert(params.lora_adapters[3].path == "file4\".gguf");
+
+    {
+        printf("test-arg-parser: test VBR cache type and budget flags\n\n");
+
+        common_params vbr_params;
+        argv = {"binary_name", "-ctk", "VBR", "-ctv", "vbr"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_params, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_params.cache_type_k == GGML_TYPE_TURBO3_TCQ);
+        assert(vbr_params.cache_type_v == GGML_TYPE_TURBO3_TCQ);
+        assert(vbr_params.vbr_cache_type_k);
+        assert(vbr_params.vbr_cache_type_v);
+        assert(vbr_params.vbr_budget == "dynamic");
+        assert(vbr_params.vbr_capacity_bits == 3.25);
+#ifndef _WIN32
+        assert(getenv("VBR_STAGE2A_DYNAMIC_RECENT") == nullptr);
+        assert(getenv("TURBO_VBR_STAGE2A_DYNAMIC_RECENT") == nullptr);
+#endif
+
+        common_params vbr_t2_floor;
+        argv = {"binary_name", "-ctk", "vbr", "-ctv", "vbr", "--vbr-min-bits", "2.25"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_t2_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_t2_floor.cache_type_k == GGML_TYPE_TURBO2_TCQ);
+        assert(vbr_t2_floor.cache_type_v == GGML_TYPE_TURBO2_TCQ);
+        assert(vbr_t2_floor.vbr_min_bits == "2.25");
+        assert(vbr_t2_floor.vbr_min_bits_value == 2.25);
+        assert(vbr_t2_floor.vbr_capacity_bits == 2.25);
+
+        common_params vbr_literal_floor;
+        argv = {"binary_name", "-ctk", "vbr", "--vbr-floor", "2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_literal_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_literal_floor.cache_type_k == GGML_TYPE_TURBO2_TCQ);
+        assert(vbr_literal_floor.vbr_min_bits == "2");
+        assert(vbr_literal_floor.vbr_min_bits_value == 2.0);
+        assert(vbr_literal_floor.vbr_capacity_bits == 2.25);
+
+        common_params vbr_tier_alias_floor;
+        argv = {"binary_name", "-ctk", "vbr", "--vbr-floor", "t2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_tier_alias_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_tier_alias_floor.cache_type_k == GGML_TYPE_TURBO2_TCQ);
+        assert(vbr_tier_alias_floor.vbr_min_bits == "2.25");
+        assert(vbr_tier_alias_floor.vbr_min_bits_value == 2.25);
+        assert(vbr_tier_alias_floor.vbr_capacity_bits == 2.25);
+
+        common_params vbr_fractional_floor;
+        argv = {"binary_name", "-ctk", "vbr", "--vbr-floor", "2.75"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_fractional_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_fractional_floor.cache_type_k == GGML_TYPE_TURBO3_TCQ);
+        assert(vbr_fractional_floor.vbr_min_bits == "2.75");
+        assert(vbr_fractional_floor.vbr_min_bits_value == 2.75);
+        assert(vbr_fractional_floor.vbr_capacity_bits == 3.25);
+
+        common_params vbr_vram_budget;
+        argv = {"binary_name", "--vbr-vram", "24G"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_vram_budget, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_vram_budget.vbr_cache_type_k);
+        assert(vbr_vram_budget.vbr_cache_type_v);
+        assert(vbr_vram_budget.vbr_vram_budget == "25769803776");
+        assert(vbr_vram_budget.vbr_vram_budget_bytes == 25769803776ull);
+        assert(vbr_vram_budget.vbr_capacity_bits == 3.25);
+
+        common_params vbr_k_only;
+        argv = {"binary_name", "-ctk", "vbr", "-ctv", "f16", "--vbr-budget", "t4"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_k_only, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_k_only.cache_type_k == GGML_TYPE_TURBO4_0);
+        assert(vbr_k_only.cache_type_v == GGML_TYPE_F16);
+        assert(vbr_k_only.vbr_cache_type_k);
+        assert(!vbr_k_only.vbr_cache_type_v);
+        assert(vbr_k_only.vbr_capacity_bits == 4.125);
+
+        common_params vbr_bad_budget;
+        argv = {"binary_name", "-ctk", "vbr", "--vbr-budget", "nonsense"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_bad_budget, LLAMA_EXAMPLE_COMMON));
+
+        common_params vbr_bad_floor;
+        argv = {"binary_name", "--vbr-min-bits", "17"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_bad_floor, LLAMA_EXAMPLE_COMMON));
+
+        common_params vbr_bad_vram;
+        argv = {"binary_name", "--vbr-vram", "abc"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_bad_vram, LLAMA_EXAMPLE_COMMON));
+
+#ifndef _WIN32
+        clear_vbr_runtime_env();
+
+        const std::string policy_prefix = "test-vbr-policy-" + std::to_string((long long) getpid());
+        const std::string policy_file = policy_prefix + ".json";
+        const std::string schedule_file = policy_prefix + ".sched";
+        const std::string dynamic_schedule_file = policy_prefix + ".dynamic.sched";
+        const std::string descriptor_file = policy_prefix + ".descriptor.json";
+
+        {
+            std::ofstream schedule(schedule_file);
+            schedule << "0-0:k:t3tcq\n";
+        }
+        {
+            std::ofstream schedule(dynamic_schedule_file);
+            schedule << "0-0:k:t2tcq\n";
+        }
+        {
+            std::ofstream descriptor(descriptor_file);
+            descriptor
+                << "{\n"
+                << "  \"implementation_slice\": { \"supported\": true },\n"
+                << "  \"stage2a_plan\": {\n"
+                << "    \"storage\": \"compact_promoted_k_shadow_validation\",\n"
+                << "    \"attention_path\": \"dequant_to_f16_with_compact_promoted_row_overlay_first\"\n"
+                << "  }\n"
+                << "}\n";
+        }
+        {
+            std::ofstream policy(policy_file);
+            policy
+                << "{\n"
+                << "  \"static_ladder\": [\n"
+                << "    {\n"
+                << "      \"name\": \"compact-test\",\n"
+                << "      \"bpv\": 3.25,\n"
+                << "      \"full_kld\": 0.05,\n"
+                << "      \"schedule_file\": \"" << schedule_file << "\",\n"
+                << "      \"stage2_descriptor_file\": \"" << descriptor_file << "\"\n"
+                << "    }\n"
+                << "  ],\n"
+                << "  \"dynamic_ladder\": [\n"
+                << "    {\n"
+                << "      \"name\": \"compact-dynamic-test\",\n"
+                << "      \"bpv\": 2.75,\n"
+                << "      \"full_kld\": 0.04,\n"
+                << "      \"runtime_supported\": true,\n"
+                << "      \"schedule_file\": \"" << dynamic_schedule_file << "\",\n"
+                << "      \"stage2_descriptor_file\": \"" << descriptor_file << "\"\n"
+                << "    }\n"
+                << "  ]\n"
+                << "}\n";
+        }
+
+        common_params vbr_policy_compact;
+        argv = {"binary_name", "-ctk", "vbr", "-ctv", "vbr", "--vbr-policy", policy_file, "--vbr-floor", "3"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_policy_compact, LLAMA_EXAMPLE_SERVER));
+        assert(vbr_policy_compact.vbr_capacity_bits == 3.25);
+        assert(getenv("VBR_STAGE2A") && std::string(getenv("VBR_STAGE2A")) == "1");
+        assert(getenv("VBR_STAGE2A_ATTEND") && std::string(getenv("VBR_STAGE2A_ATTEND")) == "1");
+        assert(getenv("VBR_STAGE2A_COMPACT") && std::string(getenv("VBR_STAGE2A_COMPACT")) == "1");
+        assert(getenv("VBR_LAYER_SCHEDULE") && std::string(getenv("VBR_LAYER_SCHEDULE")) == "@" + schedule_file);
+
+        clear_vbr_runtime_env();
+
+        common_params vbr_policy_dynamic;
+        argv = {"binary_name", "-ctk", "vbr", "-ctv", "vbr", "--vbr-policy", policy_file, "--vbr-floor", "2.5"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_policy_dynamic, LLAMA_EXAMPLE_SERVER));
+        assert(vbr_policy_dynamic.vbr_capacity_bits == 2.75);
+        assert(getenv("VBR_STAGE2A") && std::string(getenv("VBR_STAGE2A")) == "1");
+        assert(getenv("VBR_LAYER_SCHEDULE") && std::string(getenv("VBR_LAYER_SCHEDULE")) == "@" + dynamic_schedule_file);
+
+        clear_vbr_runtime_env();
+        std::remove(policy_file.c_str());
+        std::remove(schedule_file.c_str());
+        std::remove(dynamic_schedule_file.c_str());
+        std::remove(descriptor_file.c_str());
+#endif
+    }
 
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32

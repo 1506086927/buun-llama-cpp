@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -34,6 +35,15 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static bool turbo_vbr_layer_schedule_enabled() {
+    const char * e = getenv("VBR_LAYER_SCHEDULE");
+    if (e && e[0]) {
+        return true;
+    }
+    e = getenv("TURBO_VBR_LAYER_SCHEDULE");
+    return e && e[0];
 }
 
 llama_context::llama_context(
@@ -194,6 +204,13 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
     cparams.logits_all = params.logits_all;
+    cparams.vbr_enabled = params.vbr_enabled;
+    cparams.vbr_dynamic = params.vbr_dynamic;
+    cparams.vbr_type_k = params.vbr_type_k;
+    cparams.vbr_type_v = params.vbr_type_v;
+    cparams.vbr_min_bits = params.vbr_min_bits;
+    cparams.vbr_capacity_bits = params.vbr_capacity_bits;
+    cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -234,6 +251,16 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    if (cparams.vbr_enabled) {
+        LLAMA_LOG_INFO("%s: vbr           = %s, K=%s, V=%s, min_bits=%g, capacity_bits=%g, vram_budget=%" PRIu64 "\n",
+                __func__,
+                cparams.vbr_dynamic ? "dynamic" : "fixed",
+                cparams.vbr_type_k ? "true" : "false",
+                cparams.vbr_type_v ? "true" : "false",
+                cparams.vbr_min_bits,
+                cparams.vbr_capacity_bits,
+                cparams.vbr_vram_budget_bytes);
+    }
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
@@ -384,14 +411,15 @@ llama_context::llama_context(
         // Must enable FA BEFORE sched_reserve() so the scheduler knows FA is required
         // and builds the graph plan with FA ops on GPU from the start.
         {
-            const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO8_0 || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ);
-            const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO8_0 || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ);
-            if (turbo_k || turbo_v) {
+            const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO8_0 || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ || params.type_k == GGML_TYPE_TURBO1 || params.type_k == GGML_TYPE_TURBO1_NSN || params.type_k == GGML_TYPE_TURBO1_CQ || params.type_k == GGML_TYPE_TURBO1_TCQ);
+            const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO8_0 || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ || params.type_v == GGML_TYPE_TURBO1 || params.type_v == GGML_TYPE_TURBO1_NSN || params.type_v == GGML_TYPE_TURBO1_CQ || params.type_v == GGML_TYPE_TURBO1_TCQ);
+            const bool vbr_layer_schedule = turbo_vbr_layer_schedule_enabled();
+            if (turbo_k || turbo_v || vbr_layer_schedule) {
                 if (!cparams.flash_attn) {
-                    LLAMA_LOG_WARN("%s: turbo KV cache requires Flash Attention — enabling automatically\n", __func__);
+                    LLAMA_LOG_WARN("%s: turbo/VBR KV cache requires Flash Attention — enabling automatically\n", __func__);
                     cparams.flash_attn = true;
                 }
-                cparams.auto_fa = false;  // turbo requires FA — don't let sched_reserve override
+                cparams.auto_fa = false;  // turbo/VBR requires FA — don't let sched_reserve override
             }
         }
 
@@ -4888,6 +4916,9 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.vbr_min_bits                =*/ 0.0,
+        /*.vbr_capacity_bits           =*/ 0.0,
+        /*.vbr_vram_budget_bytes       =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4898,6 +4929,10 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.no_fused_gdn               =*/ false,
         /*.logits_all                  =*/ true,
+        /*.vbr_enabled                 =*/ false,
+        /*.vbr_dynamic                 =*/ false,
+        /*.vbr_type_k                  =*/ false,
+        /*.vbr_type_v                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.dflash_n_slots              =*/ 1,
@@ -4968,10 +5003,11 @@ llama_context * llama_init_from_model(
 
     // Auto-enable flash attention for turbo KV cache types
     {
-        const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO8_0 || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ);
-        const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO8_0 || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ);
-        if ((turbo_k || turbo_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-            LLAMA_LOG_WARN("%s: turbo KV cache requires flash attention — enabling automatically\n", __func__);
+        const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO8_0 || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ || params.type_k == GGML_TYPE_TURBO1 || params.type_k == GGML_TYPE_TURBO1_NSN || params.type_k == GGML_TYPE_TURBO1_CQ || params.type_k == GGML_TYPE_TURBO1_TCQ);
+        const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO8_0 || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ || params.type_v == GGML_TYPE_TURBO1 || params.type_v == GGML_TYPE_TURBO1_NSN || params.type_v == GGML_TYPE_TURBO1_CQ || params.type_v == GGML_TYPE_TURBO1_TCQ);
+        const bool vbr_layer_schedule = turbo_vbr_layer_schedule_enabled();
+        if ((turbo_k || turbo_v || vbr_layer_schedule) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_WARN("%s: turbo/VBR KV cache requires flash attention — enabling automatically\n", __func__);
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         }
     }
