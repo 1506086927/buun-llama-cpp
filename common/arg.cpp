@@ -758,14 +758,9 @@ struct common_vbr_policy_choice {
     std::string schedule_file;
     std::string schedule_path;
     std::string descriptor_file;
-    std::string stage2a_storage;
-    std::string stage2a_attention_path;
     double bpv = 0.0;
     double full_kld = 0.0;
     bool dynamic_policy = false;
-    bool stage2a_supported = false;
-    bool stage2a_required = false;
-    bool stage2a_compact = false;
 };
 
 static std::string common_vbr_policy_arg(const common_params & params, bool & explicit_policy) {
@@ -864,31 +859,7 @@ static common_vbr_policy_choice common_vbr_select_policy(
     }
 
     if (!best.descriptor_file.empty()) {
-        best.stage2a_required = true;
-        const std::string descriptor_path = common_vbr_join_path(policy_dir, best.descriptor_file);
-        std::ifstream df(descriptor_path);
-        if (!df) {
-            throw std::invalid_argument("VBR Stage2 descriptor is missing: " + descriptor_path);
-        }
-        json descriptor;
-        df >> descriptor;
-        if (descriptor.contains("implementation_slice") && descriptor["implementation_slice"].is_object()) {
-            best.stage2a_supported = descriptor["implementation_slice"].value("supported", false);
-        }
-        if (!best.stage2a_supported) {
-            throw std::invalid_argument("selected VBR policy requires an unsupported Stage2 slice: " + best.name);
-        }
-        if (descriptor.contains("stage2a_plan") && descriptor["stage2a_plan"].is_object()) {
-            best.stage2a_storage = descriptor["stage2a_plan"].value("storage", "");
-            best.stage2a_attention_path = descriptor["stage2a_plan"].value("attention_path", "");
-            const std::string storage = common_vbr_lower(best.stage2a_storage);
-            const std::string attention_path = common_vbr_lower(best.stage2a_attention_path);
-            best.stage2a_compact = storage.find("compact") != std::string::npos ||
-                attention_path.find("compact") != std::string::npos;
-        }
-        if (!best.stage2a_compact) {
-            throw std::invalid_argument("selected VBR policy requires an unvalidated non-compact Stage2A path: " + best.name);
-        }
+        throw std::invalid_argument("selected VBR policy requires Stage2A (positional/row VBR), which is no longer supported — use a per-(layer,side) schedule: " + best.name);
     }
 
     return best;
@@ -976,19 +947,6 @@ static double common_vbr_apply_policy_ladder(
     common_setenv_override("TURBO_VBR_LAYER_STRICT", "1");
     common_setenv_default("VBR_SCHEDULE_CTX", "8192");
     common_setenv_default("TURBO_VBR_SCHEDULE_CTX", "8192");
-    if (choice.stage2a_required) {
-        common_setenv_override("VBR_STAGE2A", "1");
-        common_setenv_override("TURBO_VBR_STAGE2A", "1");
-        common_setenv_override("VBR_STAGE2A_ATTEND", "1");
-        common_setenv_override("TURBO_VBR_STAGE2A_ATTEND", "1");
-        common_setenv_override("VBR_STAGE2A_COMPACT", choice.stage2a_compact ? "1" : "0");
-        common_setenv_override("TURBO_VBR_STAGE2A_COMPACT", choice.stage2a_compact ? "1" : "0");
-        if (choice.dynamic_policy &&
-                !common_env_compat_present("VBR_STAGE2A_DYNAMIC_ROWS", "TURBO_VBR_STAGE2A_DYNAMIC_ROWS")) {
-            common_setenv_override("VBR_STAGE2A_DYNAMIC_ROWS", "1");
-            common_setenv_override("TURBO_VBR_STAGE2A_DYNAMIC_ROWS", "1");
-        }
-    }
     params.vbr_selected_family = choice.dynamic_policy ? "dynamic" : "static";
     params.vbr_selected_policy = choice.name;
     params.vbr_selected_schedule = choice.schedule_path;
@@ -1004,15 +962,14 @@ static double common_vbr_apply_policy_ladder(
     common_setenv_override("TURBO_VBR_SELECTED_KLD", std::to_string(params.vbr_selected_kld));
     common_setenv_override("VBR_SELECTED_SCHEDULE", params.vbr_selected_schedule);
     common_setenv_override("TURBO_VBR_SELECTED_SCHEDULE", params.vbr_selected_schedule);
-    LOG_INF("VBR policy selected: cap=%g, floor=%g, family=%s, selected=%s, bpv=%g, full_kld=%g, schedule=%s%s\n",
+    LOG_INF("VBR policy selected: cap=%g, floor=%g, family=%s, selected=%s, bpv=%g, full_kld=%g, schedule=%s\n",
             cap_bits,
             min_bits,
             choice.dynamic_policy ? "dynamic" : "static",
             choice.name.c_str(),
             choice.bpv,
             choice.full_kld,
-            choice.schedule_path.c_str(),
-            choice.stage2a_required ? (choice.stage2a_compact ? ", stage2a=compact" : ", stage2a=shadow") : "");
+            choice.schedule_path.c_str());
     return choice.bpv;
 }
 
