@@ -346,17 +346,11 @@ public:
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
-    ggml_tensor * get_stage2a_k_idxs() const { return self_stage2a_k_idxs; }
-    ggml_tensor * get_stage2a_v_idxs() const { return self_stage2a_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
-    ggml_tensor * get_stage2a_k_row_bands() const { return self_stage2a_k_row_bands; }
-    ggml_tensor * get_stage2a_v_row_bands() const { return self_stage2a_v_row_bands; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
-    ggml_tensor * self_stage2a_k_idxs = nullptr; // I64 [n_batch], -1 skips non-promoted K rows
-    ggml_tensor * self_stage2a_v_idxs = nullptr; // I64 [n_batch], -1 skips non-promoted V rows
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
@@ -369,12 +363,6 @@ public:
     // once after the inverse WHT (attention weights sum to 1, so the mean re-enters as a
     // constant vector). Loaded from TURBO_VMEAN_SUB; nullptr when the tap is off.
     ggml_tensor * self_vmean = nullptr;
-
-    // Exact-T3 Stage 2A row-band descriptor: I32 [4, max_bands, n_layer].
-    // Each band is [logical_row0, logical_row1, physical_row0, physical_row1);
-    // negative values mark unused slots.
-    ggml_tensor * self_stage2a_k_row_bands = nullptr;
-    ggml_tensor * self_stage2a_v_row_bands = nullptr;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed

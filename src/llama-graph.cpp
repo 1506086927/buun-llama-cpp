@@ -24,50 +24,6 @@
 #include <unordered_set>
 #include <vector>
 
-static bool turbo_vbr_stage2a_attend_enabled() {
-    const char * v = getenv("VBR_STAGE2A_ATTEND");
-    if (!v || !v[0]) {
-        v = getenv("TURBO_VBR_STAGE2A_ATTEND");
-    }
-    return v && v[0] && strcmp(v, "0") != 0;
-}
-
-static bool turbo_vbr_stage2a_debug_enabled() {
-    const char * v = getenv("VBR_STAGE2A_DEBUG");
-    if (!v || !v[0]) {
-        v = getenv("TURBO_VBR_STAGE2A_DEBUG");
-    }
-    return v && v[0] && strcmp(v, "0") != 0;
-}
-
-static int64_t vbr_stage2a_max_k_row_bands(
-        const llama_kv_cache_context * mctx,
-        const llama_hparams & hparams) {
-    if (!mctx || !turbo_vbr_stage2a_attend_enabled()) {
-        return 0;
-    }
-
-    int64_t max_bands = 0;
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
-        max_bands = std::max<int64_t>(max_bands, mctx->vbr_stage2a_max_k_row_bands((int32_t) il));
-    }
-    return max_bands;
-}
-
-static int64_t vbr_stage2a_max_v_row_bands(
-        const llama_kv_cache_context * mctx,
-        const llama_hparams & hparams) {
-    if (!mctx || !turbo_vbr_stage2a_attend_enabled()) {
-        return 0;
-    }
-
-    int64_t max_bands = 0;
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
-        max_bands = std::max<int64_t>(max_bands, mctx->vbr_stage2a_max_v_row_bands((int32_t) il));
-    }
-    return max_bands;
-}
-
 // TurboQuant V-mean tap (TorQuant Prop 3.5). The CUDA encode path subtracts per-layer raw V
 // means (TURBO_VMEAN_SUB, PFH1 dump, V slab); attention weights sum to 1, so the weighted sum
 // of centered V reconstructions equals (output - mu_V) — ONE broadcast add after the graph's
@@ -170,93 +126,6 @@ static void turbo_vmean_fill(ggml_tensor * t, const llama_hparams & hparams) {
     }
     GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
     memcpy(t->data, vm->data(), ggml_nbytes(t));
-}
-
-// Fill the Stage2A K row-band descriptor. Mem-hybrid wrappers refresh attention
-// tensors manually, so this has to live beside turbo_vmean_fill rather than only
-// inside llm_graph_input_attn_kv::set_input().
-static void vbr_stage2a_fill_k_row_bands(
-        ggml_tensor * self_stage2a_k_row_bands,
-        const llama_kv_cache_context * mctx,
-        const llama_hparams & hparams) {
-    if (!self_stage2a_k_row_bands || !self_stage2a_k_row_bands->buffer) {
-        return;
-    }
-
-    GGML_ASSERT(mctx);
-    GGML_ASSERT(ggml_backend_buffer_is_host(self_stage2a_k_row_bands->buffer));
-    GGML_ASSERT(self_stage2a_k_row_bands->type == GGML_TYPE_I32);
-    GGML_ASSERT(self_stage2a_k_row_bands->ne[0] >= 4);
-
-    int32_t * data = (int32_t *) self_stage2a_k_row_bands->data;
-    std::fill(data, data + ggml_nelements(self_stage2a_k_row_bands), -1);
-
-    const int64_t ne0 = self_stage2a_k_row_bands->ne[0];
-    const int64_t max_bands = self_stage2a_k_row_bands->ne[1];
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
-        const auto bands = mctx->vbr_stage2a_get_k_row_bands((int32_t) il);
-        GGML_ASSERT((int64_t) bands.size() <= max_bands);
-        for (size_t ib = 0; ib < bands.size(); ++ib) {
-            const size_t off = ((size_t) il * (size_t) max_bands + ib) * (size_t) ne0;
-            data[off + 0] = (int32_t) bands[ib].row0;
-            data[off + 1] = (int32_t) bands[ib].row1;
-            data[off + 2] = (int32_t) bands[ib].physical0;
-            data[off + 3] = (int32_t) bands[ib].physical1;
-        }
-        if (turbo_vbr_stage2a_debug_enabled() && !bands.empty()) {
-            static int n_debug = 0;
-            if (n_debug++ < 8) {
-                const size_t off = ((size_t) il * (size_t) max_bands) * (size_t) ne0;
-                fprintf(stderr,
-                        "STAGE2A_INPUT il=%u band0=[%d,%d]->[%d,%d] max_bands=%lld tensor_ne=[%lld,%lld,%lld,%lld] tensor_nb=[%zu,%zu,%zu,%zu]\n",
-                        il,
-                        data[off + 0],
-                        data[off + 1],
-                        data[off + 2],
-                        data[off + 3],
-                        (long long) max_bands,
-                        (long long) self_stage2a_k_row_bands->ne[0],
-                        (long long) self_stage2a_k_row_bands->ne[1],
-                        (long long) self_stage2a_k_row_bands->ne[2],
-                        (long long) self_stage2a_k_row_bands->ne[3],
-                        self_stage2a_k_row_bands->nb[0],
-                        self_stage2a_k_row_bands->nb[1],
-                        self_stage2a_k_row_bands->nb[2],
-                        self_stage2a_k_row_bands->nb[3]);
-            }
-        }
-    }
-}
-
-static void vbr_stage2a_fill_v_row_bands(
-        ggml_tensor * self_stage2a_v_row_bands,
-        const llama_kv_cache_context * mctx,
-        const llama_hparams & hparams) {
-    if (!self_stage2a_v_row_bands || !self_stage2a_v_row_bands->buffer) {
-        return;
-    }
-
-    GGML_ASSERT(mctx);
-    GGML_ASSERT(ggml_backend_buffer_is_host(self_stage2a_v_row_bands->buffer));
-    GGML_ASSERT(self_stage2a_v_row_bands->type == GGML_TYPE_I32);
-    GGML_ASSERT(self_stage2a_v_row_bands->ne[0] >= 4);
-
-    int32_t * data = (int32_t *) self_stage2a_v_row_bands->data;
-    std::fill(data, data + ggml_nelements(self_stage2a_v_row_bands), -1);
-
-    const int64_t ne0 = self_stage2a_v_row_bands->ne[0];
-    const int64_t max_bands = self_stage2a_v_row_bands->ne[1];
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
-        const auto bands = mctx->vbr_stage2a_get_v_row_bands((int32_t) il);
-        GGML_ASSERT((int64_t) bands.size() <= max_bands);
-        for (size_t ib = 0; ib < bands.size(); ++ib) {
-            const size_t off = ((size_t) il * (size_t) max_bands + ib) * (size_t) ne0;
-            data[off + 0] = (int32_t) bands[ib].row0;
-            data[off + 1] = (int32_t) bands[ib].row1;
-            data[off + 2] = (int32_t) bands[ib].physical0;
-            data[off + 3] = (int32_t) bands[ib].physical1;
-        }
-    }
 }
 
 // dedup helpers
@@ -734,8 +603,6 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
-    mctx->set_input_vbr_stage2a_k_idxs(self_stage2a_k_idxs, ubatch);
-    mctx->set_input_vbr_stage2a_v_idxs(self_stage2a_v_idxs, ubatch);
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
@@ -769,8 +636,6 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     }
 
     turbo_vmean_fill(self_vmean, hparams);
-    vbr_stage2a_fill_k_row_bands(self_stage2a_k_row_bands, mctx, hparams);
-    vbr_stage2a_fill_v_row_bands(self_stage2a_v_row_bands, mctx, hparams);
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -784,26 +649,6 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
-    const int64_t stage2a_max_bands = vbr_stage2a_max_k_row_bands(mctx, hparams);
-    res &= (self_stage2a_k_row_bands != nullptr) == (stage2a_max_bands > 0);
-    res &= (self_stage2a_k_idxs != nullptr) == (stage2a_max_bands > 0);
-    if (self_stage2a_k_row_bands) {
-        res &= self_stage2a_k_row_bands->ne[0] >= 4;
-        res &= self_stage2a_k_row_bands->ne[1] == stage2a_max_bands;
-    }
-    if (self_stage2a_k_idxs) {
-        res &= self_stage2a_k_idxs->ne[0] == params.ubatch.n_tokens;
-    }
-    const int64_t stage2a_max_v_bands = vbr_stage2a_max_v_row_bands(mctx, hparams);
-    res &= (self_stage2a_v_row_bands != nullptr) == (stage2a_max_v_bands > 0);
-    res &= (self_stage2a_v_idxs != nullptr) == (stage2a_max_v_bands > 0);
-    if (self_stage2a_v_row_bands) {
-        res &= self_stage2a_v_row_bands->ne[0] >= 4;
-        res &= self_stage2a_v_row_bands->ne[1] == stage2a_max_v_bands;
-    }
-    if (self_stage2a_v_idxs) {
-        res &= self_stage2a_v_idxs->ne[0] == params.ubatch.n_tokens;
-    }
 
     return res;
 }
@@ -957,9 +802,6 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
-    mctx->get_attn()->set_input_vbr_stage2a_k_idxs(inp_attn->self_stage2a_k_idxs, ubatch);
-    mctx->get_attn()->set_input_vbr_stage2a_v_idxs(inp_attn->self_stage2a_v_idxs, ubatch);
-
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
     if (inp_attn->self_k_rot) {
@@ -971,8 +813,6 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     }
 
     turbo_vmean_fill(inp_attn->self_vmean, inp_attn->hparams);
-    vbr_stage2a_fill_k_row_bands(inp_attn->self_stage2a_k_row_bands, mctx->get_attn(), inp_attn->hparams);
-    vbr_stage2a_fill_v_row_bands(inp_attn->self_stage2a_v_row_bands, mctx->get_attn(), inp_attn->hparams);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -998,26 +838,6 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
-    const int64_t stage2a_max_bands = vbr_stage2a_max_k_row_bands(mctx->get_attn(), inp_attn->hparams);
-    res &= (inp_attn->self_stage2a_k_row_bands != nullptr) == (stage2a_max_bands > 0);
-    res &= (inp_attn->self_stage2a_k_idxs != nullptr) == (stage2a_max_bands > 0);
-    if (inp_attn->self_stage2a_k_row_bands) {
-        res &= inp_attn->self_stage2a_k_row_bands->ne[0] >= 4;
-        res &= inp_attn->self_stage2a_k_row_bands->ne[1] == stage2a_max_bands;
-    }
-    if (inp_attn->self_stage2a_k_idxs) {
-        res &= inp_attn->self_stage2a_k_idxs->ne[0] == params.ubatch.n_tokens;
-    }
-    const int64_t stage2a_max_v_bands = vbr_stage2a_max_v_row_bands(mctx->get_attn(), inp_attn->hparams);
-    res &= (inp_attn->self_stage2a_v_row_bands != nullptr) == (stage2a_max_v_bands > 0);
-    res &= (inp_attn->self_stage2a_v_idxs != nullptr) == (stage2a_max_v_bands > 0);
-    if (inp_attn->self_stage2a_v_row_bands) {
-        res &= inp_attn->self_stage2a_v_row_bands->ne[0] >= 4;
-        res &= inp_attn->self_stage2a_v_row_bands->ne[1] == stage2a_max_v_bands;
-    }
-    if (inp_attn->self_stage2a_v_idxs) {
-        res &= inp_attn->self_stage2a_v_idxs->ne[0] == params.ubatch.n_tokens;
-    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2610,19 +2430,6 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
-    const int64_t stage2a_max_bands = vbr_stage2a_max_k_row_bands(mctx_cur, hparams);
-    if (stage2a_max_bands > 0) {
-        inp->self_stage2a_k_idxs = mctx_cur->build_input_vbr_stage2a_k_idxs(ctx0, ubatch);
-        inp->self_stage2a_k_row_bands = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, stage2a_max_bands, hparams.n_layer);
-        ggml_set_input(inp->self_stage2a_k_row_bands);
-    }
-    const int64_t stage2a_max_v_bands = vbr_stage2a_max_v_row_bands(mctx_cur, hparams);
-    if (stage2a_max_v_bands > 0) {
-        inp->self_stage2a_v_idxs = mctx_cur->build_input_vbr_stage2a_v_idxs(ctx0, ubatch);
-        inp->self_stage2a_v_row_bands = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, stage2a_max_v_bands, hparams.n_layer);
-        ggml_set_input(inp->self_stage2a_v_row_bands);
-    }
-
     {
         int64_t vm_pdim = 0;
         if (turbo_vmean_table(hparams, vm_pdim)) {
@@ -2679,17 +2486,9 @@ ggml_tensor * llm_graph_context::build_attn(
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
-        const auto & stage2a_k_idxs = inp->get_stage2a_k_idxs();
-        const auto & stage2a_v_idxs = inp->get_stage2a_v_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        if (auto * k_promoted = mctx_cur->vbr_stage2a_cpy_k_promoted(ctx0, k_cur, stage2a_k_idxs ? stage2a_k_idxs : k_idxs, il)) {
-            ggml_build_forward_expand(gf, k_promoted);
-        }
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-        if (auto * v_promoted = mctx_cur->vbr_stage2a_cpy_v_promoted(ctx0, v_cur, stage2a_v_idxs ? stage2a_v_idxs : v_idxs, il)) {
-            ggml_build_forward_expand(gf, v_promoted);
-        }
     }
 
     const auto & kq_mask = inp->get_kq_mask();
@@ -2701,50 +2500,6 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k_row_bands = nullptr;
     ggml_tensor * v_promoted = nullptr;
     ggml_tensor * v_row_bands = nullptr;
-
-    if (turbo_vbr_stage2a_attend_enabled() && mctx_cur->vbr_stage2a_has_k_row_bands(il)) {
-        GGML_ASSERT(inp->get_stage2a_k_row_bands());
-        k_promoted = mctx_cur->vbr_stage2a_get_k_promoted(ctx0, il);
-        GGML_ASSERT(k_promoted);
-
-        ggml_tensor * bands_all = inp->get_stage2a_k_row_bands();
-        k_row_bands = ggml_view_2d(
-            ctx0, bands_all,
-            bands_all->ne[0], bands_all->ne[1],
-            bands_all->nb[1],
-            (size_t) il * bands_all->nb[2]);
-        cb(k_row_bands, "vbr_stage2a_k_row_bands", il);
-
-        if (turbo_vbr_stage2a_debug_enabled()) {
-            static int n_debug = 0;
-            if (n_debug++ < 8) {
-                fprintf(stderr,
-                        "STAGE2A_GRAPH il=%d k_type=%s kp_type=%s view_offs=%zu bands_nb=[%zu,%zu,%zu,%zu] k_ne=[%lld,%lld,%lld,%lld] kp_ne=[%lld,%lld,%lld,%lld] bands_ne=[%lld,%lld,%lld,%lld]\n",
-                        il,
-                        ggml_type_name(k->type),
-                        ggml_type_name(k_promoted->type),
-                        k_row_bands->view_offs,
-                        k_row_bands->nb[0], k_row_bands->nb[1], k_row_bands->nb[2], k_row_bands->nb[3],
-                        (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3],
-                        (long long) k_promoted->ne[0], (long long) k_promoted->ne[1], (long long) k_promoted->ne[2], (long long) k_promoted->ne[3],
-                        (long long) k_row_bands->ne[0], (long long) k_row_bands->ne[1], (long long) k_row_bands->ne[2], (long long) k_row_bands->ne[3]);
-            }
-        }
-    }
-
-    if (turbo_vbr_stage2a_attend_enabled() && mctx_cur->vbr_stage2a_has_v_row_bands(il)) {
-        GGML_ASSERT(inp->get_stage2a_v_row_bands());
-        v_promoted = mctx_cur->vbr_stage2a_get_v_promoted(ctx0, il);
-        GGML_ASSERT(v_promoted);
-
-        ggml_tensor * bands_all = inp->get_stage2a_v_row_bands();
-        v_row_bands = ggml_view_2d(
-            ctx0, bands_all,
-            bands_all->ne[0], bands_all->ne[1],
-            bands_all->nb[1],
-            (size_t) il * bands_all->nb[2]);
-        cb(v_row_bands, "vbr_stage2a_v_row_bands", il);
-    }
 
     // TurboQuant Q pre-rotation is handled inline in CUDA FA kernels:
     // - Vec kernel: shared memory FWHT (fattn-vec.cuh)
@@ -2869,11 +2624,6 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        if (!mctx_cur->vbr_stage2a_k_promoted_is_compact(il)) {
-            if (auto * k_promoted = mctx_cur->vbr_stage2a_cpy_k_promoted(ctx0, k_cur, k_idxs, il)) {
-                ggml_build_forward_expand(gf, k_promoted);
-            }
-        }
     }
 
     const auto & kq_mask = inp->get_kq_mask();
@@ -2933,11 +2683,6 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs_mla();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        if (!mctx_cur->vbr_stage2a_k_promoted_is_compact(il)) {
-            if (auto * k_promoted = mctx_cur->vbr_stage2a_cpy_k_promoted(ctx0, k_cur, k_idxs, il)) {
-                ggml_build_forward_expand(gf, k_promoted);
-            }
-        }
     }
 
     const auto & kq_mask = inp->get_kq_mask_mla();
@@ -3037,11 +2782,6 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        if (!mctx_cur->vbr_stage2a_k_promoted_is_compact(il)) {
-            if (auto * k_promoted = mctx_cur->vbr_stage2a_cpy_k_promoted(ctx0, k_cur, k_idxs, il)) {
-                ggml_build_forward_expand(gf, k_promoted);
-            }
-        }
     }
 
     if (v_cur) {
