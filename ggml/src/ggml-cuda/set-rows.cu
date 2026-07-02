@@ -7,6 +7,10 @@
 #include <string>
 #include <vector>
 
+// Definition for the extern in turbo-quant-cuda.cuh. When true, the encode mean-sub tap is skipped
+// (VBR transcode re-encode: its input is already stored-domain V - mu_V).
+bool g_turbo_meansub_suppress = false;
+
 static void load_turbo4_alpha(int device) {
     static bool loaded[GGML_CUDA_MAX_DEVICES] = {};
     if (loaded[device]) return;
@@ -1201,9 +1205,10 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                                 tmp_groups * (int64_t) sizeof(block_turbo1_tcq));
                         const int use_shared = ragged_tcq1_shared_bt<idx_t>(ctx.device);
                         if (!use_shared) ensure_tcq_bt_buf(ctx.device, n_blk_total * 128 * 128);
+                        // Ragged turbo1 overlay decode has no V add-back yet → K-only tap (V deferred to VBR tap integration).
                         k_set_rows_turbo1_tcq<idx_t><<<(int)n_blk_total, 256, use_shared ? 128 * 128 : 0, stream>>>(
                             (const float *) src0_d, src1_d, (block_turbo1_tcq *) ragged_tcq_tmp1[ctx.device],
-                            n_blk_total, tcq_bt_buf[ctx.device], use_shared, rg_is_k,
+                            n_blk_total, tcq_bt_buf[ctx.device], use_shared, rg_is_k, (rg_is_k ? kvmean_mu : nullptr),
                             s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, qs1, qs2, qs3,
                             ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
                         k_ragged_turbo1_tcq_overlay<idx_t><<<(int)n_blk_total, 128, 0, stream>>>(
@@ -1635,9 +1640,17 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
             const int shared_bytes = tcq1_use_shared_bt[ctx.device] ? tcq1_bt_shared_bytes : 0;
+            const float * kvmean_mu = nullptr;
+            if (strncmp(dst->name, "cache_k_l", 9) == 0 || strncmp(dst->name, "cache_v_l", 9) == 0) {
+                const int pf_layer = atoi(dst->name + 9);
+                if (pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C) {
+                    const float * tbl = iq_is_k ? turbo_kmean_table(ctx.device) : turbo_vmean_table_enc(ctx.device);
+                    if (tbl) kvmean_mu = tbl + (size_t) pf_layer * PFHEAD_MAX_C;
+                }
+            }
             k_set_rows_turbo1_tcq<idx_t><<<(int)ne_total_groups, 256, shared_bytes, stream>>>(
                 src0_d, src1_d, (block_turbo1_tcq *)dst->data,
-                ne_total_groups, tcq_bt_buf[ctx.device], tcq1_use_shared_bt[ctx.device], iq_is_k,
+                ne_total_groups, tcq_bt_buf[ctx.device], tcq1_use_shared_bt[ctx.device], iq_is_k, kvmean_mu,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }

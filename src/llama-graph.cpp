@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 
+#include "ggml-turbo-meansub.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -35,6 +36,16 @@ static const std::vector<float> * turbo_vmean_table(const llama_hparams & hparam
     static int state = 0; // 0 = uninit, 1 = loaded, -1 = absent/failed
     if (state == 0) {
         state = -1;
+
+        // Source the dense V-slab means (mu, dead layers zeroed): TURBO_VMEAN_SUB file override
+        // first (experiments), else the binary-baked per-architecture table (tap default-on).
+        std::vector<float> mu;        // [max_l * max_c], V slab, dead layers = 0
+        size_t max_l = 0, max_c = 0;
+
+        if (getenv("TURBO_MEANSUB_OFF")) {   // explicit disable (A/B + opt-out)
+            pdim_out = pdim;
+            return nullptr;
+        }
         const char * path = getenv("TURBO_VMEAN_SUB");
         if (path && path[0]) {
             FILE * f = fopen(path, "rb");
@@ -43,8 +54,8 @@ static const std::vector<float> * turbo_vmean_table(const llama_hparams & hparam
             } else {
                 int32_t hdr[4] = {0, 0, 0, 0};
                 bool ok = fread(hdr, sizeof(int32_t), 4, f) == 4 && hdr[0] == 0x50464831 && hdr[1] == 2;
-                const size_t max_l = ok ? (size_t) hdr[2] : 0;
-                const size_t max_c = ok ? (size_t) hdr[3] : 0;
+                max_l = ok ? (size_t) hdr[2] : 0;
+                max_c = ok ? (size_t) hdr[3] : 0;
                 const size_t nk = max_l * max_c;
                 std::vector<float>   sums(nk);
                 std::vector<int32_t> cnts(2 * max_l);
@@ -57,45 +68,67 @@ static const std::vector<float> * turbo_vmean_table(const llama_hparams & hparam
                 fclose(f);
                 if (!ok) {
                     fprintf(stderr, "VMEAN tap: bad/short PFH1 file %s\n", path);
+                    max_l = max_c = 0;
                 } else {
-                    int64_t w = 0;
-                    for (uint32_t il = 0; il < hparams.n_layer; il++) {
-                        const int64_t hd = hparams.n_embd_head_v(il);
-                        const int64_t nh = hparams.n_head(il);
-                        if (hd <= 0 || nh <= 0) continue;
-                        const int64_t cand = GGML_PAD(hd, 128) * nh;
-                        if (cand > w) w = cand;
-                    }
-                    int live = 0;
-                    if (w > 0) {
-                        tab.assign((size_t) w * hparams.n_layer, 0.0f);
-                        for (uint32_t il = 0; il < hparams.n_layer && il < max_l; il++) {
-                            const int64_t hd  = hparams.n_embd_head_v(il);
-                            const int64_t nh  = hparams.n_head(il);
-                            const int64_t nkv = hparams.n_head_kv(il);
-                            const int32_t cnt = cnts[max_l + il];
-                            if (hd <= 0 || nh <= 0 || nkv <= 0 || cnt < 100) continue;
-                            if ((int64_t) max_c < nkv * hd || GGML_PAD(hd, 128) * nh != w) continue;
-                            const int64_t phd = GGML_PAD(hd, 128);
-                            live++;
-                            for (int64_t qh = 0; qh < nh; qh++) {
-                                const int64_t kvh = qh / (nh / nkv);
-                                for (int64_t d = 0; d < hd; d++) {
-                                    tab[(size_t) il * w + qh * phd + d] =
-                                        sums[(size_t) il * max_c + kvh * hd + d] / cnt;
-                                }
-                            }
-                        }
-                    }
-                    if (live > 0) {
-                        pdim = w;
-                        state = 1;
-                        fprintf(stderr, "VMEAN tap: graph add armed, %d live layers from %s (pdim %lld)\n",
-                                live, path, (long long) w);
-                    } else {
-                        fprintf(stderr, "VMEAN tap: no live V layers in %s — add disabled\n", path);
+                    mu.assign(nk, 0.0f);
+                    for (size_t l = 0; l < max_l; l++) {
+                        const int32_t c = cnts[max_l + l];   // V slab counts
+                        if (c < 100) continue;
+                        for (size_t j = 0; j < max_c; j++) mu[l * max_c + j] = sums[l * max_c + j] / c;
                     }
                 }
+            }
+        } else {
+            int bL = 0, bC = 0, blive = 0;
+            const float * baked = ggml_turbo_meansub_active(1, &bL, &bC, &blive);   // V slab
+            if (baked && blive > 0) {
+                max_l = (size_t) bL;
+                max_c = (size_t) bC;
+                mu.assign(baked, baked + (size_t) bL * bC);
+            }
+        }
+
+        if (!mu.empty()) {
+            int64_t w = 0;
+            for (uint32_t il = 0; il < hparams.n_layer; il++) {
+                const int64_t hd = hparams.n_embd_head_v(il);
+                const int64_t nh = hparams.n_head(il);
+                if (hd <= 0 || nh <= 0) continue;
+                const int64_t cand = GGML_PAD(hd, 128) * nh;
+                if (cand > w) w = cand;
+            }
+            int live = 0;
+            if (w > 0) {
+                tab.assign((size_t) w * hparams.n_layer, 0.0f);
+                for (uint32_t il = 0; il < hparams.n_layer && il < max_l; il++) {
+                    const int64_t hd  = hparams.n_embd_head_v(il);
+                    const int64_t nh  = hparams.n_head(il);
+                    const int64_t nkv = hparams.n_head_kv(il);
+                    if (hd <= 0 || nh <= 0 || nkv <= 0) continue;
+                    if ((int64_t) max_c < nkv * hd || GGML_PAD(hd, 128) * nh != w) continue;
+                    bool any = false;   // skip dead (all-zero) layers
+                    for (int64_t j = 0; j < nkv * hd && !any; j++) {
+                        if (mu[(size_t) il * max_c + j] != 0.0f) any = true;
+                    }
+                    if (!any) continue;
+                    const int64_t phd = GGML_PAD(hd, 128);
+                    live++;
+                    for (int64_t qh = 0; qh < nh; qh++) {
+                        const int64_t kvh = qh / (nh / nkv);
+                        for (int64_t d = 0; d < hd; d++) {
+                            tab[(size_t) il * w + qh * phd + d] =
+                                mu[(size_t) il * max_c + kvh * hd + d];
+                        }
+                    }
+                }
+            }
+            if (live > 0) {
+                pdim = w;
+                state = 1;
+                fprintf(stderr, "VMEAN tap: graph add armed, %d live layers (pdim %lld)\n",
+                        live, (long long) w);
+            } else {
+                fprintf(stderr, "VMEAN tap: no live V layers — add disabled\n");
             }
         }
     }
@@ -2530,6 +2563,14 @@ ggml_tensor * llm_graph_context::build_attn(
                 cur = ggml_add(ctx0, cur, mu);
             }
         }
+    } else if (v->type == GGML_TYPE_TURBO1_TCQ) {
+        // turbo1_tcq V is decoded per-row to original domain in-kernel (no graph un-rotation),
+        // but the affine tap still needs mu_V restored once (weights sum to 1 -> mean re-enters as a constant).
+        if (inp->self_vmean && inp->self_vmean->ne[0] == cur->ne[0]) {
+            ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, inp->self_vmean->ne[0], 1,
+                    inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
+            cur = ggml_add(ctx0, cur, mu);
+        }
     } else if (inp->self_v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
     }
@@ -2812,6 +2853,14 @@ ggml_tensor * llm_graph_context::build_attn(
                         inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
                 cur = ggml_add(ctx0, cur, mu);
             }
+        }
+    } else if (v->type == GGML_TYPE_TURBO1_TCQ) {
+        // turbo1_tcq V is decoded per-row to original domain in-kernel (no graph un-rotation),
+        // but the affine tap still needs mu_V restored once (weights sum to 1 -> mean re-enters as a constant).
+        if (inp->self_vmean && inp->self_vmean->ne[0] == cur->ne[0]) {
+            ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, inp->self_vmean->ne[0], 1,
+                    inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
+            cur = ggml_add(ctx0, cur, mu);
         }
     } else if (v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, v_rot);

@@ -1,5 +1,6 @@
 #include "llama-model.h"
 
+#include "ggml-turbo-meansub.h"
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
@@ -1009,6 +1010,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer);
+
+    // Record model identity for the binary-baked KV affine-tap means (arch-keyed, tap default-on).
+    // MUST be here, before load_arch_hparams() repurposes hparams.n_embd for the qwen35 hybrid.
+    ggml_turbo_meansub_set_model(arch_name().c_str(), (int) hparams.n_layer, (int) hparams.n_embd);
+
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);

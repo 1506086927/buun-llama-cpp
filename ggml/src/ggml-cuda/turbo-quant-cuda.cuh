@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #endif
 #include "ggml-common.h"
+#include "ggml-turbo-meansub.h"
 #include <mutex>
 
 // === InnerQ per-channel equalization ===
@@ -254,8 +255,23 @@ static bool    h_vmean_checked[16] = {};
 // Shared PFH1 mean-table loader. kvsel: 0 = K slab (TURBO_KMEAN_SUB), 1 = V slab
 // (TURBO_VMEAN_SUB; encode half of the V tap — the graph-level add restores mu_V at decode).
 static float * turbo_meansub_load(int device, int kvsel, const char * env_name) {
+    if (getenv("TURBO_MEANSUB_OFF")) return nullptr;   // explicit disable (A/B + opt-out)
     const char * path = getenv(env_name);
-    if (!path || !path[0]) return nullptr;
+    if (!path || !path[0]) {
+        // No env override -> use the binary-baked per-architecture means (tap default-on).
+        int bL = 0, bC = 0, blive = 0;
+        const float * baked = ggml_turbo_meansub_active(kvsel, &bL, &bC, &blive);
+        if (baked && bL == PFHEAD_MAX_L && bC == PFHEAD_MAX_C && blive > 0) {
+            const size_t nk = (size_t) PFHEAD_MAX_L * PFHEAD_MAX_C;
+            float * dev = nullptr;
+            cudaMalloc(&dev, nk * sizeof(float));
+            cudaMemcpy(dev, baked, nk * sizeof(float), cudaMemcpyHostToDevice);
+            fprintf(stderr, "TURBO meansub (device %d): %s-mean BAKED table (%d live layers)\n",
+                    device, kvsel == 0 ? "K" : "V", blive);
+            return dev;
+        }
+        return nullptr;
+    }
     FILE * f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "%s: cannot open %s\n", env_name, path); return nullptr; }
     int32_t hdr[4];
@@ -293,7 +309,13 @@ static float * turbo_meansub_load(int device, int kvsel, const char * env_name) 
     return dev;
 }
 
+// Set true (around a set_rows call) to suppress the encode mean-sub tap. Used by the VBR transcode
+// re-encode: its f32 input is already in stored domain (V - mu_V), so re-subtracting mu would double
+// it. Defined in set-rows.cu; shared so the choke-point lookups below see it across TUs.
+extern bool g_turbo_meansub_suppress;
+
 static float * turbo_kmean_table(int device) {
+    if (g_turbo_meansub_suppress) return nullptr;
     if (device < 0 || device >= 16) return nullptr;
     if (h_kmean_checked[device]) return h_kmean_dev[device];
     h_kmean_checked[device] = true;
@@ -302,6 +324,7 @@ static float * turbo_kmean_table(int device) {
 }
 
 static float * turbo_vmean_table_enc(int device) {
+    if (g_turbo_meansub_suppress) return nullptr;
     if (device < 0 || device >= 16) return nullptr;
     if (h_vmean_checked[device]) return h_vmean_dev[device];
     h_vmean_checked[device] = true;
@@ -2380,7 +2403,7 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo1_tcq(
         block_turbo1_tcq * __restrict__ dst, const int64_t ne_total_groups,
         uint8_t * __restrict__ bt_buf,
         const int use_shared_bt,
-        const int iq_is_k,
+        const int iq_is_k, const float * __restrict__ kvmean_mu,
         const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t s10, const int64_t s11, const int64_t s12,
         const int64_t s1, const int64_t s2, const int64_t s3,
@@ -2412,7 +2435,14 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo1_tcq(
     __shared__ float pred_min_cost[128]; // one per low-7-bit predecessor group (k=1)
     __shared__ int   shared_initial_state;
 
-    if (sid < 128) x[sid] = grp_src[sid];
+    if (sid < 128) {
+        x[sid] = grp_src[sid];
+        // Affine tap: raw-domain mean subtract (mu pre-offset to this layer on host);
+        // same-thread element, so it folds into the load under one barrier
+        if (kvmean_mu != nullptr) {
+            x[sid] -= kvmean_mu[i00 + sid];
+        }
+    }
     __syncthreads();
 
     // Norm reduction
