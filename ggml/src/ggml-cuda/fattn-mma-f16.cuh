@@ -271,10 +271,10 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nthreads(const int DKQ, 
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nthreads;
 }
 
-// turbo1_tcq runs a latency-bound FWHT chain inside its tile loader; the stock D=256 decode
-// configs leave only 2 blocks x 2 warps resident per SM (ncu: 82% no-eligible cycles). Halving
-// nbatch_fa halves the KV tile's shared memory so twice as many blocks fit per SM — more
-// resident warps without touching the per-block MMA tiling (np, accumulator sizes unchanged).
+// turbo1_tcq: halve nbatch_fa at the D=256 decode shapes. Measured BOTH ways (2026-07-02):
+// with the FWHT-era loader the extra resident blocks were worth +10%; with the pure-LUT
+// loader the doubled per-tile overhead costs instructions BUT the occupancy still wins
+// (32: 27.5 t/s @32k vs 64: 25.6) — the loader's instruction count needs the latency hiding.
 // Scoped to DKQ=DV=256; the D=128 shapes have different np/nbatch relations and are untested.
 static constexpr __host__ __device__ int ggml_cuda_fattn_mma_nbatch_fa_typed_adjust(
         const int nbatch_fa, const int DKQ, const int DV, const ggml_type type_K, const ggml_type type_V) {
@@ -644,6 +644,16 @@ static __device__ __forceinline__ void flash_attn_ext_turbo8_load_tile(
 // Generalized turbo tile loader for non-turbo4 types (turbo3_0, turbo2_0, turbo3_tcq, turbo2_tcq).
 // Reads raw quantized bytes from K/V cache, dequants to half2 in shared memory tile.
 // is_value selects V alpha (adaptive) vs K alpha (static) for TCQ types.
+// ⚠ Two profile-motivated restructures were tried and REVERTED (2026-07-02, 27B/3090 @32k):
+// (1) rotated column order (kills the measured 3.96x store-bank-conflict serialization but
+//     breaks constant folding of the unrolled bit extraction): t2_tcq 28.3 -> 23.4 t/s;
+// (2) warp-per-row + funnel-shift extraction (t1_tcq-style; conflict-free stores AND
+//     loop-invariant offsets): t2_tcq 28.3 -> 25.3 t/s — row-per-thread's one-full-row-per-
+//     thread single pass beats it at nbatch_fa=64. The store conflicts are real in wavefront
+//     counters but NOT binding here; this shape is already well-tuned. Bit-exact both times.
+// (3) half-typed smem codebook (bank rows 8 -> 4): +0.6% t/s for +0.29% PPL — reverted, the
+//     LUT gather serialization is also not binding; and warp-per-row at its best config
+//     (nbatch_fa=32 + half cb) reached only 27.6 vs the incumbent's 28.3-28.5.
 template <ggml_type turbo_type, int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check, bool is_value>
 static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
         const char * __restrict__ raw,
@@ -781,6 +791,7 @@ static __device__ __forceinline__ float fwht128_butterfly_linear(float val, floa
     return val;
 }
 
+
 template <int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check, bool is_value>
 static __device__ __forceinline__ void flash_attn_ext_turbo1_tcq_load_tile(
         const char * __restrict__ raw,
@@ -814,21 +825,27 @@ static __device__ __forceinline__ void flash_attn_ext_turbo1_tcq_load_tile(
 
 #pragma unroll
         for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
-            const block_turbo1_tcq * blk = (const block_turbo1_tcq *)(row_ptr) + blk_idx;
-            const float norm = __half2float(blk->norm) * alpha;
-
             // Both K and V are consumed in the WHT-rotated domain: the stored trellis coeffs
             // ARE the rotated coordinates, so the tile load is a pure LUT — no FWHT, no sign
             // vectors. Q is pre-rotated to match; the attention output is un-rotated at graph
             // level for V (ggml_turbo_wht keyed on v->type — turbo2/3_tcq contract, and the
             // rotated coeffs are near-exactly f16-representable, unlike post-FWHT values).
+            //
+            // The 20-byte block is read as 5 aligned words (broadcast within the warp). The
+            // 8-bit state window of element e = lane + 32k sits at absolute bit 16+lane+32k:
+            // the funnel-shift amount (16+lane)&31 is k-independent, the low word is bw[k]
+            // for lanes 0-15 and bw[k+1] for lanes 16-31, and the high word is always bw[k+1]
+            // (for lanes >= 16 the shift is <= 15 so the high word provably cannot contribute).
+            const uint32_t * bw = (const uint32_t *)(row_ptr + blk_idx * sizeof(block_turbo1_tcq));
+            const float norm = __half2float(__ushort_as_half((unsigned short)(bw[0] & 0xFFFF))) * alpha;
+            const int shift = (16 + lane) & 31;
+
             half * tile_h = (half *)(tile + row * stride_tile + blk_idx * 64);
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                const int e = lane + 32*k;
-                const uint16_t packed = (uint16_t)blk->qs[e >> 3] | ((uint16_t)blk->qs[(e >> 3) + 1] << 8);
-                const int state = (packed >> (e & 7)) & 0xFF;
-                tile_h[e] = __float2half(norm * cb[state]);
+                const uint32_t lo = (lane < 16) ? bw[k] : bw[k + 1];
+                const int state = (int)(__funnelshift_r(lo, bw[k + 1], shift) & 0xFF);
+                tile_h[lane + 32*k] = __float2half(norm * cb[state]);
             }
         }
     }
