@@ -481,11 +481,13 @@ static inline float tcq_compute_alpha_v(ggml_type v_type, int64_t n_kv) {
         // Flat optimum for the coord-descent codebook (K=iter195/V=iter208).
         return 1.06f;
     } else if (v_type == GGML_TYPE_TURBO1_TCQ) {
-        // 1-bit wants a higher decode alpha than 2/3-bit (monotone in bits: t3=1.02, t2=1.06, t1=1.14).
-        // Sweep optimum on the baked K=seed5/iter135, V=seed1/iter490 codebooks @8192/24ch:
-        // V=1.14 → median KLD 0.0452 (−11% vs alpha=1.0's 0.0508). K alpha left at 1.0 (shared global);
-        // K=1.02 buys a further −0.3% via TURBO_TCQ_DECODE_ALPHA_K=1.02 env if desired.
-        return 1.14f;
+        // 1-bit wants a higher decode alpha than 2/3-bit (monotone in bits: t3=1.02, t2=1.06).
+        // 1.14 was the optimum on the OLD per-row V decode path (median KLD 0.0452 @8192/24ch).
+        // Under ROTATED-domain V (2026-07-02) the optimum shifted up: batch-1 PPL 4k-token sweep
+        // has every point in [1.18, 1.35] beating 1.14; 1.22 is the conservative end of the
+        // smooth region (6.875 vs 6.926 at 1.14). ⚠ Pending KLD-panel confirmation before ship;
+        // MUST stay in sync with the fused launcher constexpr in fattn-mma-turbo.cuh.
+        return 1.22f;
     }
     return 1.0f;
 }
@@ -1111,6 +1113,35 @@ static __global__ void k_turbo1_tcq_dequant_f16(
         fwht128_store_half(val, dst + dst_base + blk_idx * 128);
         __syncthreads();
     }
+}
+
+// turbo1_tcq dequant, ROTATED domain: emits the stored trellis coefficients (norm*alpha*cb)
+// directly, mirroring k_turbo2_tcq_dequant_f16 — the graph-level ggml_turbo_wht(inverse) on
+// the attention output performs the un-rotation (turbo2/3_tcq contract). One thread/element.
+static __global__ void k_turbo1_tcq_dequant_f16_rot(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        const float alpha, const int is_v) {
+    const int64_t row  = blockIdx.x;
+    const int64_t head = blockIdx.y;
+    const int64_t strm = blockIdx.z;
+    const int j = threadIdx.x;
+    if (j >= ne0) return;
+
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int blk_idx = j / QK_TURBO1_TCQ;
+    const int t = j % QK_TURBO1_TCQ;
+    const block_turbo1_tcq * blk = (const block_turbo1_tcq *)src_row + blk_idx;
+
+    const float norm = __half2float(blk->norm) * alpha;
+    const int byte_idx = t >> 3;
+    const int bit_off  = t & 7;
+    const uint16_t raw = (uint16_t)blk->qs[byte_idx] | ((uint16_t)blk->qs[byte_idx + 1] << 8);
+    const int state = (raw >> bit_off) & 0xFF;
+    const float val = (is_v ? d_turbo1_tcq_cb_v_fattn : d_turbo1_tcq_cb_fattn)[state] * norm;
+
+    dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
 }
 
 // turbo2 K dequant with inverse FWHT: produces K in original (unrotated) domain.
@@ -1745,7 +1776,10 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             k_turbo1_cq_dequant_f16<<<grid_v, 128, 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
         } else if (V->type == GGML_TYPE_TURBO1_TCQ) {
-            k_turbo1_tcq_dequant_f16<<<grid_v, 128, 0, stream>>>(
+            // ROTATED-domain V (2026-07-02): graph-level ggml_turbo_wht(inverse) un-rotates the
+            // attention output, same contract as turbo2/3_tcq. Must stay in lockstep with the
+            // turbo_v_rotated set in llama-graph.cpp.
+            k_turbo1_tcq_dequant_f16_rot<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]), 1);
         } else if (V->type == GGML_TYPE_TURBO1) {
             // turbo1 V: per-row inverse FWHT → original domain (no graph un-rotation). Diagnostic:
@@ -2607,7 +2641,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     k_turbo1_cq_dequant_f16<<<grid_v, 128, 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
                 } else if (V->type == GGML_TYPE_TURBO1_TCQ) {
-                    k_turbo1_tcq_dequant_f16<<<grid_v, 128, 0, stream>>>(
+                    // ROTATED-domain V — see the prefill site; graph un-rotation keyed on v->type.
+                    k_turbo1_tcq_dequant_f16_rot<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]), 1);
                 } else if (V->type == GGML_TYPE_TURBO1_NSN) {
                     const int vl_nsn = atoi(V->name + 9);

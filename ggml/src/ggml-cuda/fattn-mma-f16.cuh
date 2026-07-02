@@ -799,24 +799,9 @@ static __device__ __forceinline__ void flash_attn_ext_turbo1_tcq_load_tile(
     const int warp = threadIdx.y;
 
     const float alpha = is_value ? d_tcq_decode_alpha_v_fattn : d_tcq_decode_alpha_k_fattn;
-    constexpr float inv_sqrt_128 = 0.08838834764831845f;
 
-    // Per-lane loop invariants, hoisted: the sign/InnerQ arrays are indexed divergently per
-    // lane, and divergent __constant__ reads serialize into one transaction per distinct
-    // address — done per element per block they dominate the loader. Loaded once instead.
-    float sg_pre[4];   // signs2[e]                                    (applied before the FWHT)
-    float sg_post[4];  // inv_sqrt_128 * signs1[e] * innerq_inv[e]     (applied after)
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        const int e = lane + 32*k;
-        sg_pre[k]  = d_turbo_wht_signs2_fattn[e];
-        sg_post[k] = inv_sqrt_128 * d_turbo_wht_signs1_fattn[e] * d_innerq_channel_scale_inv_fattn[e];
-    }
-
-    // One row per warp, barrier-free: lane l holds elements {l, l+32, l+64, l+96} of each
-    // 128-group. FWHT-128 stages h=1..16 are intra-warp shuffles applied to all 4 registers;
-    // h=32 pairs v[0]<->v[1] and v[2]<->v[3] in-register; h=64 pairs v[0]<->v[2], v[1]<->v[3].
-    // The caller's __syncthreads() after the load publishes the tile.
+    // One row per warp, barrier-free; lane l handles elements {l, l+32, l+64, l+96} of each
+    // 128-group. The caller's __syncthreads() after the load publishes the tile.
     for (int row = warp; row < nbatch_fa; row += nwarps) {
         if (oob_check && row >= i_sup) {
             for (int b = lane; b < D/2; b += warp_size) {
@@ -832,63 +817,18 @@ static __device__ __forceinline__ void flash_attn_ext_turbo1_tcq_load_tile(
             const block_turbo1_tcq * blk = (const block_turbo1_tcq *)(row_ptr) + blk_idx;
             const float norm = __half2float(blk->norm) * alpha;
 
-            if constexpr (!is_value) {
-                // K stays in the WHT-rotated domain (Q is pre-rotated to match, like turbo2/3):
-                // the stored trellis coeffs ARE the rotated coordinates, so the tile load is a
-                // pure LUT — no FWHT, no sign vectors. V cannot do this (per-row original-domain
-                // decode is coherence-critical), so only the K side takes this path.
-                half * tile_h = (half *)(tile + row * stride_tile + blk_idx * 64);
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    const int e = lane + 32*k;
-                    const uint16_t packed = (uint16_t)blk->qs[e >> 3] | ((uint16_t)blk->qs[(e >> 3) + 1] << 8);
-                    const int state = (packed >> (e & 7)) & 0xFF;
-                    tile_h[e] = __float2half(norm * cb[state]);
-                }
-                continue;
-            }
-
-            float v[4];
+            // Both K and V are consumed in the WHT-rotated domain: the stored trellis coeffs
+            // ARE the rotated coordinates, so the tile load is a pure LUT — no FWHT, no sign
+            // vectors. Q is pre-rotated to match; the attention output is un-rotated at graph
+            // level for V (ggml_turbo_wht keyed on v->type — turbo2/3_tcq contract, and the
+            // rotated coeffs are near-exactly f16-representable, unlike post-FWHT values).
+            half * tile_h = (half *)(tile + row * stride_tile + blk_idx * 64);
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 const int e = lane + 32*k;
                 const uint16_t packed = (uint16_t)blk->qs[e >> 3] | ((uint16_t)blk->qs[(e >> 3) + 1] << 8);
                 const int state = (packed >> (e & 7)) & 0xFF;
-                v[k] = norm * cb[state] * sg_pre[k];
-            }
-
-#pragma unroll
-            for (int h = 1; h <= 16; h *= 2) {
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    const float other = __shfl_xor_sync(0xFFFFFFFFULL, v[k], h);
-                    v[k] = (lane & h) ? (other - v[k]) : (v[k] + other);
-                }
-            }
-            {   // h=32: element pairs (e, e^32) sit in adjacent registers.
-                const float a0 = v[0], a1 = v[1], a2 = v[2], a3 = v[3];
-                v[0] = a0 + a1; v[1] = a0 - a1;
-                v[2] = a2 + a3; v[3] = a2 - a3;
-            }
-            {   // h=64: element pairs (e, e^64).
-                const float a0 = v[0], a1 = v[1], a2 = v[2], a3 = v[3];
-                v[0] = a0 + a2; v[2] = a0 - a2;
-                v[1] = a1 + a3; v[3] = a1 - a3;
-            }
-
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                v[k] *= sg_post[k];
-            }
-
-            // half2 stores pair consecutive elements (2j, 2j+1) = same register on adjacent
-            // lanes; even lanes fetch the odd lane's value and write.
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                const float v_hi = __shfl_xor_sync(0xFFFFFFFFULL, v[k], 1);
-                if ((lane & 1) == 0) {
-                    tile[row * stride_tile + blk_idx * 64 + (lane + 32*k)/2] = __floats2half2_rn(v[k], v_hi);
-                }
+                tile_h[e] = __float2half(norm * cb[state]);
             }
         }
     }

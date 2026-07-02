@@ -2550,7 +2550,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible).
     // Ragged V can opt into the same contract while using an F16 cache by writing rotated-domain V.
-    const bool turbo_v_rotated = v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ;
+    const bool turbo_v_rotated = v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ || v->type == GGML_TYPE_TURBO1_TCQ;
     const bool ragged_v_rotated = v->type == GGML_TYPE_F16 && turbo_ragged_v_rotated_enabled();
     if (turbo_v_rotated || ragged_v_rotated) {
         if (cur->ne[0] % 128 == 0) {
@@ -2562,14 +2562,6 @@ ggml_tensor * llm_graph_context::build_attn(
                         inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
                 cur = ggml_add(ctx0, cur, mu);
             }
-        }
-    } else if (v->type == GGML_TYPE_TURBO1_TCQ) {
-        // turbo1_tcq V is decoded per-row to original domain in-kernel (no graph un-rotation),
-        // but the affine tap still needs mu_V restored once (weights sum to 1 -> mean re-enters as a constant).
-        if (inp->self_vmean && inp->self_vmean->ne[0] == cur->ne[0]) {
-            ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, inp->self_vmean->ne[0], 1,
-                    inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
-            cur = ggml_add(ctx0, cur, mu);
         }
     } else if (inp->self_v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
@@ -2841,7 +2833,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible).
-    const bool turbo_v_rotated = v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ;
+    const bool turbo_v_rotated = v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ || v->type == GGML_TYPE_TURBO1_TCQ;
     const bool ragged_v_rotated = v->type == GGML_TYPE_F16 && turbo_ragged_v_rotated_enabled();
     if (turbo_v_rotated || ragged_v_rotated) {
         if (cur->ne[0] % 128 == 0) {
@@ -2853,14 +2845,6 @@ ggml_tensor * llm_graph_context::build_attn(
                         inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
                 cur = ggml_add(ctx0, cur, mu);
             }
-        }
-    } else if (v->type == GGML_TYPE_TURBO1_TCQ) {
-        // turbo1_tcq V is decoded per-row to original domain in-kernel (no graph un-rotation),
-        // but the affine tap still needs mu_V restored once (weights sum to 1 -> mean re-enters as a constant).
-        if (inp->self_vmean && inp->self_vmean->ne[0] == cur->ne[0]) {
-            ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, inp->self_vmean->ne[0], 1,
-                    inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
-            cur = ggml_add(ctx0, cur, mu);
         }
     } else if (v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
