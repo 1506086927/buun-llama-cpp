@@ -626,15 +626,18 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
+    bool owned = true; // false for buffers wrapping externally-managed memory (VBR VMM pool)
     std::string name;
 
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-        device(device), dev_ptr(dev_ptr),
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, bool owned = true) :
+        device(device), dev_ptr(dev_ptr), owned(owned),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (owned) {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -850,6 +853,18 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+// Dynamic VBR (S2): wrap externally-managed device memory (a VMM VA range) as a first-class CUDA
+// buffer. Uses the standard interface + buft so ggml_backend_buffer_is_cuda / buft_is_cuda checks
+// hold; the non-owning context means freeing the buffer never cudaFree's the VA.
+ggml_backend_buffer_t ggml_backend_cuda_buffer_from_ptr(int device, void * ptr, size_t size) {
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(device);
+    if (buft == nullptr || ptr == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, ptr, /*owned=*/false);
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
 
 // cuda split buffer
