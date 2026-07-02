@@ -17,6 +17,14 @@ struct llama_context;
 // llama_kv_cache
 //
 
+// Dynamic VBR (S3): one step of the measured decode-time degrade price order —
+// knock (layer il, K/V side) down to `tier` (a vbr_tier index, see llama-kv-cache.cpp).
+struct vbr_degrade_step {
+    uint8_t il;
+    uint8_t is_v;
+    uint8_t tier;
+};
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {
@@ -112,7 +120,7 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache(); // frees the VBR VMM pool (if any); = default otherwise
 
     //
     // llama_memory_i
@@ -235,6 +243,50 @@ private:
         std::vector<ggml_tensor *> v_stream;
     };
 
+    // Dynamic VBR (M2): per-(layer,side) descriptor over the shared KV pool buffer.
+    // M2 records the current placement bit-identically; M3 mutates {tensor,type,byte_off,byte_len}
+    // when a tensor is transcoded down a tier (freed bytes return to the pool's free region).
+    struct vbr_extent {
+        size_t    byte_off = 0;                 // offset of this tensor's data within the pool buffer
+        size_t    byte_len = 0;                 // current byte size
+        ggml_type type     = GGML_TYPE_F16;     // current tier
+        int64_t   ne0      = 0;                 // padded per-cell embd dim (tier-independent cell count)
+        size_t    stash_off   = 0;              // offset into the f16 sink-stash buffer
+        uint32_t  stash_valid = 0;              // rows captured (0 = not yet)
+    };
+    struct vbr_pool {
+        bool                  enabled = false;
+        ggml_backend_buffer_t buf     = nullptr; // non-owning (lives in ctxs_bufs); single KV buffer
+        char *                base    = nullptr; // ggml_backend_buffer_get_base(buf)
+        size_t                size    = 0;        // total pool bytes
+        size_t                used    = 0;        // high-water of placed extents
+        std::vector<vbr_extent> k;                // indexed by kv-cache layer id (ikv)
+        std::vector<vbr_extent> v;
+        // S2 (option C): VMM-backed pool — per-tensor fixed VA slots, physical pages mapped on
+        // demand. When set, `size` is the VA reservation (not physical); each extent's byte_off is
+        // page-aligned so tensor-tail unmaps never straddle a neighbor's pages.
+        struct ggml_cuda_vmm_pool * vmm = nullptr;
+        uint32_t wm_cells    = 0;                 // cells already backed for every extent
+        int      device      = -1;                // CUDA device backing the pool
+        size_t   gran        = 0;                 // page granularity
+        size_t   mapped_base = 0;                 // bytes mapped up front (rotation matrices)
+        // f16 sink-stash (VBR_STASH_ROWS env; 0 = off): pristine first-degrade snapshot of the
+        // first N rows per tensor — permanently-hot sink rows re-encode from it at every hop
+        ggml_backend_buffer_t stash_buf = nullptr;
+        uint32_t stash_rows = 0;
+    };
+    void vbr_vmm_ensure_mapped(); // grow physical backing to the current cell watermark
+
+    // S3/S4: decode-time degrade controller (VMM mode only)
+    std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, F16->t8 band first
+    size_t         vbr_degrade_cursor_ = 0;
+    size_t         vbr_budget_bytes_   = 0;           // mapped-physical budget; 0 = no trigger
+    ggml_backend_t vbr_backend_        = nullptr;     // dedicated transcode backend (lazy; the side stream)
+    void     vbr_load_degrade_order();                // baked table, or VBR_DEGRADE_ORDER=<file> override
+    size_t   vbr_vmm_projected_bytes(uint32_t wm_cells) const;
+    uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
+    bool     vbr_degrade_next();                      // one step down the order; false = exhausted
+
     bool v_trans = true;  // the value tensor is transposed
 
     const uint32_t n_seq_max = 1;
@@ -280,6 +332,13 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+
+    // Dynamic VBR shared KV pool (M2 bookkeeping; M3 transcode/relocate)
+    vbr_pool vbr_pool_;
+
+    // Permanent transcode oracle (env VBR_TRANSCODE_TEST): synthetic turbo8 A->A byte round-trip +
+    // turbo8->turbo4 in-place-vs-separate identity, on a scoped CUDA backend. See definition.
+    void vbr_transcode_anchor_test();
 
     // TurboQuant rotation matrices (128x128, row-major stored)
     ggml_tensor * turbo_rotation = nullptr;      // R (forward rotation)
