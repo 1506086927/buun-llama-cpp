@@ -250,6 +250,7 @@ private:
     struct vbr_extent {
         size_t    byte_off = 0;                 // offset of this tensor's data within the pool buffer
         size_t    byte_len = 0;                 // current byte size (0 = tensor not pooled)
+        ggml_type type0    = GGML_TYPE_COUNT;   // ENTRY tier (immutable; full-clear reset target)
         size_t    stash_off   = 0;              // offset into the f16 sink-stash buffer
         uint32_t  stash_valid = 0;              // rows captured (0 = not yet)
     };
@@ -293,6 +294,12 @@ private:
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)
+    // sink-stash staleness guard: set when any cell below stash_rows is freed (its content can be
+    // rewritten by another request; injecting the old snapshot would corrupt the new rows)
+    bool   vbr_stash_dirty_   = false;
+    void     vbr_full_reset();                        // cache empty: undo every degrade (lossless)
+    void     vbr_shrink_watermark();                  // occupancy dropped: release phantom tail pages
+    bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();
     void     vbr_flush_deferred_unmaps();
     char *   vbr_stash_ensure();                      // lazy sink-stash buffer; returns base

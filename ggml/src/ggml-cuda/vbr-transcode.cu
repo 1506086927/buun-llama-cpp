@@ -98,10 +98,14 @@ static void vbr_fidelity_report(const char * name, ggml_type tA, ggml_type tB,
 //
 // STREAMING + IN-PLACE (VBR design decisions #2/#3): processed one TILE of cells at a time, so the
 // f32/f16 scratch is bounded (~few MB, independent of n_cells) — NOT the whole-tensor f32 buffer.
-// Safe when dst == src->data (in-place degrade): a degrade has rB <= rA, so the dest write
-// offset (c*rB) always trails the source read offset (c*rA); ascending tiles + same-stream ordering
-// mean a tile's write never clobbers a later tile's unread source. (rB > rA, i.e. an UPGRADE, would
-// violate this — degrades only.)
+// In-place safety is direction-dependent:
+//   rB <= rA (degrade): ascending tiles — the write offset (c*rB) always trails the read (c*rA);
+//   rB >  rA (container promotion): DESCENDING tiles — tile c's write [c*rB, ...) only overlaps
+//     the sources of tiles > c, which a descending walk has already consumed. Either way a tile's
+//     own read/write overlap is safe: Stage-1 fully dequants the tile into scratch before Stage-2
+//     writes, and both are ordered on the same stream. Promotion requires the caller to have
+//     MAPPED the grown extent first. (Promotion re-encodes the tier-A recon — it restores no
+//     information; it exists so FUTURE rows encode at the higher tier.)
 // ASYNC (S5): no end-of-call sync — everything is stream-ordered on ctx.stream(). The pool-alloc
 // scratch returns to the per-context pool at scope exit; reuse by the NEXT transcode on the same
 // stream is ordered behind this one's kernels, so that is safe by construction.
@@ -122,7 +126,7 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
     const int64_t ne0 = src_A->ne[0];
     const size_t  rA  = src_A->nb[1];                       // source bytes/cell
     const size_t  rB  = ggml_row_size(type_B, ne0);         // dest bytes/cell (contiguous)
-    GGML_ASSERT(dst_B_data != src_A->data || rB <= rA);     // in-place requires a degrade
+    const bool reverse_tiles = dst_B_data == src_A->data && rB > rA; // in-place promotion
 
     const bool fidelity = getenv("VBR_TRANSCODE_FIDELITY") != nullptr;
     std::vector<float> fidA;
@@ -168,7 +172,10 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
         dstB->ne[1] = Te; dstB->nb[2] = dstB->nb[1]*Te; dstB->nb[3] = dstB->nb[2];
     };
 
-    for (int64_t c = 0; c < n_cells; c += TILE) {
+    const int64_t n_tiles = (n_cells + TILE - 1) / TILE;
+    int64_t cur_te = TILE;
+    for (int64_t ti = 0; ti < n_tiles; ++ti) {
+        const int64_t c  = (reverse_tiles ? n_tiles - 1 - ti : ti) * TILE;
         const int64_t Te = (n_cells - c < TILE) ? (n_cells - c) : TILE;
 
         // Stage 1: dequant cells [c, c+Te) of src_A -> original-domain f32 [Te, ne0]
@@ -191,8 +198,9 @@ void ggml_cuda_vbr_kv_transcode(ggml_backend_cuda_context & ctx,
         }
 
         // Stage 2: re-encode f32 -> turbo B into dst_B_data + c*rB via the set_rows path
-        if (Te != TILE) {
-            set_rows_count(Te); // final partial tile only
+        if (Te != cur_te) {
+            set_rows_count(Te); // partial tile (last in ascending order, FIRST in descending)
+            cur_te = Te;
         }
         dstB->data = (char *) dst_B_data + (size_t) c * rB;
 
