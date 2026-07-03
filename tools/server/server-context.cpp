@@ -1471,13 +1471,17 @@ private:
         }
 
         if (server_vbr_dynamic_active(params_base)) {
+            // Disabled: both mechanisms serialize/shift the ATTENTION KV, whose tensor tiers flip
+            // in place at runtime under the dynamic VBR controller (a FLAGS_NONE state restore
+            // would land bytes under the wrong tier or past the VMM watermark; cache_reuse needs
+            // shifts, and get_can_shift() is false under VMM anyway).
+            // Context checkpoints stay ENABLED: they use LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY,
+            // which the hybrid memory routes to the recurrent state only (attention KV skipped,
+            // see llama_memory_hybrid::state_write) — tier-agnostic, and load-bearing for prompt
+            // caching on hybrid models (the recurrent state cannot rewind without them).
             if (params_base.cache_ram_mib != 0) {
                 params_base.cache_ram_mib = 0;
                 SRV_WRN("%s\n", "prompt cache state storage is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
-            }
-            if (params_base.n_ctx_checkpoints > 0) {
-                params_base.n_ctx_checkpoints = 0;
-                SRV_WRN("%s\n", "context checkpoints are not supported by dynamic VBR (KV tiers change at runtime), they will be disabled");
             }
             if (params_base.n_cache_reuse) {
                 params_base.n_cache_reuse = 0;
