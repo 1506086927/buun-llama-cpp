@@ -1586,16 +1586,15 @@ static __global__ void __launch_bounds__(512, 2) k_set_rows_turbo3_tcq(
     // Shared memory layout (~5KB, was ~35KB before global bt optimization):
     // x[128]     : rotated+normalized input (also reused as outputs[] after Viterbi)
     // cost[512]  : path costs buffer A (also reused for reductions)
-    // cost_b[512]: path costs buffer B (double-buffering eliminates 2/3 of syncs)
     // Backtrace: one predecessor byte for each of the 64 low-state groups per
     // step. The predecessor is independent of the output bits in sid[8:6], so
     // storing 128×64 bytes is equivalent to the older 128×512 layout.
     extern __shared__ uint8_t bt_shared[];
     __shared__ float x[128];
     __shared__ float cost[512];
-    __shared__ float cost_b[512];
     __shared__ int warp_min_idx[16];
     __shared__ float warp_min_cost[16];
+    __shared__ float cost_b[512];   // double-buffering for Viterbi
     __shared__ float pred_min_cost[64];
     __shared__ int shared_initial_state;
 
@@ -1677,7 +1676,18 @@ static __global__ void __launch_bounds__(512, 2) k_set_rows_turbo3_tcq(
 
     float saved_norm = cost[0];
 
-    // Viterbi forward pass: double-buffered cost (1 sync/step, was 3)
+    // Viterbi forward pass: double-buffered cost, two-phase min.
+    // ⚠ THREE restructures were tried and REVERTED (2026-07-03, pp512/tg32 27B/3090):
+    // (0) hoisting the loop-invariant codebook load out of the loop (the t2/t1 win): pp flat
+    //     AND tg 30.3 -> 29.8 — under launch_bounds(512,2) the extra live register tips this
+    //     512-thread kernel into spills, and the encoder sits on the DECODE path too (every
+    //     generated token is re-encoded). Keep the in-loop load here;
+    // (1) every-thread redundant 8-way scan (the t2/t1 shape): 8x redundancy + stride-8 bank
+    //     conflicts — not attempted after t2 measured flat with only 4x redundancy;
+    // (2) register-resident cost + lexicographic (cost,p) clique shuffle-min + double-buffered
+    //     group minima (bit-exact, genuinely one barrier): pp512 1134 -> 1088 (-4%), tg32 30.3
+    //     -> 29.8 — the ~6-op shuffle chain sits on the step's critical path and costs more
+    //     than the barrier it removes. 512 threads with a 2-warp min phase is the local optimum.
     uint8_t * bt = use_shared_bt ? bt_shared : bt_buf + (int64_t)blockIdx.x * (128 * 64);
     cost[sid] = 0.0f;
     __syncthreads();
@@ -2021,7 +2031,6 @@ static __global__ void __launch_bounds__(256, 3) k_set_rows_turbo2_tcq(
     __shared__ float cost_b[256];   // double-buffering for Viterbi
     __shared__ int warp_min_idx[8];
     __shared__ float warp_min_cost[8];
-    __shared__ float pred_min_cost[64];
     __shared__ int shared_initial_state;
 
     if (sid < 128) x[sid] = grp_src[sid];
@@ -2101,9 +2110,16 @@ static __global__ void __launch_bounds__(256, 3) k_set_rows_turbo2_tcq(
 
     float saved_norm = cost[0];
 
-    // Viterbi forward pass: double-buffered cost (1 sync/step, was 3)
+    // Viterbi forward pass: double-buffered cost, ONE barrier per step. Every thread scans its
+    // own 4-way predecessor group straight from the read buffer (reads cost_rd, writes cost_wr —
+    // no intra-step hazard), instead of a 64-thread min phase + barrier + broadcast. The scan is
+    // 4x redundant across threads sharing a group, but the loop is barrier-latency-bound, and
+    // identical floats in identical compare order keep it bit-exact. The codebook value is
+    // hoisted: it is loop-invariant, and the compiler cannot lift a __device__ load across
+    // __syncthreads (was 128 redundant global loads per thread).
     uint8_t * bt = use_shared_bt ? bt_shared : bt_buf + (int64_t)blockIdx.x * (128 * 64);
     cost[sid] = 0.0f;
+    const float cb_sid = (iq_is_k ? d_turbo2_tcq_codebook : d_turbo2_tcq_codebook_v)[sid];
     __syncthreads();
 
     for (int t = 0; t < 128; t++) {
@@ -2112,31 +2128,28 @@ static __global__ void __launch_bounds__(256, 3) k_set_rows_turbo2_tcq(
 
         float xt = x[t];
 
-        // Right-shift trellis (k=2, L=8): ns = (prev >> 2) | (out << 6).
-        // The best predecessor depends only on sid's low 6 bits, so compute
-        // those 64 minima once instead of repeating the same 4-way scan per state.
-        if (sid < 64) {
-            const int base_prev = sid << 2;
-            float best = cost_rd[base_prev];
-            int best_p = 0;
-#pragma unroll
-            for (int p = 1; p < 4; p++) {
-                float c = cost_rd[base_prev | p];
-                if (c < best) {
-                    best = c;
-                    best_p = p;
-                }
-            }
-            pred_min_cost[sid] = best;
-            bt[t * 64 + sid] = (uint8_t) best_p;
-        }
-        __syncthreads();
-
+        // Right-shift trellis (k=2, L=8): ns = (prev >> 2) | (out << 6); the best predecessor
+        // depends only on sid's low 6 bits.
         const int pred_idx = sid & 0x3F;
-        float dist = xt - (iq_is_k ? d_turbo2_tcq_codebook : d_turbo2_tcq_codebook_v)[sid];
+        const int base_prev = pred_idx << 2;
+        float best = cost_rd[base_prev];
+        int best_p = 0;
+#pragma unroll
+        for (int p = 1; p < 4; p++) {
+            float c = cost_rd[base_prev | p];
+            if (c < best) {
+                best = c;
+                best_p = p;
+            }
+        }
+        if (sid < 64) {
+            bt[t * 64 + sid] = (uint8_t) best_p; // pred_idx == sid here: same byte as the old phase
+        }
+
+        float dist = xt - cb_sid;
         dist = dist * dist;
 
-        cost_wr[sid] = pred_min_cost[pred_idx] + dist;
+        cost_wr[sid] = best + dist;
         __syncthreads();
     }
     // After 128 steps (even count): final costs in cost[]
@@ -2436,7 +2449,6 @@ static __global__ void __launch_bounds__(256, 3) k_set_rows_turbo1_tcq(
     __shared__ float cost_b[256];        // double-buffering for Viterbi
     __shared__ int   warp_min_idx[8];
     __shared__ float warp_min_cost[8];
-    __shared__ float pred_min_cost[128]; // one per low-7-bit predecessor group (k=1)
     __shared__ int   shared_initial_state;
 
     if (sid < 128) {
@@ -2509,31 +2521,34 @@ static __global__ void __launch_bounds__(256, 3) k_set_rows_turbo1_tcq(
     cost[sid] = 0.0f;
     __syncthreads();
 
+    // ONE barrier per step (same transform as k_set_rows_turbo2_tcq): each thread does its own
+    // 2-way predecessor scan from the read buffer — bit-exact, half the barriers, and the
+    // loop-invariant codebook value is hoisted out of the loop (cbk itself is still used by the
+    // recon pass below).
     const float * cbk = iq_is_k ? d_turbo1_tcq_codebook : d_turbo1_tcq_codebook_v;
+    const float cb_sid = cbk[sid];
     for (int t = 0; t < 128; t++) {
         float * cost_rd = (t & 1) ? cost_b : cost;
         float * cost_wr = (t & 1) ? cost   : cost_b;
 
         float xt = x[t];
 
-        // Right-shift trellis (k=1, L=8): ns = (prev >> 1) | (out << 7).
-        // Best predecessor depends only on sid's low 7 bits -> 128 minima, 2-way scan.
-        if (sid < 128) {
-            const int base_prev = sid << 1;
-            float best = cost_rd[base_prev];
-            int best_p = 0;
-            float c1 = cost_rd[base_prev | 1];
-            if (c1 < best) { best = c1; best_p = 1; }
-            pred_min_cost[sid] = best;
-            bt[t * 128 + sid] = (uint8_t) best_p;
-        }
-        __syncthreads();
-
+        // Right-shift trellis (k=1, L=8): ns = (prev >> 1) | (out << 7); the best predecessor
+        // depends only on sid's low 7 bits.
         const int pred_idx = sid & 0x7F;
-        float dist = xt - cbk[sid];
+        const int base_prev = pred_idx << 1;
+        float best = cost_rd[base_prev];
+        int best_p = 0;
+        float c1 = cost_rd[base_prev | 1];
+        if (c1 < best) { best = c1; best_p = 1; }
+        if (sid < 128) {
+            bt[t * 128 + sid] = (uint8_t) best_p; // pred_idx == sid here
+        }
+
+        float dist = xt - cb_sid;
         dist = dist * dist;
 
-        cost_wr[sid] = pred_min_cost[pred_idx] + dist;
+        cost_wr[sid] = best + dist;
         __syncthreads();
     }
     // After 128 steps (even count): final costs in cost[]
