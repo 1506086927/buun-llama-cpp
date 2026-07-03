@@ -2180,7 +2180,17 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                (k == GGML_TYPE_TURBO1_TCQ && v == GGML_TYPE_TURBO2_TCQ);
     };
     const bool turbo_fused_asym = turbo_fused_asym_pair(K->type, V->type) && Q->ne[0] == 256;
-    if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) && Q->ne[1] <= 4 &&
+    // TURBO_FUSED_PREFILL=1 (experiment knob): route BATCHED attention through the fused MMA path
+    // (ncols1 instances up to 64 exist). ⚠ MEASURED A LOSS (2026-07-03, 27B/3090, pp512): ~neutral
+    // at d0 but −6% (t8/t4) to −11% (t3/t1_tcq) at d8192 — re-decoding the K/V tile once per
+    // 64-column block swamps the DRAM savings vs the materialize path's decode-once f16 round
+    // trip, and the win the codecs DO get from materialize grows with depth. Keep default OFF;
+    // the knob stays for future probing (e.g. if a shared-tile multi-column loader lands).
+    static const int turbo_fused_prefill = [] {
+        const char * e = getenv("TURBO_FUSED_PREFILL");
+        return e ? atoi(e) : 0;
+    }();
+    if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) && (Q->ne[1] <= 4 || turbo_fused_prefill) &&
         (Q->ne[0] == 128 || Q->ne[0] == 256) &&
         turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         cudaStream_t stream = ctx.stream();

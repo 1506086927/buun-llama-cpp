@@ -1548,7 +1548,9 @@ static inline void turbo_tcq_load_kv_encode() {
 // 512 threads per block (one per trellis state), one block per 128-element group
 // Double-buffered cost arrays + global memory backtrace (128 syncs/group, was 384)
 template<typename idx_t>
-static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
+// minBlocks=2: the 128-step Viterbi is __syncthreads-latency-bound; a second resident block
+// per SM hides the sync stalls (pp512 tax vs turbo4 was ~4% with minBlocks=1).
+static __global__ void __launch_bounds__(512, 2) k_set_rows_turbo3_tcq(
         const float * __restrict__ src0, const idx_t * __restrict__ src1,
         block_turbo3_tcq * __restrict__ dst, const int64_t ne_total_groups,
         uint8_t * __restrict__ bt_buf,
@@ -1978,7 +1980,8 @@ static inline void turbo2_tcq_load_kv_encode() {
 // 2-bit TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis (k=2, L=8)
 // Double-buffered cost arrays + global memory backtrace (128 syncs/group, was 384)
 template<typename idx_t>
-static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
+// minBlocks=3: same sync-latency reasoning as turbo3_tcq (256 threads leave headroom for 3).
+static __global__ void __launch_bounds__(256, 3) k_set_rows_turbo2_tcq(
         const float * __restrict__ src0, const idx_t * __restrict__ src1,
         block_turbo2_tcq * __restrict__ dst, const int64_t ne_total_groups,
         uint8_t * __restrict__ bt_buf,
@@ -2398,7 +2401,8 @@ static inline void turbo1_tcq_load_kv_encode() {
 // 1-bit TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis (k=1, L=8).
 // Stores FWHT-rotated trellis codes; decode (k_turbo1_tcq_dequant_f16) does the inverse FWHT.
 template<typename idx_t>
-static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo1_tcq(
+// minBlocks=3: same sync-latency reasoning as turbo3_tcq (256 threads leave headroom for 3).
+static __global__ void __launch_bounds__(256, 3) k_set_rows_turbo1_tcq(
         const float * __restrict__ src0, const idx_t * __restrict__ src1,
         block_turbo1_tcq * __restrict__ dst, const int64_t ne_total_groups,
         uint8_t * __restrict__ bt_buf,
