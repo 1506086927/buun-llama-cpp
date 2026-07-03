@@ -554,6 +554,25 @@ static void turbo_innerq_finalize_calibration() {
 }
 
 // === Shared constants ===
+#if TURBO3_SKEW_EXP == 1
+// data-retrained symmetric Lloyd-8 (pooled 27B post-FWHT K+V rows, cert_dump_27b)
+static __constant__ float d_turbo_centroids_3bit[8] = {
+    -0.187204f, -0.117719f, -0.066485f, -0.021602f,
+     0.021602f,  0.066485f,  0.117719f,  0.187204f
+};
+static __constant__ float d_turbo_mid_3bit[7] = {
+    -0.152461f, -0.092102f, -0.044044f, 0.0f, 0.044044f, 0.092102f, 0.152461f
+};
+#elif TURBO3_SKEW_EXP == 2
+// skew-sign-aligned asymmetric Lloyd-8 (same calibration, coords aligned by ss tables below)
+static __constant__ float d_turbo_centroids_3bit[8] = {
+    -0.186344f, -0.117092f, -0.065915f, -0.021100f,
+     0.022043f,  0.066992f,  0.118394f,  0.188239f
+};
+static __constant__ float d_turbo_mid_3bit[7] = {
+    -0.151718f, -0.091504f, -0.043508f, 0.000471f, 0.044518f, 0.092693f, 0.153316f
+};
+#else // 0 = stock, 3 = oracle (stock book, variant-2 code paths)
 static __constant__ float d_turbo_centroids_3bit[8] = {
     -0.190685f, -0.117832f, -0.065717f, -0.021460f,
      0.021460f,  0.065717f,  0.117832f,  0.190685f
@@ -561,6 +580,31 @@ static __constant__ float d_turbo_centroids_3bit[8] = {
 static __constant__ float d_turbo_mid_3bit[7] = {
     -0.154259f, -0.091775f, -0.043589f, 0.0f, 0.043589f, 0.091775f, 0.154259f
 };
+#endif
+#if TURBO3_SKEW_EXP == 2
+// per-side global skew signs: sign of median train-split skew per post-FWHT coordinate
+static __constant__ float d_turbo3_ss_k[128] = {
+    -1,+1,+1,+1,-1,+1,-1,-1,-1,+1,-1,+1,+1,-1,-1,+1,-1,-1,+1,+1,+1,-1,-1,+1,+1,-1,-1,-1,+1,-1,+1,-1,
+    -1,+1,-1,-1,+1,+1,+1,+1,+1,+1,+1,+1,-1,+1,+1,+1,-1,-1,+1,-1,+1,+1,-1,-1,+1,-1,-1,-1,-1,-1,-1,-1,
+    +1,-1,-1,+1,-1,-1,-1,+1,+1,+1,-1,-1,-1,-1,+1,+1,-1,-1,-1,-1,+1,+1,-1,+1,-1,-1,+1,-1,-1,-1,-1,-1,
+    -1,-1,+1,-1,+1,+1,-1,+1,-1,+1,-1,-1,-1,+1,-1,+1,+1,+1,-1,+1,-1,+1,+1,+1,+1,+1,+1,+1,-1,+1,+1,-1};
+static __constant__ float d_turbo3_ss_v[128] = {
+    +1,+1,-1,+1,-1,-1,+1,+1,-1,-1,+1,+1,+1,+1,-1,+1,+1,+1,-1,+1,-1,+1,-1,-1,+1,+1,-1,-1,-1,+1,+1,+1,
+    +1,-1,+1,-1,+1,+1,-1,-1,-1,-1,-1,-1,-1,-1,+1,-1,-1,-1,-1,+1,+1,+1,+1,-1,+1,-1,+1,+1,-1,+1,+1,-1,
+    -1,-1,+1,+1,-1,+1,-1,+1,+1,-1,-1,+1,-1,-1,-1,+1,-1,-1,+1,+1,-1,-1,-1,+1,-1,+1,-1,-1,+1,+1,+1,-1,
+    -1,+1,-1,-1,-1,-1,+1,-1,+1,+1,+1,+1,-1,-1,-1,+1,+1,-1,+1,+1,-1,-1,+1,-1,-1,+1,+1,-1,+1,-1,-1,-1};
+#elif TURBO3_SKEW_EXP == 3
+static __constant__ float d_turbo3_ss_k[128] = {
+    +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,
+    +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,
+    +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,
+    +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1};
+static __constant__ float d_turbo3_ss_v[128] = {
+    +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,
+    +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,
+    +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,
+    +1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1,+1};
+#endif
 
 // === TURBO2: 2-bit codebook (Lloyd-Max for N(0, 1/128)) ===
 static __constant__ float d_turbo_centroids_2bit[4] = {
@@ -772,6 +816,9 @@ static __global__ void k_set_rows_turbo3(
     turbo_extract_append(x, pf_layer >= 0
         ? pf_layer * 1000 + (innerq_is_k ? 0 : 100) + (int)(i00 / 128) : -1);
     // Quantize and accumulate reconstruction norm for correction
+#if TURBO3_SKEW_EXP >= 2
+    const float * t3ss = innerq_is_k ? d_turbo3_ss_k : d_turbo3_ss_v;
+#endif
     float recon_norm_sq = 0.0f;
     for (int b = 0; b < blocks_per_group; b++) {
         block_turbo3_0 & blk = dst_row_ptr[grp_idx * blocks_per_group + b];
@@ -779,7 +826,11 @@ static __global__ void k_set_rows_turbo3(
         for (int j = 0; j < QK_TURBO3 / 4; j++) blk.qs[j] = 0;
         for (int j = 0; j < QK_TURBO3 / 8; j++) blk.signs[j] = 0;
         for (int j = 0; j < QK_TURBO3; j++) {
+#if TURBO3_SKEW_EXP >= 2
+            uint8_t idx = turbo_find_nearest_3bit(x[off + j] * t3ss[off + j]);
+#else
             uint8_t idx = turbo_find_nearest_3bit(x[off + j]);
+#endif
             blk.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
             if (idx & 0x4) blk.signs[j / 8] |= (1 << (j % 8));
             float c = d_turbo_centroids_3bit[idx];
@@ -815,7 +866,8 @@ void dequantize_turbo3_0(const void * vx, const int64_t ib, const int iqs, float
 // head_dim = 4 sub-blocks of QK_TURBO3). No innerq atomics (read-only channel scale,
 // identity by default) so it never mutates calibration globals.
 static __device__ __forceinline__
-void quantize_f32_turbo3_0_block(const float * src, block_turbo3_0 * dst) {
+void quantize_f32_turbo3_0_block(const float * src, block_turbo3_0 * dst, const int is_k = 1) {
+    GGML_UNUSED(is_k);
     // NOTE: no InnerQ channel-scale here. d_innerq_channel_scale is only initialized
     // (to 1.0) by turbo_innerq_init(), which runs only when a turbo KV type is active.
     // The ragged injector runs with -ctk f16, so that global stays zero-initialized;
@@ -829,6 +881,9 @@ void quantize_f32_turbo3_0_block(const float * src, block_turbo3_0 * dst) {
     const float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
     for (int j = 0; j < 128; j++) x[j] *= inv_norm;
     turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
+#if TURBO3_SKEW_EXP >= 2
+    const float * t3ss = is_k ? d_turbo3_ss_k : d_turbo3_ss_v;
+#endif
     const int blocks_per_group = QK_TURBO3_GROUP / QK_TURBO3;
     float recon_norm_sq = 0.0f;
     for (int b = 0; b < blocks_per_group; b++) {
@@ -837,7 +892,11 @@ void quantize_f32_turbo3_0_block(const float * src, block_turbo3_0 * dst) {
         for (int j = 0; j < QK_TURBO3 / 4; j++) blk.qs[j] = 0;
         for (int j = 0; j < QK_TURBO3 / 8; j++) blk.signs[j] = 0;
         for (int j = 0; j < QK_TURBO3; j++) {
+#if TURBO3_SKEW_EXP >= 2
+            uint8_t idx = turbo_find_nearest_3bit(x[off + j] * t3ss[off + j]);
+#else
             uint8_t idx = turbo_find_nearest_3bit(x[off + j]);
+#endif
             blk.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
             if (idx & 0x4) blk.signs[j / 8] |= (1 << (j % 8));
             const float c = d_turbo_centroids_3bit[idx];
@@ -1268,13 +1327,20 @@ void turbo_roundtrip_block_to_orig(const float * src, float * out, int tier, int
         for (int j = 0; j < 128; j++) xr[j] = d_turbo_centroids_2bit[idxs[j]];
     } else { // tier == 3 (4 sub-blocks of QK_TURBO3, shared group norm)
         block_turbo3_0 blk[QK_TURBO3_GROUP / QK_TURBO3];
-        quantize_f32_turbo3_0_block(src, blk);
+        quantize_f32_turbo3_0_block(src, blk, is_k);
         post_norm = __half2float(blk[0].norm);
+#if TURBO3_SKEW_EXP >= 2
+        const float * t3ss = is_k ? d_turbo3_ss_k : d_turbo3_ss_v;
+#endif
         for (int ib = 0; ib < QK_TURBO3_GROUP / QK_TURBO3; ib++) {
             for (int j = 0; j < QK_TURBO3; j++) {
                 const uint8_t low2 = (blk[ib].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
                 const uint8_t hi1  = (blk[ib].signs[j / 8] >> (j % 8)) & 0x1;
+#if TURBO3_SKEW_EXP >= 2
+                xr[ib * QK_TURBO3 + j] = d_turbo_centroids_3bit[low2 | (hi1 << 2)] * t3ss[ib * QK_TURBO3 + j];
+#else
                 xr[ib * QK_TURBO3 + j] = d_turbo_centroids_3bit[low2 | (hi1 << 2)];
+#endif
             }
         }
     }

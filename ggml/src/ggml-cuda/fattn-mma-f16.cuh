@@ -690,8 +690,16 @@ static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
                     const uint8_t hi1_0  = (blk->signs[j0/8] >> (j0%8)) & 0x1;
                     const uint8_t low2_1 = (blk->qs[j1/4] >> ((j1%4)*2)) & 0x3;
                     const uint8_t hi1_1  = (blk->signs[j1/8] >> (j1%8)) & 0x1;
+#if TURBO3_SKEW_EXP >= 2
+                    const float * t3ss = is_value ? d_turbo3_ss_v_fattn : d_turbo3_ss_k_fattn;
+                    const int cj = (blk_idx * QK_TURBO3) % 128;
+                    const half h0 = t3ss[cj + j0] < 0.0f ? __hneg(cn_h[low2_0 | (hi1_0 << 2)]) : cn_h[low2_0 | (hi1_0 << 2)];
+                    const half h1 = t3ss[cj + j1] < 0.0f ? __hneg(cn_h[low2_1 | (hi1_1 << 2)]) : cn_h[low2_1 | (hi1_1 << 2)];
+                    tile[row * stride_tile + blk_idx * (QK_TURBO3/2) + b] = __halves2half2(h0, h1);
+#else
                     tile[row * stride_tile + blk_idx * (QK_TURBO3/2) + b] =
                         __halves2half2(cn_h[low2_0 | (hi1_0 << 2)], cn_h[low2_1 | (hi1_1 << 2)]);
+#endif
                 }
             }
         } else if constexpr (turbo_type == GGML_TYPE_TURBO2_0) {

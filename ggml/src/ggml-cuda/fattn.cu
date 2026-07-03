@@ -555,7 +555,7 @@ static __global__ void k_turbo2_dequant_f16(
 static __global__ void k_turbo3_dequant_f16(
         const char * __restrict__ src, half * __restrict__ dst,
         const int64_t ne0, const int64_t ne1, const int64_t ne2,
-        const size_t nb1, const size_t nb2, const size_t nb3) {
+        const size_t nb1, const size_t nb2, const size_t nb3, const int is_v = 0) {
     const int64_t row  = blockIdx.x;
     const int64_t head = blockIdx.y;
     const int64_t strm = blockIdx.z;
@@ -570,7 +570,13 @@ static __global__ void k_turbo3_dequant_f16(
     const float norm = __half2float(blk->norm);
     const uint8_t low2 = (blk->qs[j_in_blk / 4] >> ((j_in_blk % 4) * 2)) & 0x3;
     const uint8_t hi1  = (blk->signs[j_in_blk / 8] >> (j_in_blk % 8)) & 0x1;
+#if TURBO3_SKEW_EXP >= 2
+    const float val = d_turbo_centroids_3bit_fattn[low2 | (hi1 << 2)]
+                    * (is_v ? d_turbo3_ss_v_fattn[j % 128] : d_turbo3_ss_k_fattn[j % 128]) * norm;
+#else
+    GGML_UNUSED(is_v);
     const float val = d_turbo_centroids_3bit_fattn[low2 | (hi1 << 2)] * norm;
+#endif
 
     dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
 }
@@ -732,7 +738,11 @@ static __global__ void k_turbo3_dequant_f16_inv_fwht(
 
         const uint8_t low2 = (blk->qs[j_in_blk / 4] >> ((j_in_blk % 4) * 2)) & 0x3;
         const uint8_t hi1  = (blk->signs[j_in_blk / 8] >> (j_in_blk % 8)) & 0x1;
+#if TURBO3_SKEW_EXP >= 2
+        const float c = d_turbo_centroids_3bit_fattn[low2 | (hi1 << 2)] * d_turbo3_ss_k_fattn[tid];
+#else
         const float c = d_turbo_centroids_3bit_fattn[low2 | (hi1 << 2)];
+#endif
 
         // Inverse FWHT: 5 intra-warp shfl passes + 2 cross-warp smem passes.
         float val = fwht128_butterfly_inplace(c * s2[tid], smem);
@@ -1555,7 +1565,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
         } else if (V->type == GGML_TYPE_TURBO3_0) {
             k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], 1);
         } else if (V->type == GGML_TYPE_TURBO3_TCQ) {
             // Runtime codebook loading for 3-bit V decode (in case K is a different type)
             {
@@ -2500,7 +2510,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], o_v);
                 } else if (V->type == GGML_TYPE_TURBO3_0) {
                     k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], 1);
                 } else if (V->type == GGML_TYPE_Q8_0) {
                     // Q8_0 V dequant: only fires at D=512 when K is turbo (mirror of K=Q8_0 path).
                     k_q8_0_dequant_f16_tkhe<<<grid_v, V->ne[0], 0, stream>>>(
