@@ -1043,11 +1043,15 @@ llama_kv_cache::llama_kv_cache(
             vbr_pool_.enabled = true;
             LLAMA_LOG_INFO("%s: VBR pool: %.2f MiB buffer, %.2f MiB used by %zu KV layers\n",
                     __func__, vbr_pool_.size/1024.0/1024.0, vbr_pool_.used/1024.0/1024.0, layers.size());
-            // S3/S4: arm the decode-time degrade controller (VMM mode only).
-            // S6 CLI path: `--vbr-budget dynamic --vbr-vram <SIZE>` sets VBR_VMM/VBR_BUDGET_MIB in
-            // common_params_postprocess_vbr (overriding pre-set envs LOUDLY, with a warning) — the
-            // envs below stay the single runtime knob. VBR_STASH_ROWS / VBR_DEGRADE_ORDER remain
-            // direct overrides for experiments.
+            // S3/S4: arm the decode-time degrade controller (VMM mode only). The envs are the
+            // single runtime knob; the CLI dynamic path feeds them from three places:
+            //   VBR_VMM=1 + VBR_MODE=dynamic  — common_params_postprocess_vbr (always in dynamic);
+            //   VBR_BUDGET_MIB                — postprocess (explicit --vbr-vram) or the fit pass
+            //                                   (auto, from remaining VRAM); absent in dynamic mode
+            //                                   -> floor-layout-cost fallback below;
+            //   VBR_MIN_BITS                  — the --vbr-floor aggregate clamp (see
+            //                                   vbr_floor_clamp_order).
+            // VBR_STASH_ROWS / VBR_DEGRADE_ORDER remain direct overrides for experiments.
             if (vbr_pool_.vmm != nullptr) {
                 vbr_load_degrade_order();
                 vbr_floor_clamp_order();

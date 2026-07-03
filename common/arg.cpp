@@ -760,7 +760,6 @@ struct common_vbr_policy_choice {
     std::string descriptor_file;
     double bpv = 0.0;
     double full_kld = 0.0;
-    bool dynamic_policy = false;
 };
 
 static std::string common_vbr_policy_arg(const common_params & params, bool & explicit_policy) {
@@ -779,11 +778,13 @@ static std::string common_vbr_policy_arg(const common_params & params, bool & ex
     return {};
 }
 
+// Selects from the STATIC ladder only. Dynamic VBR is the runtime degrade controller and never
+// consults a policy ladder — any legacy `dynamic_ladder` rows in existing policy JSONs are
+// ignored (they were always runtime_supported=false stubs).
 static common_vbr_policy_choice common_vbr_select_policy(
         const std::string & raw_policy_path,
         double cap_bits,
-        double min_bits = 0.0,
-        bool allow_dynamic = false) {
+        double min_bits = 0.0) {
     if (cap_bits <= 0.0) {
         throw std::invalid_argument("VBR policy selection requires a positive BPV cap");
     }
@@ -796,8 +797,11 @@ static common_vbr_policy_choice common_vbr_select_policy(
 
     json ladder;
     f >> ladder;
-    if (!ladder.contains("static_ladder") && (!allow_dynamic || !ladder.contains("dynamic_ladder"))) {
+    if (!ladder.contains("static_ladder")) {
         throw std::invalid_argument("VBR policy ladder is missing static_ladder: " + policy_file);
+    }
+    if (!ladder["static_ladder"].is_array()) {
+        throw std::invalid_argument("VBR policy ladder field is not an array: static_ladder");
     }
 
     const std::string policy_dir = common_vbr_dirname(policy_file);
@@ -805,46 +809,28 @@ static common_vbr_policy_choice common_vbr_select_policy(
     best.policy_file = policy_file;
     bool found = false;
 
-    auto scan_ladder = [&](const char * key, bool dynamic_policy) {
-        if (!ladder.contains(key)) {
-            return;
+    for (const auto & row : ladder["static_ladder"]) {
+        if (!row.value("runtime_supported", true)) {
+            continue;
         }
-        if (!ladder[key].is_array()) {
-            throw std::invalid_argument(std::string("VBR policy ladder field is not an array: ") + key);
-        }
-        for (const auto & row : ladder[key]) {
-            const bool runtime_supported = row.value("runtime_supported", !dynamic_policy);
-            if (!runtime_supported) {
-                continue;
-            }
 
-            const double bpv = row.value("bpv", 0.0);
-            const double full_kld = row.value("full_kld", std::numeric_limits<double>::infinity());
-            if (!std::isfinite(full_kld)) {
-                continue;
-            }
-            const bool same_kld = found && std::abs(full_kld - best.full_kld) <= 1e-12;
-            const bool same_bpv = found && std::abs(bpv - best.bpv) <= 1e-9;
-            const bool prefer_dynamic_tie = allow_dynamic && dynamic_policy && !best.dynamic_policy && same_kld && same_bpv;
-            if (bpv <= cap_bits + 1e-9 && bpv + 1e-9 >= min_bits &&
-                    (!found || full_kld < best.full_kld - 1e-12 ||
-                        (same_kld && bpv > best.bpv + 1e-9) ||
-                        prefer_dynamic_tie)) {
-                found = true;
-                best.bpv = bpv;
-                best.name = row.value("name", "");
-                best.schedule_file = row.value("schedule_file", "");
-                best.schedule_path = common_vbr_join_path(policy_dir, best.schedule_file);
-                best.descriptor_file = row.value("stage2_descriptor_file", "");
-                best.full_kld = full_kld;
-                best.dynamic_policy = dynamic_policy;
-            }
+        const double bpv = row.value("bpv", 0.0);
+        const double full_kld = row.value("full_kld", std::numeric_limits<double>::infinity());
+        if (!std::isfinite(full_kld)) {
+            continue;
         }
-    };
-
-    scan_ladder("static_ladder", false);
-    if (allow_dynamic) {
-        scan_ladder("dynamic_ladder", true);
+        const bool same_kld = found && std::abs(full_kld - best.full_kld) <= 1e-12;
+        if (bpv <= cap_bits + 1e-9 && bpv + 1e-9 >= min_bits &&
+                (!found || full_kld < best.full_kld - 1e-12 ||
+                    (same_kld && bpv > best.bpv + 1e-9))) {
+            found = true;
+            best.bpv = bpv;
+            best.name = row.value("name", "");
+            best.schedule_file = row.value("schedule_file", "");
+            best.schedule_path = common_vbr_join_path(policy_dir, best.schedule_file);
+            best.descriptor_file = row.value("stage2_descriptor_file", "");
+            best.full_kld = full_kld;
+        }
     }
 
     if (!found || best.bpv <= 0.0 || best.schedule_file.empty()) {
@@ -868,8 +854,7 @@ static common_vbr_policy_choice common_vbr_select_policy(
 static double common_vbr_apply_policy_ladder(
         common_params & params,
         double cap_bits,
-        double min_bits = 0.0,
-        bool allow_dynamic = false) {
+        double min_bits = 0.0) {
     bool explicit_policy = false;
     const std::string policy_path = common_vbr_policy_arg(params, explicit_policy);
     if (policy_path.empty()) {
@@ -886,7 +871,7 @@ static double common_vbr_apply_policy_ladder(
         return 0.0;
     }
 
-    const common_vbr_policy_choice choice = common_vbr_select_policy(policy_path, cap_bits, min_bits, allow_dynamic);
+    const common_vbr_policy_choice choice = common_vbr_select_policy(policy_path, cap_bits, min_bits);
     common_setenv_override("VBR_LAYER_SCHEDULE", "@" + choice.schedule_path);
     common_setenv_override("TURBO_VBR_LAYER_SCHEDULE", "@" + choice.schedule_path);
     common_setenv_override("VBR_LAYER_SCHEDULE_FROM_POLICY", "1");
@@ -895,7 +880,7 @@ static double common_vbr_apply_policy_ladder(
     common_setenv_override("TURBO_VBR_LAYER_STRICT", "1");
     common_setenv_default("VBR_SCHEDULE_CTX", "8192");
     common_setenv_default("TURBO_VBR_SCHEDULE_CTX", "8192");
-    params.vbr_selected_family = choice.dynamic_policy ? "dynamic" : "static";
+    params.vbr_selected_family = "static";
     params.vbr_selected_policy = choice.name;
     params.vbr_selected_schedule = choice.schedule_path;
     params.vbr_selected_bpv = choice.bpv;
@@ -910,10 +895,9 @@ static double common_vbr_apply_policy_ladder(
     common_setenv_override("TURBO_VBR_SELECTED_KLD", std::to_string(params.vbr_selected_kld));
     common_setenv_override("VBR_SELECTED_SCHEDULE", params.vbr_selected_schedule);
     common_setenv_override("TURBO_VBR_SELECTED_SCHEDULE", params.vbr_selected_schedule);
-    LOG_INF("VBR policy selected: cap=%g, floor=%g, family=%s, selected=%s, bpv=%g, full_kld=%g, schedule=%s\n",
+    LOG_INF("VBR policy selected: cap=%g, floor=%g, family=static, selected=%s, bpv=%g, full_kld=%g, schedule=%s\n",
             cap_bits,
             min_bits,
-            choice.dynamic_policy ? "dynamic" : "static",
             choice.name.c_str(),
             choice.bpv,
             choice.full_kld,
@@ -946,6 +930,11 @@ static void common_params_postprocess_vbr(common_params & params) {
     params.vbr_min_bits = floor_name;
     params.vbr_min_bits_value = floor_bits;
     params.vbr_capacity_bits = floor_bits > 0.0 ? common_vbr_capacity_surrogate_bits(floor_bits) : 0.0;
+    // Env-consumption map for the VBR_* exports in this function: the RUNTIME reads exactly four —
+    // VBR_VMM + VBR_BUDGET_MIB (controller gate/budget; also set by the fit pass in auto mode),
+    // VBR_MIN_BITS (llama-kv-cache floor clamp) and VBR_MODE (dynamic fallback budget). Everything
+    // else (VBR_CAPACITY_BITS, VBR_VRAM_BUDGET, VBR_SELECTED_*, TURBO_* legacy twins) is
+    // EXPORT-ONLY telemetry for wrapper scripts — no in-process consumer.
     common_setenv_override("TURBO_VBR_MIN_BITS", floor_name);
     common_setenv_override("VBR_MIN_BITS", floor_name);
     common_setenv_override("TURBO_VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));

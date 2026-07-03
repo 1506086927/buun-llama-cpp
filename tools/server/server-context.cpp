@@ -5264,7 +5264,9 @@ void server_routes::init_routes() {
                 {"floor_bpv",         meta->vbr_min_bits},
                 {"requested_floor_bpv", meta->vbr_min_bits},
                 {"capacity_floor_bpv",  meta->vbr_capacity_bits},
-                {"realized_bpv",      meta->vbr_capacity_bits},
+                // realized bits/value is a fixed number only for static schedules; under the
+                // dynamic runtime controller it varies with occupancy — null, not a fiction
+                {"realized_bpv",      meta->vbr_dynamic ? json() : json(meta->vbr_capacity_bits)},
                 {"selected_family",    meta->vbr_selected_family},
                 {"selected_policy",    meta->vbr_selected_policy},
                 {"selected_bpv",       meta->vbr_selected_bpv},
@@ -5795,7 +5797,9 @@ json server_routes::get_model_info() const {
                 {"floor_bpv",         meta->vbr_min_bits},
                 {"requested_floor_bpv", meta->vbr_min_bits},
                 {"capacity_floor_bpv",  meta->vbr_capacity_bits},
-                {"realized_bpv",      meta->vbr_capacity_bits},
+                // realized bits/value is a fixed number only for static schedules; under the
+                // dynamic runtime controller it varies with occupancy — null, not a fiction
+                {"realized_bpv",      meta->vbr_dynamic ? json() : json(meta->vbr_capacity_bits)},
                 {"selected_family",    meta->vbr_selected_family},
                 {"selected_policy",    meta->vbr_selected_policy},
                 {"selected_bpv",       meta->vbr_selected_bpv},
