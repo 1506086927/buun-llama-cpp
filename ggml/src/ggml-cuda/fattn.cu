@@ -1415,7 +1415,9 @@ void vbr_dequant_turbo_to_f32(const char * src, ggml_type src_type, ggml_type ty
             break;
         case GGML_TYPE_TURBO1_TCQ:
             turbo1_tcq_load_cb_fattn();
-            // turbo1_tcq decodes per-row, FWHT applied inside the kernel → original domain.
+            // NOTE (post rotated-V, 2026-07-02): the STORED bits never changed — only the decode
+            // split moved (fused loader is LUT-only + graph un-rotates). This kernel still does
+            // LUT + inverse FWHT -> ORIGINAL domain, which is exactly this function's contract.
             k_turbo1_tcq_dequant_f16<<<grid, 128, 0, stream>>>(
                 src, scratch_f16, ne0, n_cells, 1, nb1, nb1, nb1, alpha, iv);
             break;
@@ -2161,10 +2163,23 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool turbo_matched = K->type == V->type && turbo_kv && K->type != GGML_TYPE_TURBO1 && K->type != GGML_TYPE_TURBO1_NSN && K->type != GGML_TYPE_TURBO1_CQ && K->type != GGML_TYPE_TURBO1_TCQ;
     const bool turbo1_tcq_matched = K->type == GGML_TYPE_TURBO1_TCQ && V->type == GGML_TYPE_TURBO1_TCQ &&
                                     (Q->ne[0] == 128 || Q->ne[0] == 256);
-    // Asymmetric fused "q6 sweet spot" (6.124 bpw): turbo8 K + turbo4 V. Only this pair is
-    // instantiated, and only at D=256 (dense Qwen geometry). Both stay WHT-rotated like the
-    // matched path (Q pre-rotated below, V un-rotated at graph level).
-    const bool turbo_fused_asym = K->type == GGML_TYPE_TURBO8_0 && V->type == GGML_TYPE_TURBO4_0 && Q->ne[0] == 256;
+    // Asymmetric fused pairs, D=256 only (dense Qwen geometry). Both sides stay WHT-rotated like
+    // the matched path (Q pre-rotated below, V un-rotated at graph level). The set = the q6 sweet
+    // spot (t8k/t4v) + every ADJACENT-TIER pair the dynamic VBR degrade ladder can create: the
+    // controller moves K and V of a layer independently but bands complete in order, so a live
+    // mixed layer only ever holds adjacent tiers. Uncovered pairs fall to the materialize path
+    // (measured -13-15% tg32 @ d8192), which band transits would sit in for thousands of tokens.
+    auto turbo_fused_asym_pair = [](ggml_type k, ggml_type v) {
+        return (k == GGML_TYPE_TURBO8_0   && v == GGML_TYPE_TURBO4_0)   ||
+               (k == GGML_TYPE_TURBO4_0   && v == GGML_TYPE_TURBO8_0)   ||
+               (k == GGML_TYPE_TURBO4_0   && v == GGML_TYPE_TURBO3_TCQ) ||
+               (k == GGML_TYPE_TURBO3_TCQ && v == GGML_TYPE_TURBO4_0)   ||
+               (k == GGML_TYPE_TURBO3_TCQ && v == GGML_TYPE_TURBO2_TCQ) ||
+               (k == GGML_TYPE_TURBO2_TCQ && v == GGML_TYPE_TURBO3_TCQ) ||
+               (k == GGML_TYPE_TURBO2_TCQ && v == GGML_TYPE_TURBO1_TCQ) ||
+               (k == GGML_TYPE_TURBO1_TCQ && v == GGML_TYPE_TURBO2_TCQ);
+    };
+    const bool turbo_fused_asym = turbo_fused_asym_pair(K->type, V->type) && Q->ne[0] == 256;
     if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) && Q->ne[1] <= 4 &&
         (Q->ne[0] == 128 || Q->ne[0] == 256) &&
         turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
@@ -2228,10 +2243,21 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             else \
                 ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, tK, tV>(ctx, dst); \
         }
-        // Asymmetric "q6 sweet spot" (6.124 bpw): turbo8 K + turbo4 V, D=256 only (no D=128 instance).
-        if (K->type == GGML_TYPE_TURBO8_0 && V->type == GGML_TYPE_TURBO4_0) {
-            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_TURBO8_0, GGML_TYPE_TURBO4_0>(ctx, dst);
+#define TURBO_FUSED_DISPATCH_ASYM(tK, tV) \
+        if (K->type == tK && V->type == tV) { \
+            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, tK, tV>(ctx, dst); \
         }
+        // Asymmetric pairs, D=256 only (no D=128 instances): the q6 sweet spot + the VBR
+        // adjacent-tier set (see turbo_fused_asym_pair above).
+        TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO4_0)
+        else TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO8_0)
+        else TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO3_TCQ)
+        else TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO4_0)
+        else TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO2_TCQ)
+        else TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO3_TCQ)
+        else TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO1_TCQ)
+        else TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO2_TCQ)
+#undef TURBO_FUSED_DISPATCH_ASYM
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
