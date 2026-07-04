@@ -426,6 +426,9 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 	float best_global_product = FLT_MAX;
 	float best_global_codebook[MAX_STATES];
 
+	const bool static_data = getenv("TCQ_STATIC_DATA") != nullptr;
+	float* h_batch = nullptr;
+
 	for (int restart = 0; restart < n_restarts; restart++) {
 		if (n_restarts > 1) printf("\n=== Restart %d/%d ===\n", restart+1, n_restarts);
 
@@ -473,8 +476,6 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 		// rewrite lost tcq_train_cuda.cu's block, regressing --seed to eval-queries-only
 		// and training to a fixed first-n_train subset). TCQ_STATIC_DATA=1 keeps the
 		// regressed static path as an explicit control arm.
-		static const bool static_data = getenv("TCQ_STATIC_DATA") != nullptr;
-		float* h_batch = nullptr;
 		if (h_real_data) {
 			if (static_data) {
 				CHECK_CUDA(cudaMemcpy(d_data, h_real_data, (size_t)n_train * T * sizeof(float), cudaMemcpyHostToDevice));
