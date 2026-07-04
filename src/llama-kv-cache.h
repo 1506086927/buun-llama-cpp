@@ -254,12 +254,17 @@ private:
         size_t    stash_off   = 0;              // offset into the f16 sink-stash buffer
         uint32_t  stash_valid = 0;              // rows captured (0 = not yet)
     };
+    // Multi-GPU (-sm layer): the KV cache spans one buffer per device — one vbr_pool per buffer.
+    // Extent vectors stay indexed by ikv in EVERY pool; only entries whose tensor lives in that
+    // pool's buffer are populated (byte_len == 0 elsewhere). With a single GPU there is exactly
+    // one pool and all logic reduces to the previous single-pool controller bit-for-bit.
     struct vbr_pool {
         bool                  enabled = false;
-        ggml_backend_buffer_t buf     = nullptr; // non-owning (lives in ctxs_bufs); single KV buffer
+        ggml_backend_buffer_t buf     = nullptr; // non-owning (lives in ctxs_bufs); one KV buffer
         char *                base    = nullptr; // ggml_backend_buffer_get_base(buf)
         size_t                size    = 0;        // total pool bytes
         size_t                used    = 0;        // high-water of placed extents
+        size_t                budget  = 0;         // per-pool share of vbr_budget_bytes_ (VA-size proportional)
         std::vector<vbr_extent> k;                // indexed by kv-cache layer id (ikv)
         std::vector<vbr_extent> v;
         // S2 (option C): VMM-backed pool — per-tensor fixed VA slots, physical pages mapped on
@@ -270,24 +275,26 @@ private:
         int      device      = -1;                // CUDA device backing the pool
         size_t   gran        = 0;                 // page granularity
         size_t   mapped_base = 0;                 // bytes mapped up front (rotation matrices)
+        // per-device transcode side stream (lazy) + S5 overlap state: transcodes run async on
+        // backend's stream; the next decode graph GPU-waits via the armed per-device fence
+        // (ggml_backend_cuda_vbr_fence_arm). Tail pages a transcode may still READ (rA extent >
+        // kept rB extent) can only be unmapped once it finishes — queue them and flush at the
+        // next decode boundary, when the wave is long done.
+        ggml_backend_t backend      = nullptr;
+        bool           wave_pending = false;      // async GPU work enqueued, fence not yet armed
+        std::vector<std::pair<size_t, size_t>> unmap_deferred; // {pool byte_off, len}
         // f16 sink-stash (VBR_STASH_ROWS env; 0 = off): pristine first-degrade snapshot of the
         // first N rows per tensor — permanently-hot sink rows re-encode from it at every hop
         ggml_backend_buffer_t stash_buf = nullptr;
-        uint32_t stash_rows = 0;
     };
     void vbr_vmm_ensure_mapped(); // grow physical backing to the current cell watermark
 
-    // S3/S4: decode-time degrade controller (VMM mode only)
+    // S3/S4: decode-time degrade controller (VMM mode only). The price order and its cursor stay
+    // GLOBAL (layer-global price order); each step resolves the pool that owns its tensor.
     std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, F16->t8 band first
     size_t         vbr_degrade_cursor_ = 0;
-    size_t         vbr_budget_bytes_   = 0;           // mapped-physical budget; 0 = no trigger
-    ggml_backend_t vbr_backend_        = nullptr;     // dedicated transcode backend (lazy; the side stream)
-    // S5 overlap: transcodes run async on vbr_backend_'s stream; the next decode graph GPU-waits
-    // via the armed fence (ggml_backend_cuda_vbr_fence_arm). Tail pages a transcode may still READ
-    // (rA extent > kept rB extent) can only be unmapped once it finishes — queue them and flush at
-    // the next decode boundary, when the wave is long done.
-    bool vbr_wave_pending_ = false;                   // async GPU work enqueued, fence not yet armed
-    std::vector<std::pair<size_t, size_t>> vbr_unmap_deferred_; // {pool byte_off, len}
+    size_t         vbr_budget_bytes_   = 0;           // global mapped-physical budget; 0 = no trigger
+    uint32_t       vbr_stash_rows_     = 0;           // sink-stash rows per (layer,side); 0 = off
     // --vbr-floor (env VBR_MIN_BITS): first order step the aggregate bits/value floor forbids;
     // the cursor never advances past it (default = order size, i.e. unclamped)
     size_t vbr_degrade_limit_ = (size_t) -1;
@@ -302,9 +309,13 @@ private:
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();
     void     vbr_flush_deferred_unmaps();
-    char *   vbr_stash_ensure();                      // lazy sink-stash buffer; returns base
+    char *   vbr_stash_ensure(vbr_pool & p);          // lazy per-pool sink-stash buffer; returns base
     void     vbr_load_degrade_order();                // baked table, or VBR_DEGRADE_ORDER=<file> override
-    size_t   vbr_vmm_projected_bytes(uint32_t wm_cells) const;
+    size_t   vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_cells) const;
+    bool     vbr_vmm_active() const;                  // any pool is VMM-backed
+    bool     vbr_over_budget(uint32_t wm_cells) const; // any VMM pool projected past its budget
+    vbr_pool *       vbr_pool_of(const ggml_tensor * t);       // pool owning the tensor (by buffer)
+    const vbr_pool * vbr_pool_of(const ggml_tensor * t) const;
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
     bool     vbr_degrade_next(uint32_t wm_next);      // one step down the order; false = exhausted
                                                       // wm_next = projected watermark incl. the
@@ -356,8 +367,9 @@ private:
 
     std::vector<kv_layer> layers;
 
-    // Dynamic VBR shared KV pool (M2 bookkeeping; M3 transcode/relocate)
-    vbr_pool vbr_pool_;
+    // Dynamic VBR shared KV pools (M2 bookkeeping; M3 transcode/relocate) — one per KV buffer
+    // (per device under -sm layer; exactly one on a single GPU)
+    std::vector<vbr_pool> vbr_pools_;
 
     // Permanent transcode oracle (env VBR_TRANSCODE_TEST): synthetic turbo8 A->A byte round-trip +
     // turbo8->turbo4 in-place-vs-separate identity, on a scoped CUDA backend. See definition.
