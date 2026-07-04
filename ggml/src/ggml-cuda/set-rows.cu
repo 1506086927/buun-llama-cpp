@@ -1486,6 +1486,17 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                     init_tcq_error_dump(ctx.device);
                 }
             }
+            {   // TURBO_TCQ_TIEHI tie-break probe (this TU's __device__ flag)
+                static bool tiehi_set[GGML_CUDA_MAX_DEVICES] = {};
+                if (!tiehi_set[ctx.device]) {
+                    tiehi_set[ctx.device] = true;
+                    static const int tiehi = getenv("TURBO_TCQ_TIEHI") ? 1 : 0;
+                    if (tiehi) {
+                        cudaMemcpyToSymbol(d_tcq_tiehi, &tiehi, sizeof(int));
+                        fprintf(stderr, "TCQ encode: tie-break probe ON (prefer-high predecessor)\n");
+                    }
+                }
+            }
         }
         // TCQ Viterbi encode: 512 threads per block. The TCQ3 backtrace stores
         // one predecessor for each 64-state low-bit group per step.

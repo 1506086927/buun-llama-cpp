@@ -58,6 +58,7 @@ extern float * turbo1_nsn_o_buf(int device, int is_k);
 static __device__ float   * d_tcq_dump_x_buf   = nullptr; // [max_groups][128] original values
 static __device__ uint8_t * d_tcq_dump_out_buf  = nullptr; // [max_groups][128] output symbols
 static __device__ int       d_tcq_dump_max      = 0;       // max groups to dump (0 = disabled)
+static __device__ int       d_tcq_tiehi         = 0;       // TURBO_TCQ_TIEHI tie-break probe
 
 // === Post-FWHT data extraction for empirical codebook computation ===
 // Enabled by TURBO_EXTRACT=<max_samples> env var (e.g. TURBO_EXTRACT=2000000)
@@ -1839,7 +1840,9 @@ static __global__ void __launch_bounds__(512, 2) k_set_rows_turbo3_tcq(
 #pragma unroll
             for (int p = 1; p < 8; p++) {
                 float c = cost_rd[base_prev | p];
-                if (c < best) {
+                // TURBO_TCQ_TIEHI: tie-break probe (Codex knob adjudication 2026-07-04) —
+                // on exact float ties prefer the HIGHEST predecessor instead of the lowest.
+                if (c < best || (d_tcq_tiehi && c == best)) {
                     best = c;
                     best_p = p;
                 }

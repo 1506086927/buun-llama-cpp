@@ -155,7 +155,14 @@ __global__ void k_viterbi_encode(
 
 // ============================================================================
 // Weighted centroid collection: accumulates w[t]*x and w[t] per state
+// Tail-weighted GLA (codebook-anatomy 2026-07-03: median-KLD winners minimize the error
+// TAIL, which plain GLA leaves free at convergence): samples whose |err| under the current
+// book exceeds d_tail_thresh get weight ×(1+d_tail_boost). Threshold set host-side each
+// iteration from the previous iteration's RMS (TCQ_TAIL_W / TCQ_TAIL_SIGMA envs).
 // ============================================================================
+__constant__ float d_tail_thresh = 1e30f;
+__constant__ float d_tail_boost  = 0.0f;
+
 __global__ void k_collect_centroids_weighted(
 	const float*   __restrict__ data,
 	const int16_t* __restrict__ states,
@@ -172,6 +179,9 @@ __global__ void k_collect_centroids_weighted(
 	int state = (int)(unsigned short)states[idx];
 	float val = data[idx];
 	float w = d_weights[t];
+	if (d_tail_boost > 0.0f && fabsf(val - d_codebook[state]) > d_tail_thresh) {
+		w *= 1.0f + d_tail_boost;
+	}
 
 	atomicAdd(&state_wsums[state], (double)(w * val));
 	atomicAdd(&state_waccum[state], (double)w);
@@ -542,6 +552,22 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 				pos_cv += (pm - pos_mean) * (pm - pos_mean);
 			}
 			pos_cv = sqrt(pos_cv / T) / pos_mean; // coefficient of variation
+
+			// tail-weighted GLA: threshold from this iteration's realized RMS (states were
+			// just computed under the current book, so d_codebook is coherent with d_states)
+			static float tail_boost = -1.0f, tail_sigma = 2.33f;
+			if (tail_boost < 0.0f) {
+				const char * te = getenv("TCQ_TAIL_W");
+				tail_boost = te ? (float)atof(te) : 0.0f;
+				const char * ts = getenv("TCQ_TAIL_SIGMA");
+				if (ts) tail_sigma = (float)atof(ts);
+				if (tail_boost > 0.0f) printf("tail-weighted GLA: boost=%.1f sigma=%.2f\n", tail_boost, tail_sigma);
+			}
+			if (tail_boost > 0.0f) {
+				float thr = tail_sigma * (float)sqrt(pos_mean);
+				CHECK_CUDA(cudaMemcpyToSymbol(d_tail_thresh, &thr, sizeof(float)));
+				CHECK_CUDA(cudaMemcpyToSymbol(d_tail_boost, &tail_boost, sizeof(float)));
+			}
 
 			// collect weighted centroids
 			CHECK_CUDA(cudaMemset(d_state_wsums, 0, N_STATES * sizeof(double)));
