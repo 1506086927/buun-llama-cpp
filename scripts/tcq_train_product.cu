@@ -263,6 +263,7 @@ __global__ void k_scale_queries(float* queries, int n_samples) {
 // Host code
 // ============================================================================
 
+static const float LM_1BIT[] = {-0.7979f, 0.7979f};
 static const float LM_2BIT[] = {-1.510f, -0.4528f, 0.4528f, 1.510f};
 static const float LM_3BIT[] = {-1.748f, -1.050f, -0.5006f, -0.06971f, 0.06971f, 0.5006f, 1.050f, 1.748f};
 
@@ -303,7 +304,7 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 	constexpr int N_STATES = 1 << L;
 	constexpr int N_GROUPS = 1 << (L - K);
 	const float sigma = 1.0f / sqrtf(128.0f);
-	const float* centroids = (K == 2) ? LM_2BIT : LM_3BIT;
+	const float* centroids = (K == 1) ? LM_1BIT : (K == 2) ? LM_2BIT : LM_3BIT;
 
 	if (output_dir) { mkdir(output_dir, 0755); printf("Output dir: %s\n", output_dir); }
 	if (constrain_mono) printf("Monotonicity constraint: ENABLED\n");
@@ -468,14 +469,32 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 		memcpy(best_codebook, h_codebook, N_STATES * sizeof(float));
 		int stall = 0;
 
-		// upload real data once before iteration loop
+		// Real data: seeded per-iteration resampling (restored 2026-07-04 — the product
+		// rewrite lost tcq_train_cuda.cu's block, regressing --seed to eval-queries-only
+		// and training to a fixed first-n_train subset). TCQ_STATIC_DATA=1 keeps the
+		// regressed static path as an explicit control arm.
+		static const bool static_data = getenv("TCQ_STATIC_DATA") != nullptr;
+		float* h_batch = nullptr;
 		if (h_real_data) {
-			CHECK_CUDA(cudaMemcpy(d_data, h_real_data, (size_t)n_train * T * sizeof(float), cudaMemcpyHostToDevice));
+			if (static_data) {
+				CHECK_CUDA(cudaMemcpy(d_data, h_real_data, (size_t)n_train * T * sizeof(float), cudaMemcpyHostToDevice));
+			} else if (!h_batch) {
+				h_batch = (float*)malloc((size_t)n_train * T * sizeof(float));
+			}
 		}
 
 		for (int iter = 0; iter < n_iters; iter++) {
 			CHECK_CUDA(cudaMemcpyToSymbol(d_codebook, h_codebook, N_STATES * sizeof(float)));
 
+			if (h_real_data && !static_data) {
+				// sample n_train blocks randomly from the full corpus (tcq_train_cuda.cu semantics)
+				srand(base_seed + restart * 10000 + iter);
+				for (int i = 0; i < n_train; i++) {
+					int idx = rand() % real_data_n;
+					memcpy(h_batch + (size_t)i * T, h_real_data + (size_t)idx * T, T * sizeof(float));
+				}
+				CHECK_CUDA(cudaMemcpy(d_data, h_batch, (size_t)n_train * T * sizeof(float), cudaMemcpyHostToDevice));
+			}
 			if (!h_real_data) {
 				// generate fresh synthetic K data
 				CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(gen, base_seed + restart * 10000 + iter));
@@ -796,6 +815,7 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 
 	// cleanup
 	if (h_real_data) free(h_real_data);
+	if (h_batch) free(h_batch);
 	free(h_codebook); free(h_mse); free(h_wsums); free(h_waccum);
 	free(h_counts); free(h_pos_mse); free(h_product_err);
 	free(h_eval_mse); free(h_eval_prod);
@@ -856,6 +876,10 @@ int main(int argc, char** argv) {
 
 	if (bits == 2) {
 		train<2, 8>(n_train, n_iters, n_restarts, mode, init_file, qweight_file, out_file, data_file, q_rank, seed, output_dir, constrain_mono);
+	} else if (bits == 1) {
+		// turbo1_tcq: k=1, L=8 -> 256 states, 2 outputs/state. Watch the used/balance
+		// diagnostics: 1-bit trellis training historically collapses if data scaling is off.
+		train<1, 8>(n_train, n_iters, n_restarts, mode, init_file, qweight_file, out_file, data_file, q_rank, seed, output_dir, constrain_mono);
 	} else if (bits == 3) {
 		train<3, 9>(n_train, n_iters, n_restarts, mode, init_file, qweight_file, out_file, data_file, q_rank, seed, output_dir, constrain_mono);
 	} else {
