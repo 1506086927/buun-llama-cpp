@@ -653,7 +653,7 @@ void train(int n_train, int n_iters, int n_restarts, TrainMode mode,
 				save_codebook(h_codebook, N_STATES, fname);
 			}
 
-			if (stall >= 10 && iter > 20) {
+			if (stall >= 10 && iter > 20 && !output_dir) {  // checkpointing runs ALL iters (June fix: median improves past train-MSE stalls)
 				printf("  Converged (10 iters without improvement)\n");
 				break;
 			}
