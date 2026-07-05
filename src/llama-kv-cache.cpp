@@ -83,7 +83,6 @@ static bool ggml_type_is_turbo_tcq(enum ggml_type t) {
 static bool ggml_type_is_turbo(enum ggml_type t) {
     return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
            t == GGML_TYPE_TURBO8_0 || t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ ||
-           t == GGML_TYPE_TURBO1 || t == GGML_TYPE_TURBO1_NSN || t == GGML_TYPE_TURBO1_CQ ||
            t == GGML_TYPE_TURBO1_TCQ;
 }
 
@@ -2329,8 +2328,46 @@ void llama_kv_cache::vbr_flush_deferred_unmaps() {
     }
 }
 
+// Generic degrade-rank curves for models WITHOUT a baked order (matrix v3, 2026-07-05).
+// Derived by averaging the five measured models' cheap-first price orders (q27, qwen35moe,
+// g12, g26, g31 — dense, MoE-hybrid and SWA-mixed layouts) in NORMALIZED KV-layer position.
+// What generalized: the fp16->t8 band is near-universal (deep-first, front protected, K~V;
+// cross-model rank deviation 0.036); below t8 the robust invariants are final-layer V
+// maximally protected in EVERY band, front V cheapest at the bottom rungs, K positionally
+// flat. Sub-t8 mid-band shapes disagree across models (deviation ~0.2) — the mean is a
+// hedge, not a truth; a measured per-model order is always better.
+// [band][is_v][grid p=0..1 step 1/16]; lower value = degrade earlier.
+static const float vbr_generic_rank[5][2][17] = {
+    { // fp16-t8
+        { 0.95f, 0.82f, 0.83f, 0.82f, 0.78f, 0.71f, 0.63f, 0.55f, 0.52f, 0.51f, 0.39f, 0.32f, 0.26f, 0.19f, 0.13f, 0.08f, 0.00f },
+        { 0.92f, 0.94f, 0.83f, 0.80f, 0.79f, 0.71f, 0.62f, 0.54f, 0.48f, 0.45f, 0.39f, 0.32f, 0.24f, 0.21f, 0.14f, 0.08f, 0.02f },
+    },
+    { // t8-t4
+        { 0.62f, 0.66f, 0.61f, 0.54f, 0.77f, 0.66f, 0.47f, 0.58f, 0.46f, 0.48f, 0.40f, 0.46f, 0.35f, 0.41f, 0.42f, 0.44f, 0.53f },
+        { 0.49f, 0.37f, 0.58f, 0.50f, 0.56f, 0.41f, 0.48f, 0.47f, 0.38f, 0.33f, 0.35f, 0.44f, 0.36f, 0.41f, 0.31f, 0.53f, 1.00f },
+    },
+    { // t4-t3tcq
+        { 0.54f, 0.40f, 0.53f, 0.49f, 0.49f, 0.45f, 0.44f, 0.54f, 0.56f, 0.52f, 0.53f, 0.60f, 0.52f, 0.54f, 0.55f, 0.54f, 0.50f },
+        { 0.35f, 0.42f, 0.32f, 0.53f, 0.54f, 0.43f, 0.50f, 0.48f, 0.44f, 0.42f, 0.41f, 0.49f, 0.50f, 0.56f, 0.43f, 0.64f, 0.93f },
+    },
+    { // t3tcq-t2tcq
+        { 0.28f, 0.35f, 0.42f, 0.44f, 0.60f, 0.53f, 0.48f, 0.46f, 0.54f, 0.61f, 0.62f, 0.57f, 0.53f, 0.60f, 0.69f, 0.60f, 0.71f },
+        { 0.16f, 0.14f, 0.19f, 0.46f, 0.51f, 0.53f, 0.47f, 0.57f, 0.41f, 0.44f, 0.44f, 0.45f, 0.48f, 0.57f, 0.47f, 0.69f, 1.00f },
+    },
+    { // t2tcq-t1tcq
+        { 0.46f, 0.32f, 0.36f, 0.36f, 0.62f, 0.48f, 0.49f, 0.58f, 0.64f, 0.57f, 0.58f, 0.67f, 0.54f, 0.56f, 0.63f, 0.63f, 0.73f },
+        { 0.12f, 0.18f, 0.24f, 0.36f, 0.33f, 0.40f, 0.39f, 0.32f, 0.45f, 0.39f, 0.48f, 0.56f, 0.55f, 0.46f, 0.62f, 0.73f, 0.99f },
+    },
+};
+
 void llama_kv_cache::vbr_load_degrade_order() {
     vbr_degrade_order_.clear();
+    // VBR_FORCE_GENERIC=1: skip the file/registry paths — A/B instrument for the generic
+    // curves, and exactly the path an unsupported arch takes.
+    if (getenv("VBR_FORCE_GENERIC") != nullptr) {
+        vbr_synth_generic_order();
+        return;
+    }
     if (const char * path = getenv("VBR_DEGRADE_ORDER")) {
         std::ifstream f(path);
         std::string tok;
@@ -2375,8 +2412,52 @@ void llama_kv_cache::vbr_load_degrade_order() {
             return;
         }
     }
-    LLAMA_LOG_WARN("%s: no baked VBR degrade order for this arch/n_layer — "
-            "set VBR_DEGRADE_ORDER=<file> for this model\n", __func__);
+    LLAMA_LOG_WARN("%s: no measured VBR degrade order for this arch/n_layer — "
+            "using the generic cross-model order (a measured per-model order is better; "
+            "set VBR_DEGRADE_ORDER=<file> to supply one)\n", __func__);
+    vbr_synth_generic_order();
+}
+
+// Synthesize a degrade order from the generic curves: strictly banded (the whole cache
+// reaches tier N before any unit drops below it — the safe monotone default when real
+// per-model prices are unknown), and within each band cells sorted cheap-first by the
+// curve rank at the layer's normalized position among this model's KV-BEARING layers
+// (MoE/hybrid layouts: only layers that hold KV count, matching how the curves were fit).
+void llama_kv_cache::vbr_synth_generic_order() {
+    std::vector<uint32_t> ils;
+    for (const auto & l : layers) {
+        ils.push_back(l.il);
+    }
+    std::sort(ils.begin(), ils.end());
+    const size_t n = ils.size();
+    if (n == 0) {
+        return;
+    }
+    static const uint8_t band_tier[5] = {
+        VBR_TIER_T8, VBR_TIER_T4, VBR_TIER_T3_TCQ, VBR_TIER_T2_TCQ, VBR_TIER_T1_TCQ,
+    };
+    for (int band = 0; band < 5; ++band) {
+        std::vector<std::pair<float, uint16_t>> cells; // rank, (i<<1)|is_v
+        cells.reserve(n * 2);
+        for (size_t i = 0; i < n; ++i) {
+            const float x  = n > 1 ? 16.0f * (float) i / (float) (n - 1) : 0.0f;
+            const int   i0 = std::min((int) x, 15);
+            const float fr = x - (float) i0;
+            for (int is_v = 0; is_v < 2; ++is_v) {
+                const float r = vbr_generic_rank[band][is_v][i0] * (1.0f - fr)
+                              + vbr_generic_rank[band][is_v][i0 + 1] * fr;
+                cells.push_back({ r, (uint16_t) ((i << 1) | is_v) });
+            }
+        }
+        std::stable_sort(cells.begin(), cells.end(),
+                [](const auto & a, const auto & b) { return a.first < b.first; });
+        for (const auto & c : cells) {
+            vbr_degrade_order_.push_back({ (uint8_t) ils[c.second >> 1],
+                                           (uint8_t) (c.second & 1), band_tier[band] });
+        }
+    }
+    LLAMA_LOG_INFO("%s: VBR degrade order: %zu generic steps (cross-model curves, %zu KV layers)\n",
+            __func__, vbr_degrade_order_.size(), n);
 }
 
 // --vbr-floor (env VBR_MIN_BITS, decimal bits/value): a LITERAL aggregate floor. Walk the order

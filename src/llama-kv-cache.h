@@ -310,7 +310,8 @@ private:
     void     vbr_floor_clamp_order();
     void     vbr_flush_deferred_unmaps();
     char *   vbr_stash_ensure(vbr_pool & p);          // lazy per-pool sink-stash buffer; returns base
-    void     vbr_load_degrade_order();                // baked table, or VBR_DEGRADE_ORDER=<file> override
+    void     vbr_load_degrade_order();                // baked table, VBR_DEGRADE_ORDER=<file>, or generic fallback
+    void     vbr_synth_generic_order();               // cross-model curves for unsupported archs (VBR_FORCE_GENERIC=1 to force)
     size_t   vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_cells) const;
     bool     vbr_vmm_active() const;                  // any pool is VMM-backed
     bool     vbr_over_budget(uint32_t wm_cells) const; // any VMM pool projected past its budget
