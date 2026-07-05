@@ -435,9 +435,9 @@ extern "C" {
         GGML_TYPE_TURBO3_TCQ = 45, // TurboQuant 3-bit KV cache: TCQ (Trellis-Coded Quantization)
         GGML_TYPE_TURBO2_TCQ = 46, // TurboQuant 2-bit KV cache: TCQ (k=2, L=8, 256 states)
         GGML_TYPE_TURBO8_0 = 47, // TurboQuant 8-bit KV cache: FWHT + uniform 256-level grid + per-block absmax, no QJL
-        GGML_TYPE_TURBO1   = 48, // TurboQuant 1-bit KV cache: FWHT + sign + per-group fp16 scale
-        GGML_TYPE_TURBO1_NSN = 49, // turbo1 + NSNQuant double-norm + per-chunk per-head centering (1.25 bpw)
-        GGML_TYPE_TURBO1_CQ = 50, // turbo1 Coupled-Quant: FWHT + per-8ch 256-codeword VQ (1.125 bpw)
+        GGML_TYPE_TURBO1   = 48, // RESERVED (codec removed 2026-07-05; slot kept for gguf type-id stability)
+        GGML_TYPE_TURBO1_NSN = 49, // RESERVED (codec removed 2026-07-05)
+        GGML_TYPE_TURBO1_CQ = 50, // RESERVED (codec removed 2026-07-05)
         GGML_TYPE_TURBO1_TCQ = 51, // turbo1 Trellis-Coded: FWHT + k=1/L=8 trellis, separate K/V 256-state codebooks (1.25 bpw)
         GGML_TYPE_COUNT   = 52,
     };

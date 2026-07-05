@@ -347,6 +347,9 @@ typedef struct {
 } block_turbo8_0;                       // 130 bytes total
 static_assert(sizeof(block_turbo8_0) == sizeof(ggml_half) + QK_TURBO8, "wrong turbo8_0 block size/padding");
 
+// --- RESERVED layouts (turbo1 / turbo1_nsn / turbo1_cq codecs removed 2026-07-05) ---
+// The structs stay so the reserved enum slots keep well-defined type_traits metadata;
+// no encode/decode paths reference them anymore.
 // TurboQuant 1-bit: FWHT + sign + per-group fp16 scale. recon_t = sign_t * d.
 // Per block: d(fp16) + 128 sign bits (16 bytes)
 // = 18 bytes per 128 values = 1.125 bits/value.
@@ -381,7 +384,7 @@ static_assert(sizeof(block_turbo1_cq) == sizeof(ggml_half) + QK_TURBO1_CQ/8, "wr
 // turbo1_tcq: 1-bit Trellis-Coded Quantization (right-shift bitshift trellis, k=1, L=8, 256 states).
 // One block = one 128-element FWHT-rotated group. Bitstream: 7 init-prefix + 128x1-bit outputs = 135 bits = 17 bytes.
 // Decode: state_t = read_8_bits(qs, t*1), recon_t = codebook[state_t] * norm, then per-row inverse FWHT
-// (same materialize path as turbo1_cq). Separate K/V codebooks. = 20 bytes / 128 = 1.25 bits/value.
+// (materialize path). Separate K/V codebooks. = 20 bytes / 128 = 1.25 bits/value.
 #define QK_TURBO1_TCQ 128
 typedef struct {
     ggml_half  norm;                    //  2 bytes: corrected group L2 norm

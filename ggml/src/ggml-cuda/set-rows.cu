@@ -267,78 +267,7 @@ static void set_rows_cuda_quant(
     }
 }
 
-// === TURBO1_NSN: runtime per-chunk per-head centering buffer (shared encode<->decode) ===
-// SINGLE instance per device + K/V, defined here (set-rows.cu), read by fattn.cu via the extern
-// decl in turbo-quant-cuda.cuh. Sized [PFHEAD_MAX_L layers][PFHEAD_MAX_C channels]; o[layer][i00+j]
-// = mean over the token chunk of the token-normalized vn for that head's channel.
-float * turbo1_nsn_o_buf(int device, int is_k) {
-    static float * bk[16] = {};
-    static float * bv[16] = {};
-    if (device < 0 || device >= 16) return nullptr;
-    float ** b = is_k ? bk : bv;
-    if (!b[device]) {
-        CUDA_CHECK(cudaMalloc(&b[device], (size_t) PFHEAD_MAX_L * PFHEAD_MAX_C * sizeof(float)));
-        CUDA_CHECK(cudaMemset(b[device], 0, (size_t) PFHEAD_MAX_L * PFHEAD_MAX_C * sizeof(float)));
-    }
-    return b[device];
-}
 
-// Pass 1: per-(head,channel) mean o over the token chunk, on token-normalized vectors.
-// grid.x = n_heads (ne00/128), block = 128 threads (channel within head).
-static __global__ void k_turbo1_nsn_reduce_o(
-        const float * __restrict__ src0, float * __restrict__ o_out,
-        const int64_t ne01, const int64_t ne02, const int64_t ne03,
-        const int64_t s01, const int64_t s02, const int64_t s03) {
-    const int head = blockIdx.x;
-    const int tid  = threadIdx.x;
-    const int c    = head * 128 + tid;
-    __shared__ float sh[128];
-    float accum = 0.0f;
-    int64_t cnt = 0;
-    for (int64_t i3 = 0; i3 < ne03; i3++)
-    for (int64_t i2 = 0; i2 < ne02; i2++)
-    for (int64_t i1 = 0; i1 < ne01; i1++) {
-        const float * row = src0 + i1*s01 + i2*s02 + i3*s03;
-        const float v = row[c];
-        sh[tid] = v * v;
-        __syncthreads();
-        for (int s = 64; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; __syncthreads(); }
-        const float norm = sqrtf(sh[0]);
-        __syncthreads();
-        const float inv = norm > 1e-12f ? 1.0f / norm : 0.0f;
-        accum += v * 11.31370849898476f * inv; // vn = v * sqrt(128) / ||v_head||
-        cnt++;
-    }
-    o_out[c] = cnt > 0 ? accum / (float) cnt : 0.0f;
-}
-
-// Pass 2: quantize each 128-block using o (mirrors k_set_rows_quant index math).
-template<typename idx_t>
-static __global__ void k_set_rows_turbo1_nsn(
-        const float * __restrict__ src0, const idx_t * __restrict__ src1, block_turbo1_nsn * __restrict__ dst,
-        const int64_t ne_total, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t s10, const int64_t s11, const int64_t s12, const int64_t s1, const int64_t s2, const int64_t s3,
-        const uint3 ne00, const uint3 ne01, const uint3 ne02, const uint3 ne11_fd, const uint3 ne12_fd,
-        const float * __restrict__ o_layer) {
-    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
-    if (i >= ne_total) return;
-    const int64_t i_base = i * 128;
-    uint32_t tmp = (uint32_t) i_base;
-    uint2 dm;
-    dm = fast_div_modulo(tmp, ne00); const int64_t i00 = dm.y; tmp = dm.x;
-    dm = fast_div_modulo(tmp, ne01); const int64_t i01 = dm.y; tmp = dm.x;
-    dm = fast_div_modulo(tmp, ne02); const int64_t i02 = dm.y; const int64_t i03 = dm.x;
-    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
-    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
-    const int64_t i10 = i01;
-    ggml_cuda_pdl_sync();
-    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
-    const float * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
-    block_turbo1_nsn * dst_row_ptr = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_turbo1_nsn);
-    const float * src_block = src0_row + i00;
-    block_turbo1_nsn * dst_block = dst_row_ptr + i00 / 128;
-    quantize_f32_turbo1_nsn_block(src_block, dst_block, o_layer + i00);
-}
 
 // Affine-tap mean vector for a turbo4/turbo8 set_rows dst (per-layer slice of the K or V mean
 // table, selected by cache_k_/cache_v_ name). Returns nullptr (no tap) unless the dst is a
@@ -1456,50 +1385,6 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_turbo8_0*)dst->data,
             ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
             nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream, turbo_tap_mu(ctx, dst, ne00));
-    } else if (dst->type == GGML_TYPE_TURBO1) {
-        turbo1_set_scale_mode_from_env();
-        turbo1_set_is_k(strncmp(dst->name, "cache_k_l", 9) == 0 ? 1 : 0);
-        set_rows_cuda_quant<idx_t, block_turbo1, QK_TURBO1, quantize_f32_turbo1_block>(
-            src0_d, src1_d, (block_turbo1*)dst->data,
-            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
-            nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream, turbo_tap_mu(ctx, dst, ne00));
-    } else if (dst->type == GGML_TYPE_TURBO1_CQ) {
-        turbo1_set_scale_mode_from_env();
-        turbo1_set_is_k(strncmp(dst->name, "cache_k_l", 9) == 0 ? 1 : 0);
-        set_rows_cuda_quant<idx_t, block_turbo1_cq, QK_TURBO1_CQ, quantize_f32_turbo1_cq_block>(
-            src0_d, src1_d, (block_turbo1_cq*)dst->data,
-            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
-            nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream, nullptr);
-    } else if (dst->type == GGML_TYPE_TURBO1_NSN) {
-        GGML_ASSERT(ne00 % QK_TURBO1_NSN == 0);
-        turbo1_set_scale_mode_from_env();
-        const bool is_k = strncmp(dst->name, "cache_k_l", 9) == 0;
-        turbo1_set_is_k(is_k ? 1 : 0);
-        const int pf_layer = (is_k || strncmp(dst->name, "cache_v_l", 9) == 0) ? atoi(dst->name + 9) : 0;
-        float * o_buf = turbo1_nsn_o_buf(ctx.device, is_k ? 1 : 0);
-        float * o_layer = (o_buf && pf_layer >= 0 && pf_layer < PFHEAD_MAX_L && ne00 <= PFHEAD_MAX_C)
-                          ? o_buf + (size_t) pf_layer * PFHEAD_MAX_C : nullptr;
-        const int64_t s01 = nb01/sizeof(float), s02 = nb02/sizeof(float), s03 = nb03/sizeof(float);
-        const int64_t s10 = nb10/sizeof(idx_t), s11 = nb11/sizeof(idx_t), s12 = nb12/sizeof(idx_t);
-        if (o_layer) {
-            // Pass 1: per-(head,channel) mean over the token chunk (token-normalized).
-            k_turbo1_nsn_reduce_o<<<(int)(ne00 / 128), 128, 0, stream>>>(
-                src0_d, o_layer, ne01, ne02, ne03, s01, s02, s03);
-        }
-        // Pass 2: quantize each block using o (same stream → ordered after pass 1).
-        const int64_t ne_total = (ne00 * ne01 * ne02 * ne03) / QK_TURBO1_NSN;
-        const int num_blocks = (int)((ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE);
-        const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
-        const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
-        const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
-        const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
-        const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
-        if (ne_total > 0 && o_layer) {
-            k_set_rows_turbo1_nsn<idx_t><<<num_blocks, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
-                src0_d, src1_d, (block_turbo1_nsn*)dst->data, ne_total,
-                s01, s02, s03, s10, s11, s12, (int64_t) nb1, (int64_t) nb2, (int64_t) nb3,
-                ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd, o_layer);
-        }
     } else if (dst->type == GGML_TYPE_TURBO3_TCQ) {
         GGML_ASSERT(ne00 % QK_TURBO3_TCQ == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO3_TCQ;
@@ -1729,7 +1614,7 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 
     // Post-rotation extraction: thread-safe one-time init
-    if (h_extract_state == 0 && (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO8_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ || dst->type == GGML_TYPE_TURBO1 || dst->type == GGML_TYPE_TURBO1_NSN || dst->type == GGML_TYPE_TURBO1_CQ || dst->type == GGML_TYPE_TURBO1_TCQ)) {
+    if (h_extract_state == 0 && (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO8_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ || dst->type == GGML_TYPE_TURBO1_TCQ)) {
         std::call_once(h_extract_init_flag, []() {
             const char * env = getenv("TURBO_EXTRACT");
             if (env && atoi(env) > 0) {
@@ -1745,10 +1630,10 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         turbo_extract_check_done();
     }
 
-    // InnerQ: one-time init on first turbo SET_ROWS call. turbo1 must be here too: its K
+    // InnerQ: one-time init on first turbo SET_ROWS call. turbo1_tcq must be here too: its K
     // inverse-FWHT decode multiplies by d_innerq_channel_scale_inv_fattn, which stays
     // zero-initialized (→ K decoded as all-zeros) unless turbo_innerq_init() uploads identity.
-    if (innerq_state == 0 && (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO8_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ || dst->type == GGML_TYPE_TURBO1 || dst->type == GGML_TYPE_TURBO1_NSN || dst->type == GGML_TYPE_TURBO1_CQ || dst->type == GGML_TYPE_TURBO1_TCQ)) {
+    if (innerq_state == 0 && (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO8_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ || dst->type == GGML_TYPE_TURBO1_TCQ)) {
         static const char * env = getenv("TURBO_INNERQ");
         if (env && atoi(env) > 0) {
             turbo_innerq_init();

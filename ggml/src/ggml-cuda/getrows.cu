@@ -235,20 +235,8 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK_TURBO8, QR_TURBO8_0, dequantize_turbo8_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
-        case GGML_TYPE_TURBO1:
-            get_rows_cuda_q<QK_TURBO1, QR_TURBO1, dequantize_turbo1>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TURBO1_CQ:
-            get_rows_cuda_q<QK_TURBO1_CQ, QR_TURBO1_CQ, dequantize_turbo1_cq>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
         case GGML_TYPE_TURBO1_TCQ:
             get_rows_cuda_q<QK_TURBO1_TCQ, QR_TURBO1_TCQ, dequantize_turbo1_tcq>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
-        case GGML_TYPE_TURBO1_NSN:
-            get_rows_cuda_q<QK_TURBO1_NSN, QR_TURBO1_NSN, dequantize_turbo1_nsn>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_TURBO3_TCQ:

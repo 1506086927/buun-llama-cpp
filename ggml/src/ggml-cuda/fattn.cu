@@ -11,39 +11,6 @@
 #include <sys/stat.h>
 #include <vector>
 
-#include "turbo1_cq_codebook.h"   // macro TURBO1_CQ_CB_INIT (256x8 codebook)
-static __constant__ float d_turbo1_cq_cb_fattn[256*8] = TURBO1_CQ_CB_INIT;
-
-// turbo1_nsn per-chunk per-head centering buffer (defined in set-rows.cu) + table dims.
-extern float * turbo1_nsn_o_buf(int device, int is_k);
-#ifndef PFHEAD_MAX_L
-#define PFHEAD_MAX_L 128
-#define PFHEAD_MAX_C 2048
-#endif
-
-// E6 subtractive dither (decode side). MUST match set-rows.cu encode exactly (same TPDF, same
-// block-address seed). Constants set once from TURBO1_DITHER env.
-static __constant__ int   d_turbo1_dither_fattn;
-static __constant__ float d_turbo1_dither_w_fattn;
-static __device__ __forceinline__ float turbo1_tpdf_fattn(unsigned long long seed, int j, float w) {
-    unsigned long long s = seed + (unsigned long long)(j + 1) * 0x9E3779B97F4A7C15ULL;
-    s = (s ^ (s >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    s = (s ^ (s >> 27)) * 0x94D049BB133111EBULL;
-    s =  s ^ (s >> 31);
-    float u1 = (float)(unsigned int)(s & 0xFFFFFFFFu) * (1.0f / 4294967296.0f);
-    float u2 = (float)(unsigned int)(s >> 32)         * (1.0f / 4294967296.0f);
-    return (u1 + u2 - 1.0f) * w;
-}
-static void turbo1_load_dither_fattn() {
-    static bool done = false;
-    if (done) return;
-    done = true;
-    const char * dz = getenv("TURBO1_DITHER");
-    float dw = dz ? (float)atof(dz) : 0.0f;
-    int don = dw > 0.0f ? 1 : 0;
-    cudaMemcpyToSymbol(d_turbo1_dither_fattn, &don, sizeof(int));
-    cudaMemcpyToSymbol(d_turbo1_dither_w_fattn, &dw, sizeof(float));
-}
 
 // InnerQ: update the fattn-side inverse scale array from host (all devices)
 void turbo_innerq_update_fattn_scales(const float * scale_inv) {
@@ -846,145 +813,8 @@ static __global__ void k_turbo8_dequant_f16_inv_fwht(
     }
 }
 
-// turbo1 V dequant: sign * scale in the rotated domain. The graph applies the
-// inverse FWHT on the attention output (V is stored rotated), so no rotation here.
-static __global__ void k_turbo1_dequant_f16(
-        const char * __restrict__ src, half * __restrict__ dst,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2,
-        const size_t nb1, const size_t nb2, const size_t nb3) {
-    const int64_t row  = blockIdx.x;
-    const int64_t head = blockIdx.y;
-    const int64_t strm = blockIdx.z;
-    const int j = threadIdx.x;
-    if (j >= ne0) return;
 
-    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
-    const int blk_idx  = j / QK_TURBO1;
-    const int j_in_blk = j % QK_TURBO1;
-    const block_turbo1 * blk = (const block_turbo1 *)src_row + blk_idx;
 
-    const float d = __half2float(blk->d);
-    const uint8_t bit = (blk->qs[j_in_blk >> 3] >> (j_in_blk & 7)) & 1u;
-    const float val = bit ? -d : d;
-
-    dst[strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0 + j] = __float2half(val);
-}
-
-// turbo1 K dequant with inverse FWHT: produces K in original (unrotated) domain
-// so Q does NOT need pre-rotation. 128 threads per block, loops over 128-element groups.
-static __global__ void k_turbo1_dequant_f16_inv_fwht(
-        const char * __restrict__ src, half * __restrict__ dst,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2,
-        const size_t nb1, const size_t nb2, const size_t nb3) {
-    const int64_t row  = blockIdx.x;
-    const int64_t head = blockIdx.y;
-    const int64_t strm = blockIdx.z;
-    const int tid = threadIdx.x;
-
-    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
-    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
-
-    __shared__ float smem[128];
-
-    const float * s1 = d_turbo_wht_signs1_fattn;
-    const float * s2 = d_turbo_wht_signs2_fattn;
-    constexpr float inv_sqrt_128 = 0.08838834764831845f;
-
-    const int n_blocks = (int)(ne0 / QK_TURBO1);
-
-    for (int blk_idx = 0; blk_idx < n_blocks; blk_idx++) {
-        const block_turbo1 * blk = (const block_turbo1 *)src_row + blk_idx;
-        const float d = __half2float(blk->d);
-        const uint8_t bit = (blk->qs[tid >> 3] >> (tid & 7)) & 1u;
-        float recon = bit ? -d : d;
-        if (d_turbo1_dither_fattn) {
-            // Subtractive: recon = d*(q - u), q=+-1, u = same TPDF as encode (block-address seed).
-            const float qv = bit ? -1.0f : 1.0f;
-            const float u  = turbo1_tpdf_fattn((unsigned long long)(unsigned long)blk, tid, d_turbo1_dither_w_fattn);
-            recon = d * (qv - u);
-        }
-
-        float val = fwht128_butterfly_inplace(recon * s2[tid], smem);
-
-        val = val * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid];
-        fwht128_store_half(val, dst + dst_base + blk_idx * 128);
-        __syncthreads();
-    }
-}
-
-// turbo1_nsn dequant: per-row inverse FWHT to original domain + NSNQuant un-normalize/un-center.
-// v = s1 * (s2 * sqrt(128) * invFWHT(sign*sigma) + o[layer][head*ne0 + blk*128 + tid]).
-// Used for BOTH K and V (both decode to original domain — no graph un-rotation). o_layer = the
-// per-(layer) slice of the per-chunk per-head mean buffer (selected K vs V by the caller).
-static __global__ void k_turbo1_nsn_dequant_f16(
-        const char * __restrict__ src, half * __restrict__ dst,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2,
-        const size_t nb1, const size_t nb2, const size_t nb3,
-        const float * __restrict__ o_layer) {
-    const int64_t row  = blockIdx.x;
-    const int64_t head = blockIdx.y;
-    const int64_t strm = blockIdx.z;
-    const int tid = threadIdx.x;
-
-    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
-    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
-
-    __shared__ float smem[128];
-    const float * s1a = d_turbo_wht_signs1_fattn;
-    const float * s2a = d_turbo_wht_signs2_fattn;
-    constexpr float inv_sqrt_128 = 0.08838834764831845f; // sigma
-    constexpr float sqrt_128 = 11.31370849898476f;
-    const int n_blocks = (int)(ne0 / QK_TURBO1_NSN);
-
-    for (int blk_idx = 0; blk_idx < n_blocks; blk_idx++) {
-        const block_turbo1_nsn * blk = (const block_turbo1_nsn *)src_row + blk_idx;
-        const float bs1 = __half2float(blk->s1);
-        const float bs2 = __half2float(blk->s2);
-        const uint8_t bit = (blk->qs[tid >> 3] >> (tid & 7)) & 1u;
-        const float recon = bit ? -inv_sqrt_128 : inv_sqrt_128; // sign * sigma
-
-        float val = fwht128_butterfly_inplace(recon * s2a[tid], smem);
-        // x_recon[tid] = invFWHT(sign*sigma)
-        const float x_recon = val * inv_sqrt_128 * s1a[tid] * d_innerq_channel_scale_inv_fattn[tid];
-        const float o = o_layer ? o_layer[head * ne0 + blk_idx * 128 + tid] : 0.0f;
-        const float v_out = bs1 * (bs2 * sqrt_128 * x_recon + o);
-        fwht128_store_half(v_out, dst + dst_base + blk_idx * 128);
-        __syncthreads();
-    }
-}
-
-// turbo1_cq dequant: per-row inverse FWHT of codebook reconstruction → original domain (K and V).
-// recon_rotated[tid] = d * codebook[qs[tid/8]][tid%8], then inverse FWHT.
-static __global__ void k_turbo1_cq_dequant_f16(
-        const char * __restrict__ src, half * __restrict__ dst,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2,
-        const size_t nb1, const size_t nb2, const size_t nb3) {
-    const int64_t row  = blockIdx.x;
-    const int64_t head = blockIdx.y;
-    const int64_t strm = blockIdx.z;
-    const int tid = threadIdx.x;
-
-    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
-    const int64_t dst_base = strm * (ne1 * ne2 * ne0) + row * (ne2 * ne0) + head * ne0;
-
-    __shared__ float smem[128];
-    const float * s1 = d_turbo_wht_signs1_fattn;
-    const float * s2 = d_turbo_wht_signs2_fattn;
-    constexpr float inv_sqrt_128 = 0.08838834764831845f;
-    const int n_blocks = (int)(ne0 / QK_TURBO1_CQ);
-
-    for (int blk_idx = 0; blk_idx < n_blocks; blk_idx++) {
-        const block_turbo1_cq * blk = (const block_turbo1_cq *)src_row + blk_idx;
-        const float d = __half2float(blk->d);
-        const int g = tid >> 3, k = tid & 7;
-        const float recon = d * d_turbo1_cq_cb_fattn[(int)blk->qs[g] * 8 + k];
-
-        float val = fwht128_butterfly_inplace(recon * s2[tid], smem);
-        val = val * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid];
-        fwht128_store_half(val, dst + dst_base + blk_idx * 128);
-        __syncthreads();
-    }
-}
 
 // turbo1_tcq decode codebooks (256-state, separate K/V). Cold-start = turbo2_tcq decode anchor;
 // TURBO1_TCQ_CB_K / _V (?? TURBO1_TCQ_CB) override. MUST match the encode-side symbols.
@@ -1450,8 +1280,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    const bool turbo_k = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1 || K->type == GGML_TYPE_TURBO1_NSN || K->type == GGML_TYPE_TURBO1_CQ || K->type == GGML_TYPE_TURBO1_TCQ;
-    const bool turbo_v = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1 || V->type == GGML_TYPE_TURBO1_NSN || V->type == GGML_TYPE_TURBO1_CQ || V->type == GGML_TYPE_TURBO1_TCQ;
+    const bool turbo_k = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1_TCQ;
+    const bool turbo_v = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1_TCQ;
     // Mixed (asymmetric) K/V: a q8_0 side must be dequanted to f16 here too, otherwise the raw
     // q8_0 bytes are handed to the f16-only MMA kernel below and read as f16 → garbage. f16 sides
     // need no conversion (already f16). This is the prefill mirror of the decode dequant path.
@@ -1519,23 +1349,9 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             // turbo8 K: inverse FWHT dequant → produces K in original domain (no Q rotation needed)
             k_turbo8_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
-        } else if (K->type == GGML_TYPE_TURBO1) {
-            // turbo1 K: inverse FWHT dequant → produces K in original domain (no Q rotation needed)
-            k_turbo1_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
-                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
-        } else if (K->type == GGML_TYPE_TURBO1_CQ) {
-            k_turbo1_cq_dequant_f16<<<grid_k, 128, 0, stream>>>(
-                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else if (K->type == GGML_TYPE_TURBO1_TCQ) {
             k_turbo1_tcq_dequant_f16<<<grid_k, 128, 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k, 0);
-        } else if (K->type == GGML_TYPE_TURBO1_NSN) {
-            // turbo1_nsn K: inverse FWHT + NSNQuant un-normalize/un-center → original domain.
-            const int kl_nsn = atoi(K->name + 9);
-            const float * o_k = (kl_nsn >= 0 && kl_nsn < PFHEAD_MAX_L)
-                ? turbo1_nsn_o_buf(device, 1) + (size_t) kl_nsn * PFHEAD_MAX_C : nullptr;
-            k_turbo1_nsn_dequant_f16<<<grid_k, 128, 0, stream>>>(
-                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], o_k);
         } else if (K->type == GGML_TYPE_BF16) {
             // bf16 K (mixed K/V): cast to f16 in original (unrotated) domain. Q stays unrotated.
             k_bf16_to_f16_tkhe<<<grid_k, K->ne[0], 0, stream>>>(
@@ -1597,26 +1413,12 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
         } else if (V->type == GGML_TYPE_TURBO8_0) {
             k_turbo8_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
-        } else if (V->type == GGML_TYPE_TURBO1_CQ) {
-            k_turbo1_cq_dequant_f16<<<grid_v, 128, 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
         } else if (V->type == GGML_TYPE_TURBO1_TCQ) {
             // ROTATED-domain V (2026-07-02): graph-level ggml_turbo_wht(inverse) un-rotates the
             // attention output, same contract as turbo2/3_tcq. Must stay in lockstep with the
             // turbo_v_rotated set in llama-graph.cpp.
             k_turbo1_tcq_dequant_f16_rot<<<grid_v, V->ne[0], 0, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]), 1);
-        } else if (V->type == GGML_TYPE_TURBO1) {
-            // turbo1 V: per-row inverse FWHT → original domain (no graph un-rotation). Diagnostic:
-            // the rotated-V + single graph-FWHT path (turbo8-style) is broken for turbo1 V only.
-            k_turbo1_dequant_f16_inv_fwht<<<grid_v, 128, 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
-        } else if (V->type == GGML_TYPE_TURBO1_NSN) {
-            const int vl_nsn = atoi(V->name + 9);
-            const float * o_v = (vl_nsn >= 0 && vl_nsn < PFHEAD_MAX_L)
-                ? turbo1_nsn_o_buf(device, 0) + (size_t) vl_nsn * PFHEAD_MAX_C : nullptr;
-            k_turbo1_nsn_dequant_f16<<<grid_v, 128, 0, stream>>>(
-                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], o_v);
         } else if (V->type == GGML_TYPE_BF16) {
             // bf16 V (mixed K/V): cast to f16 in original domain. Not rotated, and the graph-level
             // inverse WHT is gated on V being a turbo type (llama-graph.cpp), so none is applied.
@@ -1662,9 +1464,6 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             K->type != GGML_TYPE_TURBO8_0 &&
             K->type != GGML_TYPE_TURBO3_TCQ &&
             K->type != GGML_TYPE_TURBO2_TCQ &&
-            K->type != GGML_TYPE_TURBO1 &&
-            K->type != GGML_TYPE_TURBO1_NSN &&
-            K->type != GGML_TYPE_TURBO1_CQ &&
             K->type != GGML_TYPE_TURBO1_TCQ &&
             Q->ne[0] % 128 == 0) {
         const size_t q_size = ggml_nelements(Q) * sizeof(float);
@@ -1933,7 +1732,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     {
         auto is_turbo_type = [](ggml_type t) {
             return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO8_0 ||
-                   t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ || t == GGML_TYPE_TURBO1 || t == GGML_TYPE_TURBO1_NSN || t == GGML_TYPE_TURBO1_CQ || t == GGML_TYPE_TURBO1_TCQ;
+                   t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ || t == GGML_TYPE_TURBO1_TCQ;
         };
         // Asymmetric turbo K/V (e.g. q8_0 K + turbo4 V) is handled by the turbo dequant-to-f16
         // FA paths (ggml_cuda_turbo_prefill_attend for prefill, do_decode_dequant for decode).
@@ -1964,9 +1763,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_TURBO8_0:
         case GGML_TYPE_TURBO3_TCQ:
         case GGML_TYPE_TURBO2_TCQ:
-        case GGML_TYPE_TURBO1:
-        case GGML_TYPE_TURBO1_NSN:
-        case GGML_TYPE_TURBO1_CQ:
         case GGML_TYPE_TURBO1_TCQ:
             break;
         default:
@@ -1985,8 +1781,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         K->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO8_0 ||
         K->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO3_TCQ ||
         K->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO2_TCQ ||
-        K->type == GGML_TYPE_TURBO1    || V->type == GGML_TYPE_TURBO1 ||
-        K->type == GGML_TYPE_TURBO1_NSN || K->type == GGML_TYPE_TURBO1_CQ || V->type == GGML_TYPE_TURBO1_NSN || V->type == GGML_TYPE_TURBO1_CQ ||
         K->type == GGML_TYPE_TURBO1_TCQ || V->type == GGML_TYPE_TURBO1_TCQ) {
         if (Q->ne[0] <= 512 && Q->ne[0] % 64 == 0)
             return BEST_FATTN_KERNEL_VEC;
@@ -2140,7 +1934,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     turbo_vanilla_cb_load_fattn();  // TURBO_CB_T2/3/4/8 vanilla-book override (this TU's copies)
     turbo1_tcq_load_cb_fattn();  // E7: turbo1_tcq K/V decode codebooks (TURBO1_TCQ_CB_K/_V, cold-start = turbo2 anchor)
 
-    turbo1_load_dither_fattn();  // E6: one-time TURBO1_DITHER env → fattn decode constants
 
     cert_dump_q(ctx, dst);
 
@@ -2157,8 +1950,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         if (e) fprintf(stderr, "TURBO_PREFILL_VEC=%s: forcing vec prefill for turbo types\n", e);
         return e != nullptr;
     }();
-    const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1 || K->type == GGML_TYPE_TURBO1_NSN || K->type == GGML_TYPE_TURBO1_CQ || K->type == GGML_TYPE_TURBO1_TCQ ||
-                          V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1 || V->type == GGML_TYPE_TURBO1_NSN || V->type == GGML_TYPE_TURBO1_CQ || V->type == GGML_TYPE_TURBO1_TCQ;
+    const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1_TCQ ||
+                          V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1_TCQ;
 
     // Fused MMA turbo: reads raw turbo bytes directly in the MMA kernel, no intermediate fp16 buffers.
     // Phase 1: turbo4_0 matched K/V at D=128. Set GGML_TURBO_MMA_FUSED=0 to disable.
@@ -2170,9 +1963,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
         return true;
     }();
-    // turbo1 has no fused MMA-turbo instance (dequant-to-f16 codec only); exclude it so it
+    // turbo1_tcq handling below; removed 1-bit variants have no instances (dequant-to-f16 codec only); exclude it so it
     // does not enter the fused path and fall through with no kernel launched.
-    const bool turbo_matched = K->type == V->type && turbo_kv && K->type != GGML_TYPE_TURBO1 && K->type != GGML_TYPE_TURBO1_NSN && K->type != GGML_TYPE_TURBO1_CQ && K->type != GGML_TYPE_TURBO1_TCQ;
+    const bool turbo_matched = K->type == V->type && turbo_kv && K->type != GGML_TYPE_TURBO1_TCQ;
     const bool turbo1_tcq_matched = K->type == GGML_TYPE_TURBO1_TCQ && V->type == GGML_TYPE_TURBO1_TCQ &&
                                     (Q->ne[0] == 128 || Q->ne[0] == 256);
     // Asymmetric fused pairs, D=256 only (dense Qwen geometry). Both sides stay WHT-rotated like
@@ -2335,8 +2128,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // K and V are turbo (Gemma 4 ISWA global layers with K=V — Bug A2). Mixed q8_0+turbo
         // at D=512 stays on native VEC path because post-dequant q8_0 K + f16 V has no
         // working VEC template at D=512.
-        const bool turbo_k_only = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1 || K->type == GGML_TYPE_TURBO1_NSN || K->type == GGML_TYPE_TURBO1_CQ || K->type == GGML_TYPE_TURBO1_TCQ;
-        const bool turbo_v_only = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1 || V->type == GGML_TYPE_TURBO1_NSN || V->type == GGML_TYPE_TURBO1_CQ || V->type == GGML_TYPE_TURBO1_TCQ;
+        const bool turbo_k_only = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO8_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ || K->type == GGML_TYPE_TURBO1_TCQ;
+        const bool turbo_v_only = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1_TCQ;
         // Mixed f16/q8_0 + turbo at D=512: dequant K (and turbo V) to f16 so FA dispatches as
         // F16/F16 D=512 (which exists). Without this, the native VEC templates needed are
         // either missing (F16↔turbo) or have buggy SASS on sm_120 PTX-JIT (Q8_0↔turbo4 etc).
@@ -2348,11 +2141,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // VEC path (would hit BEST_FATTN_KERNEL_VEC → unregistered template → GGML_ABORT), so
         // force dequant whenever turbo8 is on either side, regardless of the override. Other
         // turbo types do have native VEC kernels and honor the override.
-        // turbo8 and turbo1 have no native VEC kernel (dequant-to-f16 only) — force dequant even
+        // turbo8 has no native VEC kernel (dequant-to-f16 only) — force dequant even
         // under GGML_TURBO_DECODE_NATIVE so we never route them to an unregistered VEC template.
         const bool turbo8_involved = K->type == GGML_TYPE_TURBO8_0 || V->type == GGML_TYPE_TURBO8_0 ||
-                                     K->type == GGML_TYPE_TURBO1   || V->type == GGML_TYPE_TURBO1 ||
-                                     K->type == GGML_TYPE_TURBO1_NSN || K->type == GGML_TYPE_TURBO1_CQ || K->type == GGML_TYPE_TURBO1_TCQ || V->type == GGML_TYPE_TURBO1_NSN || V->type == GGML_TYPE_TURBO1_CQ || V->type == GGML_TYPE_TURBO1_TCQ;
+                                     K->type == GGML_TYPE_TURBO1_TCQ || V->type == GGML_TYPE_TURBO1_TCQ;
         const bool do_decode_dequant = (!turbo_decode_native || turbo8_involved) && turbo_kv && (Q->ne[0] <= 256 || (Q->ne[0] <= 512 && both_dequantable_512));
 
         half * k_fp16_dec = nullptr;
@@ -2423,22 +2215,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 } else if (K->type == GGML_TYPE_TURBO8_0) {
                     k_turbo8_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
-                } else if (K->type == GGML_TYPE_TURBO1) {
-                    k_turbo1_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
-                } else if (K->type == GGML_TYPE_TURBO1_CQ) {
-                    k_turbo1_cq_dequant_f16<<<grid_k, 128, 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
                 } else if (K->type == GGML_TYPE_TURBO1_TCQ) {
                     k_turbo1_tcq_dequant_f16<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k, 0);
-                } else if (K->type == GGML_TYPE_TURBO1_NSN) {
-                    const int kl_nsn = atoi(K->name + 9);
-                    const float * o_k = (kl_nsn >= 0 && kl_nsn < PFHEAD_MAX_L)
-                        ? turbo1_nsn_o_buf(device_dec, 1) + (size_t) kl_nsn * PFHEAD_MAX_C : nullptr;
-                    k_turbo1_nsn_dequant_f16<<<grid_k, 128, 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], o_k);
-                } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
+        } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
                     k_turbo3_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
                 } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
@@ -2494,23 +2274,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 } else if (V->type == GGML_TYPE_TURBO8_0) {
                     k_turbo8_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
-                } else if (V->type == GGML_TYPE_TURBO1) {
-                    k_turbo1_dequant_f16_inv_fwht<<<grid_v, 128, 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
-                } else if (V->type == GGML_TYPE_TURBO1_CQ) {
-                    k_turbo1_cq_dequant_f16<<<grid_v, 128, 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
                 } else if (V->type == GGML_TYPE_TURBO1_TCQ) {
                     // ROTATED-domain V — see the prefill site; graph un-rotation keyed on v->type.
                     k_turbo1_tcq_dequant_f16_rot<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], tcq_compute_alpha_v(V->type, V->ne[1]), 1);
-                } else if (V->type == GGML_TYPE_TURBO1_NSN) {
-                    const int vl_nsn = atoi(V->name + 9);
-                    const float * o_v = (vl_nsn >= 0 && vl_nsn < PFHEAD_MAX_L)
-                        ? turbo1_nsn_o_buf(device_dec, 0) + (size_t) vl_nsn * PFHEAD_MAX_C : nullptr;
-                    k_turbo1_nsn_dequant_f16<<<grid_v, 128, 0, stream>>>(
-                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], o_v);
-                } else if (V->type == GGML_TYPE_TURBO3_0) {
+        } else if (V->type == GGML_TYPE_TURBO3_0) {
                     k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3], 1);
                 } else if (V->type == GGML_TYPE_Q8_0) {
