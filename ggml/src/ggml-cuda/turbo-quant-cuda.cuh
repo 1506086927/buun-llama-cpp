@@ -510,6 +510,17 @@ static void turbo_innerq_finalize_calibration() {
     fprintf(stderr, "InnerQ calibration: %d tokens, mode=%d, strength=%.2f, max scale ratio: %.3f (clamped to %.1f)\n",
             count, mode, strength, max_ratio, max_clamp);
 
+    // Fail-loud (2026-07-05 audit): the cross-TU scale push reaches set-rows.cu + fattn.cu only.
+    // The fused-MMA template TUs and any other decode instantiations keep their compile-time
+    // identity copies — the fattn-common.cuh promise to "gate the fused turbo1_tcq path off if
+    // calibration is ever revived" was never implemented. Until it is, armed non-identity scales
+    // make fused turbo1_tcq decode silently wrong (identity inv-scale on scaled-domain K).
+    if (max_ratio >= 1.2f) {
+        fprintf(stderr, "InnerQ WARNING: non-identity scales will arm, but the fused turbo1_tcq "
+                "decode path is NOT scale-aware (per-TU symbol never updated) — avoid turbo1_tcq "
+                "under calibrated InnerQ or implement the fused gate first.\n");
+    }
+
     // Auto-detect: if channels are already well-balanced, InnerQ won't help — skip.
     // TURBO_INNERQ_FORCE=1 bypasses this PPL-era heuristic so low-strength scales
     // (e.g. strength 0.2 → ratio<1.2) can be measured on KLD/hazard/trajectory.
