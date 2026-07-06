@@ -94,6 +94,16 @@
 #define cudaMemoryTypeDevice hipMemoryTypeDevice
 #define cudaPointerAttributes hipPointerAttribute_t
 #define cudaPointerGetAttributes hipPointerGetAttributes
+// CUDA-style masked warp shuffles -> plain HIP shuffles (#70). AMD has no independent thread
+// scheduling, so the mask is meaningless there — and ROCm >= 7.2 ships strict __shfl*_sync
+// templates that static_assert on 32-bit mask literals (sizeof(MaskT) == 8 required), which
+// breaks every 0xFFFFFFFF call site at compile time. This mirrors mainline llama.cpp's hip.h
+// (the mapping was lost in this fork's divergence). Variadic: covers 3-arg (default width)
+// and 4-arg call forms alike.
+#define __shfl_sync(mask, var, ...)      __shfl((var), __VA_ARGS__)
+#define __shfl_up_sync(mask, var, ...)   __shfl_up((var), __VA_ARGS__)
+#define __shfl_down_sync(mask, var, ...) __shfl_down((var), __VA_ARGS__)
+#define __shfl_xor_sync(mask, var, ...)  __shfl_xor((var), __VA_ARGS__)
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
