@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <set>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -2381,6 +2382,37 @@ void llama_kv_cache::vbr_load_degrade_order() {
             vbr_degrade_order_.assign(e.steps, e.steps + e.n);
             LLAMA_LOG_INFO("%s: VBR degrade order: %zu baked steps (arch-matched, matrix v3)\n",
                     __func__, vbr_degrade_order_.size());
+            return;
+        }
+    }
+    // Models ship with and without MTP/nextn predict layers, which append to n_layer while
+    // leaving the KV-bearing backbone identical — so fall back to matching on (arch + the
+    // EXACT KV-layer-id set). Set equality (not subset) so different-sized same-arch models
+    // can never cross-match, and a cache holding layers the table does not cover falls
+    // through to the generic order instead of silently never degrading them.
+    for (const auto & e : vbr_baked_orders) {
+        if (e.arch != model.arch) {
+            continue;
+        }
+        std::set<uint8_t> tbl_ils;
+        for (size_t i = 0; i < e.n; ++i) {
+            tbl_ils.insert(e.steps[i].il);
+        }
+        if (tbl_ils.size() != map_layer_ids.size()) {
+            continue;
+        }
+        bool same = true;
+        for (const uint8_t il : tbl_ils) {
+            if (map_layer_ids.find(il) == map_layer_ids.end()) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            vbr_degrade_order_.assign(e.steps, e.steps + e.n);
+            LLAMA_LOG_INFO("%s: VBR degrade order: %zu baked steps (arch + KV-layout matched; "
+                    "n_layer %u vs table %u — MTP/nextn-style variant)\n",
+                    __func__, vbr_degrade_order_.size(), hparams.n_layer, e.n_layer);
             return;
         }
     }
