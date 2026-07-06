@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-vbr.h"
 
 #ifdef  __cplusplus
 extern "C" {
@@ -22,7 +23,36 @@ extern "C" {
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
+// TurboQuant/VBR KV-cache support — the CUDA implementation of the backend-agnostic
+// interface in ggml-vbr.h (struct/semantics docs live there). libllama reaches these
+// through ggml_backend_cuda_vbr_iface (resolved via GGML_VBR_BACKEND_IFACE_PROC), never
+// by direct link.
+GGML_BACKEND_API const struct ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void);
+
+GGML_BACKEND_API void ggml_backend_cuda_kv_transcode(ggml_backend_t backend,
+                                                     const struct ggml_vbr_transcode_params * params);
+GGML_BACKEND_API void ggml_backend_cuda_kv_stash_capture(ggml_backend_t backend, const struct ggml_tensor * src,
+                                                         void * stash_f16, int64_t n_rows, bool is_v);
+GGML_BACKEND_API void ggml_backend_cuda_sync_device(int device);
+GGML_BACKEND_API void ggml_backend_cuda_vbr_fence_arm(ggml_backend_t backend);
+
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+
+// VMM pool (works on CUDA and ROCm — HIP maps the cuMem* driver API; *_available reports
+// the device flag)
+GGML_BACKEND_API bool   ggml_backend_cuda_vmm_available(int device);
+GGML_BACKEND_API size_t ggml_backend_cuda_vmm_granularity(int device);
+GGML_BACKEND_API struct ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int device, size_t va_size);
+GGML_BACKEND_API void   ggml_backend_cuda_vmm_pool_free(struct ggml_vbr_vmm_pool * pool);
+GGML_BACKEND_API void * ggml_backend_cuda_vmm_pool_base(struct ggml_vbr_vmm_pool * pool);
+GGML_BACKEND_API size_t ggml_backend_cuda_vmm_pool_mapped(struct ggml_vbr_vmm_pool * pool);
+GGML_BACKEND_API bool   ggml_backend_cuda_vmm_pool_map(struct ggml_vbr_vmm_pool * pool, size_t off, size_t len);
+GGML_BACKEND_API bool   ggml_backend_cuda_vmm_pool_unmap(struct ggml_vbr_vmm_pool * pool, size_t off, size_t len);
+GGML_BACKEND_API void   ggml_backend_cuda_vmm_pool_clear(struct ggml_vbr_vmm_pool * pool);
+
+// wrap externally-managed device memory (e.g. a VMM VA range) as a CUDA backend buffer; the buffer
+// does NOT take ownership — freeing it never cudaFree's ptr.
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_buffer_from_ptr(int device, void * ptr, size_t size);
 
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);

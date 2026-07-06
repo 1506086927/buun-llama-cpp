@@ -719,6 +719,7 @@ class ChatStore {
 						predicted_n: timings?.predicted_n || 0,
 						predicted_per_second: tokensPerSecond,
 						cache_n: timings?.cache_n || 0,
+						kv_bpv: timings?.kv_bpv,
 						prompt_progress: promptProgress
 					},
 					convId
@@ -1395,6 +1396,7 @@ class ChatStore {
 								predicted_n: timings?.predicted_n || 0,
 								predicted_per_second: tokensPerSecond,
 								cache_n: timings?.cache_n || 0,
+								kv_bpv: timings?.kv_bpv,
 								prompt_progress: promptProgress
 							},
 							msg.convId
@@ -1711,6 +1713,7 @@ class ChatStore {
 			predicted_n: number;
 			predicted_per_second: number;
 			cache_n: number;
+			kv_bpv?: number;
 			prompt_progress?: ChatMessagePromptProgress;
 		},
 		conversationId?: string
@@ -1737,6 +1740,7 @@ class ChatStore {
 		const promptProgress = timingData.prompt_progress as
 			| { total: number; cache: number; processed: number; time_ms: number }
 			| undefined;
+		const kvBpv = typeof timingData.kv_bpv === 'number' ? (timingData.kv_bpv as number) : undefined;
 		const contextTotal = this.getContextTotal();
 		const currentConfig = config();
 		const outputTokensMax = currentConfig.max_tokens || -1;
@@ -1765,7 +1769,8 @@ class ChatStore {
 			promptProgress,
 			promptTokens,
 			promptMs,
-			cacheTokens
+			cacheTokens,
+			kvBpv
 		};
 	}
 

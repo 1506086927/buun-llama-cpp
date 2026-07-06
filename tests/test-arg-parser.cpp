@@ -2,6 +2,9 @@
 #include "common.h"
 #include "download.h"
 
+#include <cstdlib>
+#include <fstream>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -9,6 +12,10 @@
 
 #undef NDEBUG
 #include <cassert>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 int main(void) {
     common_params params;
@@ -82,6 +89,33 @@ int main(void) {
         return res;
     };
 
+#ifndef _WIN32
+    auto clear_vbr_runtime_env = []() {
+        // the arg layer's own exports + the developer-override envs llama-kv-cache honors —
+        // scrub between blocks so one test's env cannot leak into the next
+        for (const char * name : {
+                "VBR_VMM",
+                "VBR_MODE",
+                "VBR_BUDGET_MIB",
+                "VBR_MIN_BITS",
+                "VBR_LAYER_SCHEDULE",
+                "VBR_LAYER_SCHEDULE_FROM_POLICY",
+                "VBR_LAYER_STRICT",
+                "VBR_SCHEDULE_CTX",
+                "VBR_POLICY_LADDER",
+                "VBR_BUDGET",
+                "VBR_CAPACITY_BITS",
+                "VBR_VRAM_BUDGET",
+                "VBR_SELECTED_FAMILY",
+                "VBR_SELECTED_POLICY",
+                "VBR_SELECTED_BPV",
+                "VBR_SELECTED_KLD",
+                "VBR_SELECTED_SCHEDULE"}) {
+            unsetenv(name);
+        }
+    };
+#endif
+
     std::vector<std::string> argv;
 
     printf("test-arg-parser: test invalid usage\n\n");
@@ -140,6 +174,186 @@ int main(void) {
     assert(params.lora_adapters[1].path == "file2,2.gguf");
     assert(params.lora_adapters[2].path == "file3\"3\".gguf");
     assert(params.lora_adapters[3].path == "file4\".gguf");
+
+    {
+        printf("test-arg-parser: test VBR cache type and budget flags\n\n");
+
+        // dynamic mode (the default): the cache STARTS at the F16 entry tier (full quality
+        // until budget pressure; the measured fp16->t8 band degrades first) and the runtime
+        // controller walks it toward the floor; the runtime channel is cparams
+        // (llama_context_params), postprocess exports NO runtime env.
+        common_params vbr_params;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "VBR", "-ctv", "vbr"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_params, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_params.cache_type_k == GGML_TYPE_F16);
+        assert(vbr_params.cache_type_v == GGML_TYPE_F16);
+        assert(vbr_params.vbr_cache_type_k);
+        assert(vbr_params.vbr_cache_type_v);
+        assert(vbr_params.vbr_budget == "dynamic");
+        assert(vbr_params.vbr_dynamic());
+        assert(vbr_params.vbr_min_bits_value == 0.0);
+        assert(vbr_params.vbr_capacity_bits == 1.25); // capacity advertised at the default t1 floor
+#ifndef _WIN32
+        assert(getenv("VBR_VMM") == nullptr);
+        assert(getenv("VBR_MODE") == nullptr);
+        assert(getenv("VBR_BUDGET_MIB") == nullptr);
+        assert(getenv("VBR_MIN_BITS") == nullptr);
+#endif
+
+        // --vbr-floor is a LITERAL aggregate floor (no snap-up to the next tier); the entry type
+        // stays turbo8 regardless
+        common_params vbr_t2_floor;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "-ctv", "vbr", "--vbr-min-bits", "2.25"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_t2_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_t2_floor.cache_type_k == GGML_TYPE_F16);
+        assert(vbr_t2_floor.vbr_min_bits == "2.25");
+        assert(vbr_t2_floor.vbr_min_bits_value == 2.25);
+        assert(vbr_t2_floor.vbr_capacity_bits == 2.25);
+
+        common_params vbr_literal_floor;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-floor", "2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_literal_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_literal_floor.vbr_min_bits_value == 2.0);
+        assert(vbr_literal_floor.vbr_capacity_bits == 2.0); // literal, NOT snapped to 2.25
+
+        common_params vbr_tier_alias_floor;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-floor", "t2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_tier_alias_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_tier_alias_floor.vbr_min_bits == "2.25");
+        assert(vbr_tier_alias_floor.vbr_min_bits_value == 2.25);
+
+        common_params vbr_fractional_floor;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-floor", "2.75"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_fractional_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_fractional_floor.vbr_min_bits_value == 2.75);
+        assert(vbr_fractional_floor.vbr_capacity_bits == 2.75);
+
+        // dynamic floors outside the degrade ladder [t1, t8] clamp with a warning
+        common_params vbr_low_floor;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-floor", "0.5"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_low_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_low_floor.vbr_min_bits_value == 1.25);
+
+        common_params vbr_high_floor;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-floor", "f16"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_high_floor, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_high_floor.vbr_min_bits_value == 16.0); // f16 tops the ladder now (= never degrade)
+
+        // one-sided vbr in dynamic mode: an untouched (default f16) opposite side is implied
+        // vbr too; an explicitly non-default side stays pinned at its type
+        common_params vbr_imply_v;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_imply_v, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_imply_v.vbr_cache_type_k);
+        assert(vbr_imply_v.vbr_cache_type_v);
+        assert(vbr_imply_v.cache_type_v == GGML_TYPE_F16);
+
+        common_params vbr_pin_v;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "-ctv", "q8_0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_pin_v, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_pin_v.vbr_cache_type_k);
+        assert(!vbr_pin_v.vbr_cache_type_v);
+        assert(vbr_pin_v.cache_type_k == GGML_TYPE_F16);
+        assert(vbr_pin_v.cache_type_v == GGML_TYPE_Q8_0);
+
+        // --vbr-vram alone implies -ctk/-ctv vbr (dynamic)
+        common_params vbr_vram_budget;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-vram", "24G"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_vram_budget, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_vram_budget.vbr_cache_type_k);
+        assert(vbr_vram_budget.vbr_cache_type_v);
+        assert(vbr_vram_budget.vbr_vram_budget == "25769803776");
+        assert(vbr_vram_budget.vbr_vram_budget_bytes == 25769803776ull);
+        assert(vbr_vram_budget.vbr_dynamic());
+
+        // fixed mode: a tier budget selects the static cache type
+        common_params vbr_k_only;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "-ctv", "f16", "--vbr-budget", "t4"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_k_only, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_k_only.cache_type_k == GGML_TYPE_TURBO4_0);
+        assert(vbr_k_only.cache_type_v == GGML_TYPE_F16);
+        assert(vbr_k_only.vbr_cache_type_k);
+        assert(!vbr_k_only.vbr_cache_type_v);
+        assert(vbr_k_only.vbr_capacity_bits == 4.125);
+        assert(!vbr_k_only.vbr_dynamic());
+
+        common_params vbr_bad_budget;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-budget", "nonsense"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_bad_budget, LLAMA_EXAMPLE_COMMON));
+
+        common_params vbr_bad_floor;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-min-bits", "17"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_bad_floor, LLAMA_EXAMPLE_COMMON));
+
+        common_params vbr_bad_vram;
+        argv = {"binary_name", "-m", "model.gguf", "--vbr-vram", "abc"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_bad_vram, LLAMA_EXAMPLE_COMMON));
+
+        // --vbr-* never clobbers an explicitly non-vbr cache side; with BOTH sides explicit
+        // there is nothing to apply it to
+        common_params vbr_ct_conflict;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "q8_0", "-ctv", "q8_0", "--vbr-budget", "t3"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_ct_conflict, LLAMA_EXAMPLE_COMMON));
+
+        // one free side: applies to it (V here), leaves the explicit side alone
+        common_params vbr_ct_partial;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "q8_0", "--vbr-budget", "t3"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_ct_partial, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_ct_partial.cache_type_k == GGML_TYPE_Q8_0);
+        assert(vbr_ct_partial.cache_type_v == GGML_TYPE_TURBO3_TCQ);
+        assert(!vbr_ct_partial.vbr_cache_type_k);
+        assert(vbr_ct_partial.vbr_cache_type_v);
+
+        // a floor above the fixed budget is contradictory
+        common_params vbr_floor_over_budget;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-budget", "t2", "--vbr-floor", "t3"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_floor_over_budget, LLAMA_EXAMPLE_COMMON));
+
+        // --vbr-policy needs a fixed budget (dynamic mode uses the baked degrade order)
+        common_params vbr_solo_policy;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-policy", "does-not-matter.json"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_solo_policy, LLAMA_EXAMPLE_COMMON));
+
+#ifndef _WIN32
+        clear_vbr_runtime_env();
+
+        // fixed mode + policy ladder: rung selection, schedule export
+        const std::string policy_prefix = "test-vbr-policy-" + std::to_string((long long) getpid());
+        const std::string policy_file = policy_prefix + ".json";
+        const std::string schedule_file = policy_prefix + ".sched";
+
+        {
+            std::ofstream schedule(schedule_file);
+            schedule << "0-0:k:t3tcq\n";
+        }
+        {
+            std::ofstream policy(policy_file);
+            policy
+                << "{\n"
+                << "  \"static_ladder\": [\n"
+                << "    {\n"
+                << "      \"name\": \"compact-test\",\n"
+                << "      \"bpv\": 3.25,\n"
+                << "      \"full_kld\": 0.05,\n"
+                << "      \"schedule_file\": \"" << schedule_file << "\"\n"
+                << "    }\n"
+                << "  ]\n"
+                << "}\n";
+        }
+
+        common_params vbr_policy_fixed;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "-ctv", "vbr", "--vbr-budget", "3.5", "--vbr-policy", policy_file, "--vbr-floor", "3"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_policy_fixed, LLAMA_EXAMPLE_SERVER));
+        assert(vbr_policy_fixed.vbr_capacity_bits == 3.25);
+        assert(vbr_policy_fixed.vbr_selected_policy == "compact-test");
+        assert(getenv("VBR_LAYER_SCHEDULE") && std::string(getenv("VBR_LAYER_SCHEDULE")) == "@" + schedule_file);
+        assert(getenv("VBR_SELECTED_POLICY") && std::string(getenv("VBR_SELECTED_POLICY")) == "compact-test");
+
+        clear_vbr_runtime_env();
+        std::remove(policy_file.c_str());
+        std::remove(schedule_file.c_str());
+#endif
+    }
 
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32

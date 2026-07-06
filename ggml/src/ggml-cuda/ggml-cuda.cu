@@ -54,6 +54,7 @@
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
+#include "ggml-cuda/vbr-transcode.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
@@ -626,15 +627,18 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
+    bool owned = true; // false for buffers wrapping externally-managed memory (VBR VMM pool)
     std::string name;
 
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-        device(device), dev_ptr(dev_ptr),
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, bool owned = true) :
+        device(device), dev_ptr(dev_ptr), owned(owned),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (owned) {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -850,6 +854,18 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+// Dynamic VBR (S2): wrap externally-managed device memory (a VMM VA range) as a first-class CUDA
+// buffer. Uses the standard interface + buft so ggml_backend_buffer_is_cuda / buft_is_cuda checks
+// hold; the non-owning context means freeing the buffer never cudaFree's the VA.
+ggml_backend_buffer_t ggml_backend_cuda_buffer_from_ptr(int device, void * ptr, size_t size) {
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(device);
+    if (buft == nullptr || ptr == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, ptr, /*owned=*/false);
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
 
 // cuda split buffer
@@ -4488,6 +4504,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // VBR S5: if a KV degrade wave is in flight on the side stream, GPU-wait on it here (before
+    // any capture/launch) so this graph reads the flipped tensors post-transcode. Host never blocks.
+    ggml_cuda_vbr_fence_consume(cuda_ctx->device, cuda_ctx->stream());
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -5229,6 +5249,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_TURBO8_0:
                     case GGML_TYPE_TURBO3_TCQ:
                     case GGML_TYPE_TURBO2_TCQ:
+                    case GGML_TYPE_TURBO1_TCQ:
                         return true;
                     default:
                         return false;
@@ -5246,7 +5267,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0 ||
                        op->type == GGML_TYPE_TURBO8_0 ||
                        op->type == GGML_TYPE_TURBO3_TCQ ||
-                       op->type == GGML_TYPE_TURBO2_TCQ) &&
+                       op->type == GGML_TYPE_TURBO2_TCQ ||
+                       op->type == GGML_TYPE_TURBO1_TCQ) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
@@ -5641,8 +5663,37 @@ extern "C" void   dflash_cross_ring_gpu_write(void *, int, int, const float *, i
 extern "C" const float * dflash_cross_ring_gpu_interleave(void *, int, int, int);
 extern "C" void   dflash_cross_ring_gpu_set_tensor(void *, const void *, size_t, size_t);
 
+// TurboQuant/VBR KV-cache backend interface (ggml-vbr.h): every slot filled — libllama
+// resolves this vtable via GGML_VBR_BACKEND_IFACE_PROC instead of linking CUDA symbols.
+const ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void) {
+    static const ggml_vbr_backend_iface iface = {
+        /* .get_device_count  = */ ggml_backend_cuda_get_device_count,
+        /* .buffer_type       = */ ggml_backend_cuda_buffer_type,
+        /* .get_device_memory = */ ggml_backend_cuda_get_device_memory,
+        /* .backend_init      = */ ggml_backend_cuda_init,
+        /* .sync_device       = */ ggml_backend_cuda_sync_device,
+        /* .vmm_available     = */ ggml_backend_cuda_vmm_available,
+        /* .vmm_granularity   = */ ggml_backend_cuda_vmm_granularity,
+        /* .vmm_pool_init     = */ ggml_backend_cuda_vmm_pool_init,
+        /* .vmm_pool_free     = */ ggml_backend_cuda_vmm_pool_free,
+        /* .vmm_pool_base     = */ ggml_backend_cuda_vmm_pool_base,
+        /* .vmm_pool_mapped   = */ ggml_backend_cuda_vmm_pool_mapped,
+        /* .vmm_pool_map      = */ ggml_backend_cuda_vmm_pool_map,
+        /* .vmm_pool_unmap    = */ ggml_backend_cuda_vmm_pool_unmap,
+        /* .vmm_pool_clear    = */ ggml_backend_cuda_vmm_pool_clear,
+        /* .buffer_from_ptr   = */ ggml_backend_cuda_buffer_from_ptr,
+        /* .kv_transcode      = */ ggml_backend_cuda_kv_transcode,
+        /* .kv_stash_capture  = */ ggml_backend_cuda_kv_stash_capture,
+        /* .fence_arm         = */ ggml_backend_cuda_vbr_fence_arm,
+    };
+    return &iface;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, GGML_VBR_BACKEND_IFACE_PROC) == 0) {
+        return (void *)ggml_backend_cuda_vbr_iface;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

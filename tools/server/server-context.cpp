@@ -25,6 +25,7 @@
 #include <memory>
 #include <random>
 #include <filesystem>
+#include <string>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -39,6 +40,17 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// The dynamic VBR runtime controller flips KV tensor types in place as the context fills; state
+// save/restore, context checkpoints and cache reuse all assume a fixed cache layout and would
+// restore/reuse bytes under the wrong tier. Gate them off whenever the controller can arm.
+// (This replaces the old VBR_STAGE2A env gate — Stage2A itself is gone.)
+static bool server_vbr_dynamic_active(const common_params & params) {
+    return params.vbr_dynamic();
+}
+
+// defined near get_model_info(); shared by the /props and /models responses
+static json server_vbr_meta_json(const server_context_meta * meta);
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -433,6 +445,11 @@ struct server_slot {
             timings.draft_n_accepted = n_draft_accepted;
         }
 
+        // live effective KV bits/value (moves under dynamic VBR as tiers degrade/reset)
+        if (ctx_tgt != nullptr) {
+            timings.kv_bpv = llama_memory_kv_bpv(llama_get_memory(ctx_tgt));
+        }
+
         return timings;
     }
 
@@ -539,6 +556,14 @@ struct server_slot {
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
         };
+
+        // live effective KV bits/value (moves under dynamic VBR); pollable via GET /slots
+        if (ctx_tgt != nullptr) {
+            const double kv_bpv = llama_memory_kv_bpv(llama_get_memory(ctx_tgt));
+            if (kv_bpv >= 0.0) {
+                res["kv_bpv"] = kv_bpv;
+            }
+        }
 
         const auto & ptask = task ? task : task_prev;
 
@@ -890,6 +915,87 @@ private:
         slot.prompt_save(*prompt_cache);
         slot.prompt_clear(false);
         prompt_cache->update();
+    }
+
+    // dynamic VBR: clear-only reclaim of idle slots (the prompt cache is disabled under the VBR
+    // gates, so unlike cache_idle_slots there is nothing to save into — the cost is a re-prefill
+    // if that conversation returns). Never touches processing slots or a slot an explicitly
+    // pinned deferred task is waiting on. Returns the number of slots cleared.
+    int vbr_clear_idle_slots(int except_id, const char * reason) {
+        int cleared = 0;
+        for (auto & s : slots) {
+            if (s.id == except_id || s.is_processing() || s.prompt.n_tokens() == 0) {
+                continue;
+            }
+            if (queue_tasks.has_deferred_for_slot(s.id)) {
+                SLT_INF(s, "vbr reclaim (%s): kept — a deferred id_slot task pins this slot\n", reason);
+                continue;
+            }
+            SLT_WRN(s, "vbr reclaim (%s): clearing %d cached tokens\n", reason, (int) s.prompt.n_tokens());
+            s.prompt_clear(false);
+            s.prompt.checkpoints.clear(); // host-RAM recurrent blobs would linger until slot reuse
+            cleared++;
+        }
+        return cleared;
+    }
+
+    // reclaim-before-degrade: when the incoming work's projected footprint would push the
+    // degrade ladder BELOW the quality floor, pay with idle caches instead of tiers. Above the
+    // floor the trade inverts — a within-band degrade is near-lossless and cheaper than
+    // destroying another conversation's re-prefillable cache, so caches are kept. Policy reads
+    // deficit_raw only: page-exact and free-VRAM independent, so WHETHER a cache is erased
+    // never depends on driver jitter or co-tenants (the cache's own live clamp still handles
+    // those with tier degrades).
+    void vbr_reclaim_before_degrade(int except_id, uint32_t n_tokens_extra, const char * reason) {
+        if (!server_vbr_dynamic_active(params_base) || params_base.vbr_reclaim_floor_bpv <= 0.0f) {
+            return;
+        }
+        const auto st = llama_memory_vbr_state(llama_get_memory(ctx_tgt), -1, n_tokens_extra);
+        if (st.deficit_raw <= 0 || st.bpv_if_degraded >= (double) params_base.vbr_reclaim_floor_bpv) {
+            return;
+        }
+        const int cleared = vbr_clear_idle_slots(except_id, reason);
+        if (cleared > 0) {
+            SRV_WRN("vbr reclaim (%s): cleared %d idle slot(s) — deficit %.2f MiB, degrading instead would land %.3f bpv < floor %.3f\n",
+                    reason, cleared, st.deficit_raw / 1024.0 / 1024.0, st.bpv_if_degraded,
+                    (double) params_base.vbr_reclaim_floor_bpv);
+        }
+    }
+
+    // reset-on-low-LCP (dynamic VBR): tiers are per-tensor and promotion cannot cross the tap
+    // boundary, so the ONLY full-quality recovery is the lossless empty-cache reset. When a
+    // DEGRADED conversation keeps a token-trivial prefix anyway (rolling-window agent
+    // harnesses rewrite mid-context every turn), trade the prefix for the reset: clear the
+    // idle slots (recovery reclaim — deliberately NOT deficit-gated: budget slack is exactly
+    // the state that starves the pressure path, and worthless idle caches are the only
+    // obstacle to recovery that benefits every stream), and if the pool then holds nothing
+    // but this slot's cells, drop n_past to 0 — the full re-prefill re-enters at the entry
+    // tier, so turn-N cache quality equals turn-1. Returns the (possibly zeroed) n_past.
+    int vbr_reset_on_low_lcp(server_slot & slot, int n_past) {
+        if (!server_vbr_dynamic_active(params_base) || params_base.vbr_reset_keep_frac <= 0.0f) {
+            return n_past;
+        }
+        const int n_prompt = slot.task->n_tokens();
+        if (n_prompt <= 0 || (float) n_past >= params_base.vbr_reset_keep_frac * (float) n_prompt) {
+            return n_past;
+        }
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        auto st = llama_memory_vbr_state(mem, slot.id, 0);
+        if (st.cursor < 2) {
+            return n_past; // pristine or one transient step — a full re-prefill buys ~nothing
+        }
+        vbr_clear_idle_slots(slot.id, "reset-recovery");
+        st = llama_memory_vbr_state(mem, slot.id, 0);
+        if (st.used_cells_other > 0) {
+            SLT_INF(slot, "vbr reset blocked: %u used cells belong to other sequences (pinned or processing slots)\n",
+                    st.used_cells_other);
+            return n_past;
+        }
+        SLT_WRN(slot, "vbr reset: cursor %d and only %d/%d prompt tokens reusable (< %.2f) — dropping the prefix; "
+                "the full re-prefill re-enters at the entry tier\n",
+                st.cursor, n_past, n_prompt, (double) params_base.vbr_reset_keep_frac);
+        slot.prompt.checkpoints.clear(); // all invalidated by the full clear
+        return 0;
     }
 
     void recurrent_shrink_for_prefill(const char * reason) {
@@ -1441,6 +1547,40 @@ private:
             batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
         }
 
+        if (server_vbr_dynamic_active(params_base)) {
+            // Disabled: these mechanisms serialize/shift the ATTENTION KV, whose tensor tiers flip
+            // in place at runtime under the dynamic VBR controller (a FLAGS_NONE state restore
+            // would land bytes under the wrong tier or past the VMM watermark; cache_reuse needs
+            // shifts, and get_can_shift() is false under VMM anyway).
+            if (params_base.cache_ram_mib != 0) {
+                params_base.cache_ram_mib = 0;
+                SRV_WRN("%s\n", "prompt cache state storage is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
+            }
+            if (params_base.n_cache_reuse) {
+                params_base.n_cache_reuse = 0;
+                SRV_WRN("%s\n", "cache_reuse is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
+            }
+            if (!params_base.slot_save_path.empty()) {
+                // llama_state_seq_save_file carries full tier-typed attention KV: a save taken
+                // after any degrade is refused at the lib level, and even entry-tier saves stop
+                // restoring once the target cache has degraded — predictably off beats flaky
+                params_base.slot_save_path.clear();
+                SRV_WRN("%s\n", "slot save/restore (--slot-save-path) is not supported by dynamic VBR (KV tiers change at runtime), it will be disabled");
+            }
+            // Context checkpoints (PARTIAL_ONLY):
+            //   hybrid models  — routed to the recurrent state only (attention KV skipped, see
+            //     llama_memory_hybrid::state_write): tier-agnostic and load-bearing for prompt
+            //     rewind, so they stay ENABLED;
+            //   iSWA models    — llama_kv_cache_iswa::state_write DOES serialize the SWA
+            //     attention KV under PARTIAL_ONLY; once a tier flips every restore would fail
+            //     (clean fallback, but the checkpoints are dead weight) — disable them.
+            if (params_base.n_ctx_checkpoints > 0 &&
+                llama_model_n_swa(model_tgt) > 0 && !llama_model_is_hybrid(model_tgt)) {
+                params_base.n_ctx_checkpoints = 0;
+                SRV_WRN("%s\n", "context checkpoints are not supported by dynamic VBR on SWA models (the SWA attention KV is part of the checkpoint), they will be disabled");
+            }
+        }
+
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_INF("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -1612,6 +1752,11 @@ private:
 
         bool update_cache = false;
 
+        // best similarity seen even BELOW the threshold — feeds the vbr route-home tier and the
+        // LRU log line (a hopping conversation was undiagnosable: "selected by LRU" never said
+        // how close the rejected candidates came)
+        float sim_best_any = 0;
+
         // find the slot that has at least n% prompt similarity
         if (ret == nullptr && slot_prompt_similarity != 0.0f) {
             float sim_best = 0;
@@ -1632,6 +1777,8 @@ private:
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
                 const float sim_cur = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
 
+                sim_best_any = std::max(sim_best_any, sim_cur);
+
                 // select the current slot if the criteria match
                 if (sim_cur > sim_best && sim_cur > slot_prompt_similarity) {
                     sim_best = sim_cur;
@@ -1650,6 +1797,43 @@ private:
                 if (f_keep < 0.5f) {
                     update_cache = true;
                 }
+            }
+        }
+
+        // dynamic VBR: route a returning conversation HOME before the LRU tier colonizes a fresh
+        // slot. In the unified pool an idle slot's cells are live cost for everyone (mapped pages,
+        // attention span, the one shared quality budget), and the LRU tier below ranks never-used
+        // slots FIRST — a rewritten-context prompt that fails the similarity threshold would stack
+        // slot after slot while its own history rots elsewhere. Any nonzero LCP (a shared system
+        // prompt suffices) identifies the home slot; genuinely-new streams (zero LCP everywhere)
+        // still take the LRU spread below.
+        if (ret == nullptr && server_vbr_dynamic_active(params_base)) {
+            size_t lcp_best = 0;
+
+            for (server_slot & slot : slots) {
+                if (slot.is_processing()) {
+                    continue;
+                }
+
+                const auto & tokens = slot.prompt.tokens;
+
+                if (tokens.empty()) {
+                    continue;
+                }
+
+                const size_t lcp = tokens.get_common_prefix(task.tokens);
+                if (lcp > lcp_best) {
+                    lcp_best = lcp;
+
+                    ret = &slot;
+                }
+            }
+
+            if (ret != nullptr) {
+                SLT_INF(*ret, "selected slot by route-home (vbr), lcp = %zu tokens (sim %.3f <= %.3f thold)\n",
+                        lcp_best, (double) lcp_best / task.tokens.size(), slot_prompt_similarity);
+
+                update_cache = true;
             }
         }
 
@@ -1677,7 +1861,8 @@ private:
             }
 
             if (ret != nullptr) {
-                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
+                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 " (best rejected sim = %.3f)\n",
+                        t_last, sim_best_any);
 
                 update_cache = true;
             }
@@ -2582,6 +2767,16 @@ private:
                             }
                         }
 
+                        // dynamic VBR: if this launch's projected footprint would degrade the
+                        // pool below the quality floor, clear idle caches first. The probe is
+                        // sized by the post-LCP SUFFIX — the common prefix refills in place with
+                        // zero cell growth, and probing the full prompt evicted other clients'
+                        // caches for growth that was never going to happen.
+                        if (server_vbr_dynamic_active(params_base) && task.n_tokens() > 0) {
+                            const size_t lcp = slot->prompt.tokens.get_common_prefix(task.tokens);
+                            vbr_reclaim_before_degrade(slot->id, (uint32_t) (task.n_tokens() - lcp), "launch");
+                        }
+
                         if (!launch_slot_with_task(*slot, std::move(task))) {
                             SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                             break; // drop the task
@@ -3375,6 +3570,11 @@ private:
                             }
                         }
 
+                        // dynamic VBR: trade a token-trivial reusable prefix for the lossless
+                        // full reset (n_past -> 0 makes the seq_rm below a full clear; the
+                        // cache empties and the next prepare restores every entry tier)
+                        n_past = vbr_reset_on_low_lcp(slot, n_past);
+
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
@@ -3726,6 +3926,13 @@ private:
             && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH);
         if (can_batch_multiseq) {
             llama_set_force_split_seq(ctx_tgt, false);
+        }
+
+        // dynamic VBR: mid-decode pressure — generation can cross a page/budget boundary long
+        // after launch. Same floor-gated reclaim before the cache pays with tiers (idle slots
+        // only; every generating slot is processing and untouchable).
+        if (batch.n_tokens > 0) {
+            vbr_reclaim_before_degrade(-1, (uint32_t) batch.n_tokens, "decode");
         }
 
         // process the created batch of tokens
@@ -4620,6 +4827,18 @@ server_context_meta server_context::get_meta() const {
         /* json_ui_settings       */ impl->json_ui_settings,
         /* json_webui_settings    */ impl->json_webui_settings,  // Deprecated
         /* slot_n_ctx             */ impl->get_slot_n_ctx(),
+        /* vbr_enabled            */ impl->params_base.vbr_enabled(),
+        /* vbr_dynamic            */ impl->params_base.vbr_dynamic(),
+        /* vbr_type_k             */ impl->params_base.vbr_cache_type_k,
+        /* vbr_type_v             */ impl->params_base.vbr_cache_type_v,
+        /* vbr_min_bits           */ impl->params_base.vbr_min_bits_value,
+        /* vbr_capacity_bits      */ impl->params_base.vbr_capacity_bits,
+        /* vbr_selected_bpv       */ impl->params_base.vbr_selected_bpv,
+        /* vbr_selected_kld       */ impl->params_base.vbr_selected_kld,
+        /* vbr_vram_budget_bytes  */ impl->params_base.vbr_vram_budget_bytes,
+        /* vbr_selected_family    */ impl->params_base.vbr_selected_family,
+        /* vbr_selected_policy    */ impl->params_base.vbr_selected_policy,
+        /* vbr_selected_schedule  */ impl->params_base.vbr_selected_schedule,
         /* pooling_type           */ llama_pooling_type(impl->ctx_tgt),
 
         /* chat_params            */ impl->chat_params,
@@ -5191,6 +5410,7 @@ void server_routes::init_routes() {
             { "total_slots",                 params.n_parallel },
             { "model_alias",                 meta->model_name },
             { "model_path",                  meta->model_path },
+            { "vbr",                         server_vbr_meta_json(meta.get()) },
             { "modalities",                  json {
                 {"vision", meta->has_inp_image},
                 {"audio",  meta->has_inp_audio},
@@ -5693,6 +5913,28 @@ void server_routes::init_routes() {
     };
 }
 
+// the /props and /models "vbr" object — built in ONE place. selected_kld/schedule are
+// static-ladder measurements: null under the dynamic controller (like realized_bpv), not 0.
+static json server_vbr_meta_json(const server_context_meta * meta) {
+    return json {
+        {"enabled",           meta->vbr_enabled},
+        {"dynamic",           meta->vbr_dynamic},
+        {"type_k",            meta->vbr_type_k},
+        {"type_v",            meta->vbr_type_v},
+        {"floor_bpv",         meta->vbr_min_bits},
+        {"capacity_floor_bpv", meta->vbr_capacity_bits},
+        // realized bits/value is a fixed number only for static schedules; under the
+        // dynamic runtime controller it varies with occupancy — null, not a fiction
+        {"realized_bpv",      meta->vbr_dynamic ? json() : json(meta->vbr_capacity_bits)},
+        {"selected_family",   meta->vbr_selected_family},
+        {"selected_policy",   meta->vbr_selected_policy},
+        {"selected_bpv",      meta->vbr_dynamic ? json() : json(meta->vbr_selected_bpv)},
+        {"selected_kld",      meta->vbr_dynamic ? json() : json(meta->vbr_selected_kld)},
+        {"selected_schedule", meta->vbr_dynamic ? json() : json(meta->vbr_selected_schedule)},
+        {"vram_budget_bytes", meta->vbr_vram_budget_bytes},
+    };
+}
+
 json server_routes::get_model_info() const {
     return json {
         {"id",       meta->model_name},
@@ -5706,6 +5948,7 @@ json server_routes::get_model_info() const {
             {"n_vocab",     meta->model_vocab_n_tokens},
             {"n_ctx",       meta->slot_n_ctx},
             {"n_ctx_train", meta->model_n_ctx_train},
+            {"vbr",         server_vbr_meta_json(meta.get())},
             {"n_embd",      meta->model_n_embd_inp},
             {"n_params",    meta->model_n_params},
             {"size",        meta->model_size},

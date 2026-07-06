@@ -39,7 +39,8 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+    const llama_memory_vbr_params & vbr = {});
 
     ~llama_memory_hybrid() = default;
 
@@ -58,6 +59,13 @@ public:
 
     bool get_can_shift() const override;
 
+    double kv_bpv() const override { return mem_attn->kv_bpv(); }
+
+    // recurrent state has no VBR controller and clears with rm-all; the attn cache answers
+    llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override {
+        return mem_attn->memory_vbr_state(seq_id, n_tokens_extra);
+    }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -70,6 +78,7 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown_fixed() const override;
 
     // state write/load
 

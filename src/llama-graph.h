@@ -326,6 +326,11 @@ public:
     const llama_cparams cparams;
 };
 
+// VBR tier-flip epoch of a memory context (0 when VBR is off); defined in llama-graph.cpp
+// where the context types are complete
+uint64_t llm_graph_vbr_epoch(const llama_kv_cache_context * mctx);
+uint64_t llm_graph_vbr_epoch(const llama_kv_cache_iswa_context * mctx);
+
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv(
@@ -336,6 +341,7 @@ public:
         hparams(hparams),
         cparams(cparams),
         mctx(mctx),
+        vbr_epoch(llm_graph_vbr_epoch(mctx)),
         tree_mask(tree_mask) {
     }
     ~llm_graph_input_attn_kv() = default;
@@ -359,6 +365,11 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // TurboQuant V-mean tap: per-layer GQA-expanded mu_V table [pdim, n_layer], added back
+    // once after the inverse WHT (attention weights sum to 1, so the mean re-enters as a
+    // constant vector). Loaded from TURBO_VMEAN_SUB; nullptr when the tap is off.
+    ggml_tensor * self_vmean = nullptr;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -366,6 +377,9 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    // VBR tier-flip epoch captured at graph build; can_reuse fences on it (in-place tier
+    // flips rewrite the cache tensors' type/strides under a reused graph's baked views)
+    uint64_t vbr_epoch = 0;
     const llama_tree_mask * tree_mask;
 };
 
@@ -379,7 +393,8 @@ public:
             const llama_kv_cache_context * mctx) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        vbr_epoch(llm_graph_vbr_epoch(mctx)) {
     }
     ~llm_graph_input_attn_k() = default;
 
@@ -400,6 +415,9 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    // VBR tier-flip epoch captured at graph build; can_reuse fences on it (in-place tier
+    // flips rewrite the cache tensors' type/strides under a reused graph's baked views)
+    uint64_t vbr_epoch = 0;
 };
 
 class llm_graph_input_attn_k_dsa : public llm_graph_input_i {
@@ -448,7 +466,8 @@ public:
             const llama_kv_cache_iswa_context * mctx) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        vbr_epoch(llm_graph_vbr_epoch(mctx)) {
     }
     ~llm_graph_input_attn_kv_iswa() = default;
 
@@ -480,10 +499,16 @@ public:
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
 
+    // TurboQuant V-mean tap (see llm_graph_input_attn_kv::self_vmean)
+    ggml_tensor * self_vmean = nullptr;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+    // VBR tier-flip epoch captured at graph build; can_reuse fences on it (in-place tier
+    // flips rewrite the cache tensors' type/strides under a reused graph's baked views)
+    uint64_t vbr_epoch = 0;
 };
 
 class llm_graph_input_attn_cross : public llm_graph_input_i {
@@ -1006,8 +1031,8 @@ struct llm_graph_context {
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
-                  float   kq_scale,
-                    int   il) const;
+            float   kq_scale,
+            int   il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

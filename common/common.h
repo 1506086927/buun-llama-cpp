@@ -616,6 +616,42 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    std::string vbr_budget = "dynamic"; // VBR target budget: dynamic or a fixed tier/bit width
+    std::string vbr_min_bits = "auto";  // VBR aggregate effective bits/value floor for dynamic capacity planning
+    std::string vbr_vram_budget = "auto"; // VBR KV VRAM budget: auto or explicit byte/suffixed size
+    std::string vbr_policy = "auto";    // VBR policy ladder JSON/path; auto checks VBR_POLICY_LADDER env
+    std::string vbr_selected_family;     // selected VBR ladder family, static or dynamic
+    std::string vbr_selected_policy;     // selected VBR measured policy/rung name
+    std::string vbr_selected_schedule;   // selected VBR schedule path
+    double vbr_min_bits_value = 0.0;     // requested aggregate floor in effective bits/value, 0 == auto/none; not a per-codec ban
+    double vbr_capacity_bits = 0.0;      // selected supported capacity floor in effective bits/value, 0 == auto/none
+    double vbr_selected_bpv = 0.0;       // measured BPV of the selected policy/rung
+    double vbr_selected_kld = 0.0;       // measured KLD of the selected policy/rung
+    uint64_t vbr_vram_budget_bytes = 0;  // explicit VBR KV VRAM budget in bytes, 0 == auto
+    bool vbr_budget_explicit = false;   // whether --vbr-budget/--vbr-bits was provided
+    bool vbr_min_bits_explicit = false; // whether --vbr-min-bits/--vbr-floor was provided
+    bool vbr_vram_budget_explicit = false; // whether --vbr-vram/--vbr-vram-budget was provided
+    bool vbr_policy_explicit = false;   // whether --vbr-policy was provided
+    bool vbr_cache_type_k = false;      // whether K was selected via the VBR cache-type alias
+    bool vbr_cache_type_v = false;      // whether V was selected via the VBR cache-type alias
+    // dynamic VBR server policy: clear idle slots' KV before a degrade wave would land the
+    // aggregate BELOW this bits/value. 8.125 = protect the f16/t8 near-lossless band (above it,
+    // degrading beats destroying another client's re-prefillable cache); 0 = never reclaim;
+    // >= 16 = reclaim before any degrade (single-user maximal-quality profile)
+    float vbr_reclaim_floor_bpv = 8.125f;
+    // dynamic VBR server policy: when a DEGRADED conversation would keep less than this
+    // fraction of its prompt as reusable prefix anyway, drop the prefix entirely so the
+    // empty-cache lossless reset restores the entry tier (turn-N cache quality = turn-1).
+    // 0 disables the trade.
+    float vbr_reset_keep_frac = 0.25f;
+    // canonical predicates — use these instead of re-deriving the flag combinations
+    bool vbr_enabled() const {
+        return vbr_cache_type_k || vbr_cache_type_v || vbr_budget_explicit ||
+               vbr_min_bits_explicit || vbr_vram_budget_explicit || vbr_policy_explicit;
+    }
+    bool vbr_dynamic() const {
+        return vbr_enabled() && (vbr_budget == "dynamic" || vbr_budget == "auto" || vbr_budget.empty());
+    }
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

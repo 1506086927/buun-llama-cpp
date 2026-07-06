@@ -53,6 +53,7 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown_fixed() const override;
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 

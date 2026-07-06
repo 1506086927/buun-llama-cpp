@@ -1,5 +1,6 @@
 #include "llama-model.h"
 
+#include "ggml-turbo-meansub.h"
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
@@ -1009,6 +1010,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer);
+
+    // Record model identity for the binary-baked KV affine-tap means (arch-keyed, tap default-on).
+    // MUST be here, before load_arch_hparams() repurposes hparams.n_embd for the qwen35 hybrid.
+    ggml_turbo_meansub_set_model(arch_name().c_str(), (int) hparams.n_layer, (int) hparams.n_embd);
+
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
@@ -1943,6 +1949,17 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    // TurboQuant dynamic-VBR inputs for the attention KV caches (no-op unless armed);
+    // recurrent/DSA caches do not take them
+    const llama_memory_vbr_params vbr = {
+        /*.dynamic               =*/ cparams.vbr_dynamic,
+        /*.budget_bytes          =*/ cparams.vbr_vram_budget_bytes,
+        /*.min_bits              =*/ cparams.vbr_min_bits,
+        /*.budget_explicit       =*/ cparams.vbr_budget_explicit,
+        /*.growth_headroom_bytes =*/ cparams.vbr_growth_headroom_bytes,
+        /*.device_share          =*/ 1.0,
+    };
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -1972,7 +1989,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         hparams.n_swa,
                         hparams.swa_type,
                         nullptr,
-                        nullptr);
+                        nullptr,
+                        vbr);
             } break;
         case LLM_ARCH_LLADA:
         case LLM_ARCH_LLADA_MOE:
@@ -2062,7 +2080,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* vbr               */ vbr);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -2081,7 +2100,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* vbr               */ vbr);
                     }
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
@@ -2118,7 +2138,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.n_ubatch,
                                 1,
                                 filter,
-                                reuse);
+                                reuse,
+                                vbr);
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
@@ -2136,7 +2157,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 hparams.n_swa,
                                 hparams.swa_type,
                                 filter,
-                                nullptr);
+                                nullptr,
+                                vbr);
                     }
                 }
             }

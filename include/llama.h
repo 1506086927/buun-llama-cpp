@@ -363,6 +363,11 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        // TurboQuant dynamic VBR (see vbr_dynamic below) [EXPERIMENTAL]
+        double vbr_min_bits;              // aggregate KV floor in effective bits/value, 0 = bottom-tier floor; not a per-codec ban
+        uint64_t vbr_vram_budget_bytes;   // mapped-physical KV VRAM budget in bytes, 0 = floor-layout-cost fallback
+        uint64_t vbr_growth_headroom_bytes; // free-VRAM headroom the runtime keeps when re-deriving
+                                          // an AUTO budget upward at decode boundaries (0 = 1 GiB default)
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -384,6 +389,11 @@ extern "C" {
         bool no_fused_gdn; // disable fused Gated Delta Net kernels (use decomposed ops)
         bool logits_all;  // if false, reserve logits buffer for n_seqs outputs only (saves VRAM on big-vocab models);
                           // set true when per-token logits are needed (e.g. perplexity)
+        bool vbr_dynamic; // arm the decode-time KV degrade controller (turbo-typed caches decay
+                          // tier-by-tier as the context fills; requires flash attention and a
+                          // backend exporting the ggml-vbr.h interface) [EXPERIMENTAL]
+        bool vbr_budget_explicit; // vbr_vram_budget_bytes is a user-set HARD CAP: the runtime
+                          // must never re-derive it from live free VRAM [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -784,6 +794,34 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    // effective bits/value of the attention KV cache at its CURRENT tensor types, aggregated
+    // over all KV layers (f16 = 16, q8_0 = 8.5, turbo tiers struct-true). Under dynamic VBR
+    // this moves at runtime as tiers degrade/reset. Returns -1 when the context's memory
+    // holds no attention KV. [EXPERIMENTAL]
+    LLAMA_API double llama_memory_kv_bpv(llama_memory_t mem);
+
+    // TurboQuant dynamic VBR: point-in-time pressure/quality state of the attention KV memory.
+    // All-zero when the memory has no active dynamic-VBR controller. [EXPERIMENTAL]
+    struct llama_memory_vbr_state_data {
+        int64_t  deficit_raw;      // projected bytes over the CONFIGURED budget at the current
+                                   // watermark extended by n_tokens_extra (<= 0: fits). Page-exact
+                                   // and free-VRAM independent -- safe to drive policy (e.g. cache
+                                   // eviction) deterministically.
+        int64_t  deficit_clamped;  // same, against the live free-VRAM-clamped budget. Moves with
+                                   // co-tenant VRAM use -- telemetry/emergency signal, NOT policy.
+        double   bpv_if_degraded;  // aggregate KV bits/value the degrade ladder would land at if
+                                   // deficit_raw were paid by tier degradation alone
+        int32_t  cursor;           // applied degrade steps (0 = pristine entry tiers)
+        uint32_t used_cells_other; // used cells NOT owned exclusively by seq_id (seq_id < 0
+                                   // counts every used cell) -- 0 means removing seq_id's cells
+                                   // would empty the cache (full-reset feasibility)
+    };
+
+    // seq_id: the sequence asking (for used_cells_other); n_tokens_extra: tokens about to be
+    // decoded on top of the current occupancy (a launch passes the incoming prompt's suffix).
+    LLAMA_API struct llama_memory_vbr_state_data llama_memory_vbr_state(
+            llama_memory_t mem, llama_seq_id seq_id, uint32_t n_tokens_extra);
 
     // Expand the recurrent state to new_n_seq_max cells (for deferred backup allocation).
     // Returns true on success. No-op if the memory is already large enough or has no recurrent component.

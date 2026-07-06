@@ -511,6 +511,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "turbo2_tcq") {
         return GGML_TYPE_TURBO2_TCQ;
     }
+    if (s == "turbo1_tcq") {
+        return GGML_TYPE_TURBO1_TCQ;
+    }
 
     return GGML_TYPE_COUNT;
 }

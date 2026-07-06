@@ -5021,7 +5021,11 @@ static void ggml_compute_forward_set_rows_f32(
 
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+                if (i1 < 0) {
+                    continue;
+                }
+
+                GGML_ASSERT(i1 < ne1);
 
                 from_float(
                         (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),

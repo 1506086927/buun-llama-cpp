@@ -24,7 +24,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) : hparams(model.hparams), unified(unified) {
+    const  layer_reuse_cb & reuse,
+    const llama_memory_vbr_params & vbr) : hparams(model.hparams), unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -57,19 +58,52 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         size_swa = size_base;
     }
 
+    // split the dynamic-VBR budget across the two caches proportional to their worst-case
+    // (entry-tier) footprints — layers x cells; both instances arming with the FULL budget
+    // would target ~2x the configured mapped-physical total before degrading
+    llama_memory_vbr_params vbr_base = vbr;
+    llama_memory_vbr_params vbr_swa  = vbr;
+    if (vbr.dynamic || vbr.budget_bytes > 0) {
+        uint64_t n_base_l = 0;
+        uint64_t n_swa_l  = 0;
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            if (filter && !filter(il)) {
+                continue;
+            }
+            (hparams.is_swa(il) ? n_swa_l : n_base_l)++;
+        }
+        const double w_base = (double) n_base_l * size_base;
+        const double w_swa  = (double) n_swa_l  * size_swa;
+        if (w_base + w_swa > 0.0) {
+            // the same footprint weights split BOTH the configured budget and the children's
+            // claim on the device's spare VRAM (device_share): two independent controllers on
+            // one device must never both re-derive against the full free amount
+            vbr_base.device_share = vbr.device_share * (w_base / (w_base + w_swa));
+            vbr_swa.device_share  = vbr.device_share - vbr_base.device_share;
+            if (vbr.budget_bytes > 0) {
+                vbr_base.budget_bytes = (uint64_t) ((double) vbr.budget_bytes * (w_base / (w_base + w_swa)));
+                vbr_swa.budget_bytes  = vbr.budget_bytes - vbr_base.budget_bytes;
+                if (vbr.dynamic) {
+                    LLAMA_LOG_INFO("%s: VBR budget split: %.2f MiB base / %.2f MiB SWA (by entry-tier footprint)\n",
+                            __func__, vbr_base.budget_bytes/1024.0/1024.0, vbr_swa.budget_bytes/1024.0/1024.0);
+                }
+            }
+        }
+    }
+
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
 
     kv_base = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, filter_base, reuse);
+            0, LLAMA_SWA_TYPE_NONE, filter_base, reuse, vbr_base);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     kv_swa = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
-            hparams.n_swa, hparams.swa_type, filter_swa, reuse);
+            hparams.n_swa, hparams.swa_type, filter_swa, reuse, vbr_swa);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {
@@ -215,6 +249,38 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_full() {
 
 llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_iswa_context>(this, lctx, optimize);
+}
+
+double llama_kv_cache_iswa::kv_bpv() const {
+    double bits = 0.0;
+    double vals = 0.0;
+    kv_base->kv_bpv_accum(bits, vals);
+    kv_swa ->kv_bpv_accum(bits, vals);
+    return vals > 0.0 ? bits / vals : -1.0;
+}
+
+llama_memory_vbr_state_data llama_kv_cache_iswa::memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const {
+    const llama_memory_vbr_state_data b = kv_base->memory_vbr_state(seq_id, n_tokens_extra);
+    const llama_memory_vbr_state_data s = kv_swa ->memory_vbr_state(seq_id, n_tokens_extra);
+
+    llama_memory_vbr_state_data r = {};
+    // each child runs an independent controller with its own budget share: either one over
+    // budget means degrades happen, so pressure combines as max, exactly like the trigger
+    r.deficit_raw      = std::max(b.deficit_raw,     s.deficit_raw);
+    r.deficit_clamped  = std::max(b.deficit_clamped, s.deficit_clamped);
+    r.cursor           = b.cursor + s.cursor;
+    r.used_cells_other = b.used_cells_other + s.used_cells_other;
+
+    // value-weighted like kv_bpv: weight each child's landing bpv by its total KV values
+    double bits_base = 0.0, vals_base = 0.0;
+    double bits_swa  = 0.0, vals_swa  = 0.0;
+    kv_base->kv_bpv_accum(bits_base, vals_base);
+    kv_swa ->kv_bpv_accum(bits_swa,  vals_swa);
+    const double vals_sum = vals_base + vals_swa;
+    r.bpv_if_degraded = vals_sum > 0.0
+        ? (b.bpv_if_degraded * vals_base + s.bpv_if_degraded * vals_swa) / vals_sum
+        : 0.0;
+    return r;
 }
 
 bool llama_kv_cache_iswa::get_can_shift() const {

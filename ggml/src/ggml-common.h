@@ -347,6 +347,52 @@ typedef struct {
 } block_turbo8_0;                       // 130 bytes total
 static_assert(sizeof(block_turbo8_0) == sizeof(ggml_half) + QK_TURBO8, "wrong turbo8_0 block size/padding");
 
+// --- RESERVED layouts (turbo1 / turbo1_nsn / turbo1_cq codecs removed 2026-07-05) ---
+// The structs stay so the reserved enum slots keep well-defined type_traits metadata;
+// no encode/decode paths reference them anymore.
+// TurboQuant 1-bit: FWHT + sign + per-group fp16 scale. recon_t = sign_t * d.
+// Per block: d(fp16) + 128 sign bits (16 bytes)
+// = 18 bytes per 128 values = 1.125 bits/value.
+#define QK_TURBO1 128
+typedef struct {
+    ggml_half  d;                       //  2 bytes: per-group reconstruction scale
+    uint8_t    qs[QK_TURBO1 / 8];       // 16 bytes: 128 sign bits (1 = negative)
+} block_turbo1;                         // 18 bytes total
+static_assert(sizeof(block_turbo1) == sizeof(ggml_half) + QK_TURBO1/8, "wrong turbo1 block size/padding");
+
+// turbo1_nsn: NSNQuant double-normalize + per-chunk per-head centering, then 1-bit sign.
+// Decode: v = s1*(s2*sqrt(128)*invFWHT(sign*sigma) + o[layer][head][channel]).
+// s1 = ||v||/sqrt(128) (token-norm), s2 = ||v_n - o||/sqrt(128) (post-center renorm).
+#define QK_TURBO1_NSN 128
+typedef struct {
+    ggml_half  s1;                      //  2 bytes: token L2 norm / sqrt(128)
+    ggml_half  s2;                      //  2 bytes: post-centering renorm
+    uint8_t    qs[QK_TURBO1_NSN / 8];   // 16 bytes: 128 sign bits (1 = negative)
+} block_turbo1_nsn;                     // 20 bytes total = 1.25 bpw
+static_assert(sizeof(block_turbo1_nsn) == 2*sizeof(ggml_half) + QK_TURBO1_NSN/8, "wrong turbo1_nsn block size/padding");
+
+// turbo1_cq: Coupled Quantization. 128-coord block = 16 groups of 8 channels; each group is a
+// single 8-bit index into a shared 256-entry 8-dim codebook (1 bit/channel) + per-block fp16 scale.
+// Decode: recon[g*8+k] = d * codebook[qs[g]*8 + k], then inverse FWHT.
+#define QK_TURBO1_CQ 128
+typedef struct {
+    ggml_half  d;                       //  2 bytes: per-group reconstruction scale (norm-corrected)
+    uint8_t    qs[QK_TURBO1_CQ / 8];    // 16 bytes: 16 codebook indices (one per 8-channel group)
+} block_turbo1_cq;                      // 18 bytes total = 1.125 bpw
+static_assert(sizeof(block_turbo1_cq) == sizeof(ggml_half) + QK_TURBO1_CQ/8, "wrong turbo1_cq block size/padding");
+
+// turbo1_tcq: 1-bit Trellis-Coded Quantization (right-shift bitshift trellis, k=1, L=8, 256 states).
+// One block = one 128-element FWHT-rotated group. Bitstream: 7 init-prefix + 128x1-bit outputs = 135 bits = 17 bytes.
+// Decode: state_t = read_8_bits(qs, t*1), recon_t = codebook[state_t] * norm, then per-row inverse FWHT
+// (materialize path). Separate K/V codebooks. = 20 bytes / 128 = 1.25 bits/value.
+#define QK_TURBO1_TCQ 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected group L2 norm
+    uint8_t    qs[17];                  // 17 bytes: 135-bit trellis bitstream (1 padding bit)
+    uint8_t    pad;                     //  1 byte:  alignment padding (struct rounds to 2)
+} block_turbo1_tcq;                     // 20 bytes total for 128 values (1.25 bpv)
+static_assert(sizeof(block_turbo1_tcq) == sizeof(ggml_half) + 18, "wrong turbo1_tcq block size/padding");
+
 //
 // Super-block quantization structures
 //

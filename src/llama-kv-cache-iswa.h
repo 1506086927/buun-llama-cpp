@@ -26,7 +26,8 @@ public:
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        const llama_memory_vbr_params & vbr = {});
 
     ~llama_kv_cache_iswa() = default;
 
@@ -44,6 +45,10 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+
+    double kv_bpv() const override; // value-weighted combination of the base and SWA caches
+
+    llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
 
     void clear(bool data) override;
 

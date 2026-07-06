@@ -159,6 +159,11 @@ export function useProcessingState(): UseProcessingStateReturn {
 			);
 		}
 
+		// effective KV cache bits/value — live under dynamic VBR (drops as tiers degrade)
+		if (typeof stateToUse.kvBpv === 'number' && stateToUse.kvBpv > 0) {
+			details.push(`${stateToUse.kvBpv.toFixed(2)} KVB`);
+		}
+
 		if (stateToUse.outputTokensUsed > 0) {
 			// Handle infinite max_tokens (-1) case
 			if (stateToUse.outputTokensMax <= 0) {
@@ -207,6 +212,11 @@ export function useProcessingState(): UseProcessingStateReturn {
 			details.push(
 				`Context: ${stateToUse.contextUsed}/${stateToUse.contextTotal} (${contextPercent}%)`
 			);
+		}
+
+		// effective KV cache bits/value — live under dynamic VBR (drops as tiers degrade)
+		if (typeof stateToUse.kvBpv === 'number' && stateToUse.kvBpv > 0) {
+			details.push(`${stateToUse.kvBpv.toFixed(2)} KVB`);
 		}
 
 		if (stateToUse.outputTokensUsed > 0) {

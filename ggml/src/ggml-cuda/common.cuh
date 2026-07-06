@@ -22,6 +22,17 @@
 #endif
 #include "ggml-common.h"
 
+// TURBO3_SKEW_EXP — odd-moment (skew) codec experiment for turbo3_0 (TorQuant V3 delta
+// follow-up, 2026-07-03). Compile-time so every TU's __constant__ copies stay consistent.
+//   0 = stock codebook (production)
+//   1 = data-retrained SYMMETRIC 8-level book (constants swap only, no sign alignment)
+//   2 = skew-sign-aligned ASYMMETRIC book: post-FWHT coordinate j is flipped by a per-side
+//       baked sign ss[j] at encode (all coords positively skewed), decode multiplies back
+//   3 = plumbing oracle: variant-2 code paths active but stock book and ss ≡ +1 — must be
+//       bit-identical to 0. Coverage gap (all modes): generic get_rows dequant path is
+//       side-blind and stays unaligned; it does not fire in perplexity/decode workloads.
+#define TURBO3_SKEW_EXP 0
+
 #include <array>
 #include <algorithm>
 #include <cassert>

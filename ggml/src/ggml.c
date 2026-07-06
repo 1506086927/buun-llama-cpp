@@ -797,6 +797,32 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo2_tcq,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo2_tcq_ref,
     },
+    [GGML_TYPE_TURBO1] = { // RESERVED (codec removed 2026-07-05); metadata kept so the slot stays well-defined
+        .type_name                = "turbo1",
+        .blck_size                = QK_TURBO1,
+        .type_size                = sizeof(block_turbo1),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TURBO1_NSN] = { // RESERVED (codec removed 2026-07-05); metadata kept so the slot stays well-defined
+        .type_name                = "turbo1_nsn",
+        .blck_size                = QK_TURBO1_NSN,
+        .type_size                = sizeof(block_turbo1_nsn),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TURBO1_CQ] = { // RESERVED (codec removed 2026-07-05); metadata kept so the slot stays well-defined
+        .type_name                = "turbo1_cq",
+        .blck_size                = QK_TURBO1_CQ,
+        .type_size                = sizeof(block_turbo1_cq),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TURBO1_TCQ] = {
+        .type_name                = "turbo1_tcq",
+        .blck_size                = QK_TURBO1_TCQ,
+        .type_size                = sizeof(block_turbo1_tcq),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo1_tcq,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo1_tcq_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1385,6 +1411,21 @@ bool ggml_is_quantized(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
     return type_traits[type].is_quantized;
+}
+
+bool ggml_is_turbo_kv_type(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO8_0:
+        case GGML_TYPE_TURBO3_TCQ:
+        case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO1_TCQ:
+            return true;
+        default: // the RESERVED turbo1 slots (48-50) are dead codecs, not members
+            return false;
+    }
 }
 
 const char * ggml_op_name(enum ggml_op op) {
@@ -7931,6 +7972,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TURBO8_0: result = quantize_turbo8_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO3_TCQ: result = quantize_turbo3_tcq(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO2_TCQ: result = quantize_turbo2_tcq(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO1_TCQ: result = quantize_turbo1_tcq(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

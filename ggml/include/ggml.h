@@ -435,7 +435,11 @@ extern "C" {
         GGML_TYPE_TURBO3_TCQ = 45, // TurboQuant 3-bit KV cache: TCQ (Trellis-Coded Quantization)
         GGML_TYPE_TURBO2_TCQ = 46, // TurboQuant 2-bit KV cache: TCQ (k=2, L=8, 256 states)
         GGML_TYPE_TURBO8_0 = 47, // TurboQuant 8-bit KV cache: FWHT + uniform 256-level grid + per-block absmax, no QJL
-        GGML_TYPE_COUNT   = 48,
+        GGML_TYPE_TURBO1   = 48, // RESERVED (codec removed 2026-07-05; slot kept for gguf type-id stability)
+        GGML_TYPE_TURBO1_NSN = 49, // RESERVED (codec removed 2026-07-05)
+        GGML_TYPE_TURBO1_CQ = 50, // RESERVED (codec removed 2026-07-05)
+        GGML_TYPE_TURBO1_TCQ = 51, // turbo1 Trellis-Coded: FWHT + k=1/L=8 trellis, separate K/V 256-state codebooks (1.25 bpw)
+        GGML_TYPE_COUNT   = 52,
     };
 
     // precision
@@ -765,6 +769,10 @@ extern "C" {
     GGML_API size_t  ggml_element_size(const struct ggml_tensor * tensor);
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
+
+    // TurboQuant KV-cache codec family (turbo2/3/4/8 + the TCQ tiers). These types are only
+    // usable as KV-cache tensors on a backend exporting the VBR interface (see ggml-vbr.h).
+    GGML_API bool    ggml_is_turbo_kv_type(enum ggml_type type);
 
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);

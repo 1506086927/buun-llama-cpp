@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 
+#include "ggml-turbo-meansub.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -14,11 +15,154 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+#include <vector>
+
+// TurboQuant V-mean tap (TorQuant Prop 3.5). The CUDA encode path subtracts per-layer raw V
+// means (TURBO_VMEAN_SUB, PFH1 dump, V slab); attention weights sum to 1, so the weighted sum
+// of centered V reconstructions equals (output - mu_V) — ONE broadcast add after the graph's
+// inverse WHT restores exactness. This builds the GQA-expanded, head-padded host table
+// [pdim, n_layer] once; layers with insufficient calibration rows stay zero (no-op).
+static const std::vector<float> * turbo_vmean_table(const llama_hparams & hparams, int64_t & pdim_out) {
+    static std::vector<float> tab;
+    static int64_t pdim = 0;
+    static int state = 0; // 0 = uninit, 1 = loaded, -1 = absent/failed
+    if (state == 0) {
+        state = -1;
+
+        // Source the dense V-slab means (mu, dead layers zeroed): TURBO_VMEAN_SUB file override
+        // first (experiments), else the binary-baked per-architecture table (tap default-on).
+        std::vector<float> mu;        // [max_l * max_c], V slab, dead layers = 0
+        size_t max_l = 0, max_c = 0;
+
+        if (getenv("TURBO_MEANSUB_OFF")) {   // explicit disable (A/B + opt-out)
+            pdim_out = pdim;
+            return nullptr;
+        }
+        const char * path = getenv("TURBO_VMEAN_SUB");
+        if (path && path[0]) {
+            FILE * f = fopen(path, "rb");
+            if (!f) {
+                fprintf(stderr, "VMEAN tap: cannot open %s\n", path);
+            } else {
+                int32_t hdr[4] = {0, 0, 0, 0};
+                bool ok = fread(hdr, sizeof(int32_t), 4, f) == 4 && hdr[0] == 0x50464831 && hdr[1] == 2;
+                max_l = ok ? (size_t) hdr[2] : 0;
+                max_c = ok ? (size_t) hdr[3] : 0;
+                const size_t nk = max_l * max_c;
+                std::vector<float>   sums(nk);
+                std::vector<int32_t> cnts(2 * max_l);
+                // file layout: hdr | sums[2][L][C] | sqs[2][L][C] | cnts[2][L]; V slab = second
+                ok = ok && nk > 0 &&
+                     fseek(f, (long) (16 + nk * sizeof(float)), SEEK_SET) == 0 &&
+                     fread(sums.data(), sizeof(float), nk, f) == nk &&
+                     fseek(f, (long) (16 + 4 * nk * sizeof(float)), SEEK_SET) == 0 &&
+                     fread(cnts.data(), sizeof(int32_t), 2 * max_l, f) == 2 * max_l;
+                fclose(f);
+                if (!ok) {
+                    fprintf(stderr, "VMEAN tap: bad/short PFH1 file %s\n", path);
+                    max_l = max_c = 0;
+                } else {
+                    mu.assign(nk, 0.0f);
+                    for (size_t l = 0; l < max_l; l++) {
+                        const int32_t c = cnts[max_l + l];   // V slab counts
+                        if (c < 100) continue;
+                        for (size_t j = 0; j < max_c; j++) mu[l * max_c + j] = sums[l * max_c + j] / c;
+                    }
+                }
+            }
+        } else {
+            int bL = 0, bC = 0, blive = 0;
+            const float * baked = ggml_turbo_meansub_active(1, &bL, &bC, &blive);   // V slab
+            if (baked && blive > 0) {
+                max_l = (size_t) bL;
+                max_c = (size_t) bC;
+                mu.assign(baked, baked + (size_t) bL * bC);
+            }
+        }
+
+        if (!mu.empty()) {
+            int64_t w = 0;
+            for (uint32_t il = 0; il < hparams.n_layer; il++) {
+                const int64_t hd = hparams.n_embd_head_v(il);
+                const int64_t nh = hparams.n_head(il);
+                if (hd <= 0 || nh <= 0) continue;
+                const int64_t cand = GGML_PAD(hd, 128) * nh;
+                if (cand > w) w = cand;
+            }
+            int live = 0;
+            if (w > 0) {
+                tab.assign((size_t) w * hparams.n_layer, 0.0f);
+                for (uint32_t il = 0; il < hparams.n_layer && il < max_l; il++) {
+                    const int64_t hd  = hparams.n_embd_head_v(il);
+                    const int64_t nh  = hparams.n_head(il);
+                    const int64_t nkv = hparams.n_head_kv(il);
+                    if (hd <= 0 || nh <= 0 || nkv <= 0) continue;
+                    // Narrower layers (e.g. gemma4 SWA vs global widths) occupy a prefix of the
+                    // pdim-wide row; requiring == w armed ZERO layers on heterogeneous geometry
+                    // while the encode side still subtracted -> V shifted by -mu, never restored.
+                    if ((int64_t) max_c < nkv * hd || GGML_PAD(hd, 128) * nh > w) continue;
+                    bool any = false;   // skip dead (all-zero) layers
+                    for (int64_t j = 0; j < nkv * hd && !any; j++) {
+                        if (mu[(size_t) il * max_c + j] != 0.0f) any = true;
+                    }
+                    if (!any) continue;
+                    const int64_t phd = GGML_PAD(hd, 128);
+                    live++;
+                    for (int64_t qh = 0; qh < nh; qh++) {
+                        const int64_t kvh = qh / (nh / nkv);
+                        for (int64_t d = 0; d < hd; d++) {
+                            tab[(size_t) il * w + qh * phd + d] =
+                                mu[(size_t) il * max_c + kvh * hd + d];
+                        }
+                    }
+                }
+            }
+            if (live > 0) {
+                pdim = w;
+                state = 1;
+                fprintf(stderr, "VMEAN tap: graph add armed, %d live layers (pdim %lld)\n",
+                        live, (long long) w);
+            } else {
+                fprintf(stderr, "VMEAN tap: no live V layers — add disabled\n");
+            }
+        }
+    }
+    pdim_out = pdim;
+    return state == 1 ? &tab : nullptr;
+}
+
+static bool turbo_ragged_v_rotated_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * e = getenv("TURBO_RAGGED_V_ROTATED");
+        enabled = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+// Fill the self_vmean input tensor. MUST be called from EVERY set_input path that owns an
+// attention input — including the mem-hybrid wrappers, which forward aux fields manually
+// and do NOT call the inner attention input's set_input.
+static void turbo_vmean_fill(ggml_tensor * t, const llama_hparams & hparams) {
+    if (!t || !t->buffer) {
+        return;
+    }
+    int64_t vm_pdim = 0;
+    const auto * vm = turbo_vmean_table(hparams, vm_pdim);
+    if (!vm) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+    memcpy(t->data, vm->data(), ggml_nbytes(t));
+}
 
 // dedup helpers
 
@@ -526,6 +670,16 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    turbo_vmean_fill(self_vmean, hparams);
+}
+
+uint64_t llm_graph_vbr_epoch(const llama_kv_cache_context * mctx) {
+    return mctx->get_vbr_tier_epoch();
+}
+
+uint64_t llm_graph_vbr_epoch(const llama_kv_cache_iswa_context * mctx) {
+    return mctx->get_base()->get_vbr_tier_epoch() + mctx->get_swa()->get_vbr_tier_epoch();
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -539,6 +693,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // in-place VBR tier flips rewrite the cache tensors' type/strides; this graph's K/V views
+    // and set_rows dst were baked at build time (a mid-band free-VRAM-clamp wave flips tiers
+    // without an n_kv shape change, so the checks above cannot see it)
+    res &= vbr_epoch == llm_graph_vbr_epoch(mctx);
 
     return res;
 }
@@ -559,6 +718,9 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // fence reuse off in-place VBR tier flips (see llm_graph_input_attn_kv)
+    res &= vbr_epoch == llm_graph_vbr_epoch(mctx);
 
     return res;
 }
@@ -623,6 +785,8 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot_swa) {
         mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
     }
+
+    turbo_vmean_fill(self_vmean, hparams);
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
@@ -647,6 +811,9 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
     }
+
+    // fence reuse off in-place VBR tier flips in either cache (see llm_graph_input_attn_kv)
+    res &= vbr_epoch == llm_graph_vbr_epoch(mctx);
 
     return res;
 }
@@ -690,7 +857,6 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
-
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
     if (inp_attn->self_k_rot) {
@@ -700,6 +866,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     if (inp_attn->self_v_rot) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
+
+    turbo_vmean_fill(inp_attn->self_vmean, inp_attn->hparams);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -814,6 +982,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     if (inp_attn->self_v_rot_swa) {
         attn_ctx->get_swa()->set_input_v_rot(inp_attn->self_v_rot_swa);
     }
+
+    turbo_vmean_fill(inp_attn->self_vmean, inp_attn->hparams);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -2301,6 +2471,14 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+    {
+        int64_t vm_pdim = 0;
+        if (turbo_vmean_table(hparams, vm_pdim)) {
+            inp->self_vmean = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, vm_pdim, hparams.n_layer);
+            ggml_set_input(inp->self_vmean);
+        }
+    }
+
     return inp;
 }
 
@@ -2374,11 +2552,23 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant V un-rotation at graph level (CUDA graph compatible)
-    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
+    // TurboQuant V un-rotation at graph level (CUDA graph compatible).
+    // Ragged V can opt into the same contract while using an F16 cache by writing rotated-domain V.
+    const bool turbo_v_rotated = ggml_is_turbo_kv_type(v->type);
+    const bool ragged_v_rotated = v->type == GGML_TYPE_F16 && turbo_ragged_v_rotated_enabled();
+    if (turbo_v_rotated || ragged_v_rotated) {
         if (cur->ne[0] % 128 == 0) {
             cur = ggml_cont(ctx0, cur);  // force copy to break potential aliasing
             cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
+            // V-mean tap: restore mu_V once (weights sum to 1 -> mean re-enters as a constant).
+            // View this layer's prefix of the pdim-wide mu row: narrower layers (gemma4 SWA vs
+            // global) must still restore or encode-side subtraction leaves V shifted by -mu.
+            // TURBO8_0 excluded: its encode is tap-gated (turbo_tap_mu), so nothing to restore.
+            if (v->type != GGML_TYPE_TURBO8_0 && inp->self_vmean && inp->self_vmean->ne[0] >= cur->ne[0]) {
+                ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, cur->ne[0], 1,
+                        inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
+                cur = ggml_add(ctx0, cur, mu);
+            }
         }
     } else if (inp->self_v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
@@ -2649,11 +2839,21 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant V un-rotation at graph level (CUDA graph compatible)
-    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO8_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
+    // TurboQuant V un-rotation at graph level (CUDA graph compatible).
+    const bool turbo_v_rotated = ggml_is_turbo_kv_type(v->type);
+    const bool ragged_v_rotated = v->type == GGML_TYPE_F16 && turbo_ragged_v_rotated_enabled();
+    if (turbo_v_rotated || ragged_v_rotated) {
         if (cur->ne[0] % 128 == 0) {
             cur = ggml_cont(ctx0, cur);
             cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
+            // V-mean tap: restore mu_V once (weights sum to 1 -> mean re-enters as a constant).
+            // Prefix view per layer — see the primary attention site for why >= / cur->ne[0]
+            // and the turbo_tap_mu gate for why TURBO8_0 is excluded.
+            if (v->type != GGML_TYPE_TURBO8_0 && inp->self_vmean && inp->self_vmean->ne[0] >= cur->ne[0]) {
+                ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, cur->ne[0], 1,
+                        inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
+                cur = ggml_add(ctx0, cur, mu);
+            }
         }
     } else if (v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
@@ -2788,6 +2988,14 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
+
+    {
+        int64_t vm_pdim = 0;
+        if (turbo_vmean_table(hparams, vm_pdim)) {
+            inp->self_vmean = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, vm_pdim, hparams.n_layer);
+            ggml_set_input(inp->self_vmean);
+        }
+    }
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }

@@ -25,6 +25,25 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 };
 
+// TurboQuant dynamic-VBR runtime parameters, threaded from llama_context_params through
+// create_memory into the attention KV caches (backend side: ggml-vbr.h). The VBR_VMM /
+// VBR_MODE / VBR_BUDGET_MIB / VBR_MIN_BITS environment variables remain available as
+// developer overrides on top of these.
+struct llama_memory_vbr_params {
+    bool     dynamic      = false; // arm the VMM pool + decode-time degrade controller
+    uint64_t budget_bytes = 0;     // mapped-physical KV budget; 0 = floor-layout-cost fallback
+    double   min_bits     = 0.0;   // aggregate bits/value floor (0 = bottom-tier floor)
+    // explicit budgets are HARD CAPS: the runtime never re-derives them from live free VRAM
+    // (an auto budget floats within [armed value, live reach] at decode boundaries)
+    bool     budget_explicit = false;
+    // free-VRAM headroom kept when re-deriving an auto budget (0 = 1 GiB default; the fit
+    // passes its --fit-target so startup and runtime encode the same worst case)
+    uint64_t growth_headroom_bytes = 0;
+    // this cache's fraction of its device's spare VRAM (iSWA children share a device; the
+    // parent splits by entry-tier footprint so the children never double-claim the same free)
+    double   device_share = 1.0;
+};
+
 enum llama_memory_status {
     LLAMA_MEMORY_STATUS_SUCCESS = 0,
     LLAMA_MEMORY_STATUS_NO_UPDATE,
@@ -101,6 +120,17 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // effective bits/value of the attention KV storage, aggregated over all KV tensors at
+    // their CURRENT types (dynamic VBR tier flips move this at runtime; f16 = 16, q8_0 = 8.5,
+    // turbo tiers struct-true). -1 when the memory holds no attention KV (recurrent-only).
+    virtual double kv_bpv() const { return -1.0; }
+
+    // dynamic-VBR pressure/quality state (llama.h: llama_memory_vbr_state_data). Default =
+    // all zeros: "no controller, no pressure, nothing resident" — safe for policy consumers.
+    virtual llama_memory_vbr_state_data memory_vbr_state(llama_seq_id /*seq_id*/, uint32_t /*n_tokens_extra*/) const {
+        return {};
+    }
+
     //
     // ops
     //
@@ -118,6 +148,11 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    // the subset of memory_breakdown() that does NOT scale with the context length (e.g. the
+    // recurrent-state cache, sized by n_seq_max). Reported so budget math can charge it even
+    // where the context-linear part cancels out of a projection. Empty for pure KV caches.
+    virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown_fixed() const { return {}; }
 
     //
     // state write/read

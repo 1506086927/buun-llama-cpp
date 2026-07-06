@@ -640,3 +640,31 @@ size_t quantize_turbo8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     }
     return nrows * row_size;
 }
+
+// turbo1_tcq CPU ref: STUB (the 256-state trellis codebook + Viterbi are CUDA-only; CPU path unused for KV decode).
+void quantize_row_turbo1_tcq_ref(const float * GGML_RESTRICT x, block_turbo1_tcq * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO1_TCQ == 0);
+    const int nb = k / QK_TURBO1_TCQ;
+    for (int b = 0; b < nb; b++) {
+        const float * src = x + b * QK_TURBO1_TCQ;
+        float ns = 0.0f; for (int i = 0; i < QK_TURBO1_TCQ; i++) ns += src[i]*src[i];
+        y[b].norm = GGML_FP32_TO_FP16(sqrtf(ns) * 0.08838834764831845f);
+        for (int i = 0; i < 17; i++) y[b].qs[i] = 0;
+    }
+}
+void dequantize_row_turbo1_tcq(const block_turbo1_tcq * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO1_TCQ == 0);
+    memset(y, 0, (size_t)k * sizeof(float)); // stub; real decode is the CUDA trellis lookup + inverse FWHT
+    (void)x;
+}
+size_t quantize_turbo1_tcq(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                           int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO1_TCQ == 0);
+    size_t row_size = (n_per_row / QK_TURBO1_TCQ) * sizeof(block_turbo1_tcq);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_turbo1_tcq_ref(src + row * n_per_row,
+            (block_turbo1_tcq *)((char *)dst + row * row_size), n_per_row);
+    }
+    return nrows * row_size;
+}

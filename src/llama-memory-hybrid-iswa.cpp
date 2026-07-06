@@ -29,7 +29,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+    const llama_memory_vbr_params & vbr) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -46,7 +47,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         filter_attn == nullptr ?
             [&](int32_t il) { return !hparams.is_recurrent(il); }
             : filter_attn,
-        nullptr
+        nullptr,
+        vbr
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -188,6 +190,14 @@ llama_pos llama_memory_hybrid_iswa::seq_pos_max(llama_seq_id seq_id) const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
     for (const auto & buft_size : mem_recr->memory_breakdown()) {
+        mb[buft_size.first] += buft_size.second;
+    }
+    return mb;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_breakdown_fixed() const {
+    std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown_fixed();
+    for (const auto & buft_size : mem_recr->memory_breakdown_fixed()) {
         mb[buft_size.first] += buft_size.second;
     }
     return mb;
