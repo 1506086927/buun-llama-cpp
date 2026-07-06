@@ -82,9 +82,10 @@ std::vector<llama_device_memory_data> common_get_device_memory_data(
 
     for (const auto & [buft, mb] : memory_breakdown) {
         if (ggml_backend_buft_is_host(buft)) {
-            ret.back().mb.model   += mb.model;
-            ret.back().mb.context += mb.context;
-            ret.back().mb.compute += mb.compute;
+            ret.back().mb.model         += mb.model;
+            ret.back().mb.context       += mb.context;
+            ret.back().mb.compute       += mb.compute;
+            ret.back().mb.context_fixed += mb.context_fixed;
             continue;
         }
 
@@ -94,9 +95,10 @@ std::vector<llama_device_memory_data> common_get_device_memory_data(
         }
         for (size_t i = 0; i < nd; i++) {
             if (dev == llama_model_get_device(model, i)) {
-                ret[i].mb.model   += mb.model;
-                ret[i].mb.context += mb.context;
-                ret[i].mb.compute += mb.compute;
+                ret[i].mb.model         += mb.model;
+                ret[i].mb.context       += mb.context;
+                ret[i].mb.compute       += mb.compute;
+                ret[i].mb.context_fixed += mb.context_fixed;
                 break;
             }
         }
@@ -255,12 +257,21 @@ static void common_params_fit_impl(
         }
         uint64_t budget = vbr_budget_explicit; // explicit --vbr-vram
         if (budget == 0) {
+            // b algebraically reduces to free_measured - model - compute - margin: the context
+            // term cancels against its copy inside projected_used. The n_ctx-INVARIANT part of
+            // the context (recurrent state, sized by n_seq_max) must NOT ride that cancellation —
+            // it is a real allocation the KV budget can never reuse, so charge it explicitly.
+            // (It used to be charged by accident: the probe physically allocated RS, depressing
+            // measured free. Once the probe honors no_alloc, only this subtraction charges it.)
             int64_t b = 0;
             if (nd == 0) {
-                b = dmds_full.back().mb.context + projected_free_host - margins[0];
+                b = (int64_t) (dmds_full.back().mb.context - dmds_full.back().mb.context_fixed)
+                    + projected_free_host - margins[0];
             } else {
                 for (size_t id = 0; id < nd; id++) {
-                    b += std::max<int64_t>(0, dmds_full[id].mb.context + projected_free_per_device[id] - margins[id]);
+                    b += std::max<int64_t>(0,
+                            (int64_t) (dmds_full[id].mb.context - dmds_full[id].mb.context_fixed)
+                            + projected_free_per_device[id] - margins[id]);
                 }
             }
             if (b <= 0) {

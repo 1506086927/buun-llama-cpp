@@ -67,6 +67,10 @@ struct llama_memory_breakdown_data {
     size_t model   = 0; // memory allocated for the model
     size_t context = 0; // memory allocated for the context
     size_t compute = 0; // memory allocated for temporary compute buffers
+    // portion of `context` that does NOT scale with n_ctx (recurrent-state cache, sized by
+    // n_seq_max). Included in `context`, never added separately. Budget formulas that exploit
+    // the context term cancelling out of context-linear projections must still charge this part.
+    size_t context_fixed = 0;
 
     size_t total() const {
         return model + context + compute;

@@ -195,6 +195,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
     return mb;
 }
 
+std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_breakdown_fixed() const {
+    std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown_fixed();
+    for (const auto & buft_size : mem_recr->memory_breakdown_fixed()) {
+        mb[buft_size.first] += buft_size.second;
+    }
+    return mb;
+}
+
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     mem_attn->state_write(io, seq_id, flags);
     mem_recr->state_write(io, seq_id, flags);

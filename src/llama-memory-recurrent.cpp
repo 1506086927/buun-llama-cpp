@@ -111,12 +111,29 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        ggml_backend_buffer_t buf = nullptr;
+        if (hparams.no_alloc) {
+            // memory-fit probe: report sizes without touching device memory (mirrors the KV
+            // cache). Probes that really allocated here depressed the measured free VRAM by the
+            // full RS size while the projection ALSO counted it — the fit double-billed RS and
+            // shrank contexts for phantom deficits (np=4 27B: 619 "missing" MiB, ~449 phantom).
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf; // the scheduler must not try to allocate the cache tensors
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for rs cache");
         }
-        ggml_backend_buffer_clear(buf, 0);
-        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        if (!hparams.no_alloc) {
+            ggml_backend_buffer_clear(buf, 0);
+        }
+        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB%s\n", __func__, ggml_backend_buffer_name(buf),
+                (hparams.no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft)
+                                  : ggml_backend_buffer_get_size(buf)) / 1024.0 / 1024.0,
+                hparams.no_alloc ? " (projected)" : "");
 
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
@@ -630,10 +647,22 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [_, buf] : ctxs_bufs) {
-        ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    for (const auto & [ctx, buf] : ctxs_bufs) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+        if (hparams.no_alloc) {
+            // fit probe: the buffer is a 0-size dummy — report what the real allocation costs,
+            // or the fit stops billing RS entirely and under-projects by the whole cache
+            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+        } else {
+            ret[buft] += ggml_backend_buffer_get_size(buf.get());
+        }
     }
     return ret;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown_fixed() const {
+    // the whole RS cache is n_seq_max-sized, not n_ctx-sized
+    return memory_breakdown();
 }
 
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {

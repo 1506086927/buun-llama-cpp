@@ -134,6 +134,11 @@ struct llama_memory_i {
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
+    // the subset of memory_breakdown() that does NOT scale with the context length (e.g. the
+    // recurrent-state cache, sized by n_seq_max). Reported so budget math can charge it even
+    // where the context-linear part cancels out of a projection. Empty for pure KV caches.
+    virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown_fixed() const { return {}; }
+
     //
     // state write/read
     //

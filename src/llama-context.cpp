@@ -4652,6 +4652,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (const auto & [buft, size] : memory->memory_breakdown()) {
             ret[buft].context += size;
         }
+        for (const auto & [buft, size] : memory->memory_breakdown_fixed()) {
+            ret[buft].context_fixed += size;
+        }
     }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
