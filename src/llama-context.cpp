@@ -554,7 +554,10 @@ void llama_context::sched_reserve() {
             if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 const char * reg_name = ggml_backend_reg_name(reg);
-                if (reg_name && strncmp(reg_name, "CUDA", 4) == 0) {
+                if (reg_name && (strncmp(reg_name, "CUDA", 4) == 0 || strncmp(reg_name, "ROCm", 4) == 0)) {
+                    // HIP builds register as "ROCm": the fused-GDN path compiles and runs there
+                    // (validated on RDNA3, buun-llama-cpp#69) — the CUDA-only name check was
+                    // silently dropping AMD to the decomposed ops (~9% generation speed)
                     have_cuda_gpu = true;
                 }
                 break;
