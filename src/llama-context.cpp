@@ -203,6 +203,8 @@ llama_context::llama_context(
     cparams.vbr_dynamic = params.vbr_dynamic;
     cparams.vbr_min_bits = params.vbr_min_bits;
     cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
+    cparams.vbr_growth_headroom_bytes = params.vbr_growth_headroom_bytes;
+    cparams.vbr_budget_explicit = params.vbr_budget_explicit;
 
     // Dynamic VBR requires single-stream KV (the VMM pool + degrade controller are gated on
     // n_stream == 1). Force unified KV here — at context init, AFTER tools have applied their
@@ -4922,6 +4924,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.vbr_min_bits                =*/ 0.0,
         /*.vbr_vram_budget_bytes       =*/ 0,
+        /*.vbr_growth_headroom_bytes   =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4933,6 +4936,7 @@ llama_context_params llama_context_default_params() {
         /*.no_fused_gdn               =*/ false,
         /*.logits_all                  =*/ true,
         /*.vbr_dynamic                 =*/ false,
+        /*.vbr_budget_explicit         =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.dflash_n_slots              =*/ 1,

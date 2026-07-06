@@ -1952,9 +1952,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     // TurboQuant dynamic-VBR inputs for the attention KV caches (no-op unless armed);
     // recurrent/DSA caches do not take them
     const llama_memory_vbr_params vbr = {
-        /*.dynamic      =*/ cparams.vbr_dynamic,
-        /*.budget_bytes =*/ cparams.vbr_vram_budget_bytes,
-        /*.min_bits     =*/ cparams.vbr_min_bits,
+        /*.dynamic               =*/ cparams.vbr_dynamic,
+        /*.budget_bytes          =*/ cparams.vbr_vram_budget_bytes,
+        /*.min_bits              =*/ cparams.vbr_min_bits,
+        /*.budget_explicit       =*/ cparams.vbr_budget_explicit,
+        /*.growth_headroom_bytes =*/ cparams.vbr_growth_headroom_bytes,
+        /*.device_share          =*/ 1.0,
     };
 
     switch (arch) {

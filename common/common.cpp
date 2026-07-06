@@ -1595,6 +1595,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.vbr_min_bits          = params.vbr_min_bits_value;
     cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
     cparams.vbr_dynamic           = params.vbr_dynamic();
+    cparams.vbr_budget_explicit   = params.vbr_vram_budget_explicit;
 
     return cparams;
 }

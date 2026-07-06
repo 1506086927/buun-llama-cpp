@@ -366,6 +366,8 @@ extern "C" {
         // TurboQuant dynamic VBR (see vbr_dynamic below) [EXPERIMENTAL]
         double vbr_min_bits;              // aggregate KV floor in effective bits/value, 0 = bottom-tier floor; not a per-codec ban
         uint64_t vbr_vram_budget_bytes;   // mapped-physical KV VRAM budget in bytes, 0 = floor-layout-cost fallback
+        uint64_t vbr_growth_headroom_bytes; // free-VRAM headroom the runtime keeps when re-deriving
+                                          // an AUTO budget upward at decode boundaries (0 = 1 GiB default)
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -390,6 +392,8 @@ extern "C" {
         bool vbr_dynamic; // arm the decode-time KV degrade controller (turbo-typed caches decay
                           // tier-by-tier as the context fills; requires flash attention and a
                           // backend exporting the ggml-vbr.h interface) [EXPERIMENTAL]
+        bool vbr_budget_explicit; // vbr_vram_budget_bytes is a user-set HARD CAP: the runtime
+                          // must never re-derive it from live free VRAM [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

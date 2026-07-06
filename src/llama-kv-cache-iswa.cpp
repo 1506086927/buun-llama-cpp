@@ -63,7 +63,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     // would target ~2x the configured mapped-physical total before degrading
     llama_memory_vbr_params vbr_base = vbr;
     llama_memory_vbr_params vbr_swa  = vbr;
-    if (vbr.budget_bytes > 0) {
+    if (vbr.dynamic || vbr.budget_bytes > 0) {
         uint64_t n_base_l = 0;
         uint64_t n_swa_l  = 0;
         for (uint32_t il = 0; il < hparams.n_layer; ++il) {
@@ -75,11 +75,18 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         const double w_base = (double) n_base_l * size_base;
         const double w_swa  = (double) n_swa_l  * size_swa;
         if (w_base + w_swa > 0.0) {
-            vbr_base.budget_bytes = (uint64_t) ((double) vbr.budget_bytes * (w_base / (w_base + w_swa)));
-            vbr_swa.budget_bytes  = vbr.budget_bytes - vbr_base.budget_bytes;
-            if (vbr.dynamic) {
-                LLAMA_LOG_INFO("%s: VBR budget split: %.2f MiB base / %.2f MiB SWA (by entry-tier footprint)\n",
-                        __func__, vbr_base.budget_bytes/1024.0/1024.0, vbr_swa.budget_bytes/1024.0/1024.0);
+            // the same footprint weights split BOTH the configured budget and the children's
+            // claim on the device's spare VRAM (device_share): two independent controllers on
+            // one device must never both re-derive against the full free amount
+            vbr_base.device_share = vbr.device_share * (w_base / (w_base + w_swa));
+            vbr_swa.device_share  = vbr.device_share - vbr_base.device_share;
+            if (vbr.budget_bytes > 0) {
+                vbr_base.budget_bytes = (uint64_t) ((double) vbr.budget_bytes * (w_base / (w_base + w_swa)));
+                vbr_swa.budget_bytes  = vbr.budget_bytes - vbr_base.budget_bytes;
+                if (vbr.dynamic) {
+                    LLAMA_LOG_INFO("%s: VBR budget split: %.2f MiB base / %.2f MiB SWA (by entry-tier footprint)\n",
+                            __func__, vbr_base.budget_bytes/1024.0/1024.0, vbr_swa.budget_bytes/1024.0/1024.0);
+                }
             }
         }
     }

@@ -333,8 +333,11 @@ static void common_params_fit_impl(
             }
             budget = (uint64_t) b;
         }
-        // hand the resolved budget to the runtime through cparams (context not created yet)
+        // hand the resolved budget to the runtime through cparams (context not created yet),
+        // plus the fit target as the runtime's growth headroom: startup arming and runtime
+        // re-derivation then encode the SAME worst case, and raising -fitt hardens both
         cparams->vbr_vram_budget_bytes = budget;
+        cparams->vbr_growth_headroom_bytes = (uint64_t) margins[0];
         LOG_INF("%s: VBR dynamic: KV VRAM budget %" PRIu64 " MiB (%s) — decode-time degrade controller armed\n",
                 __func__, std::max<uint64_t>(1, budget / MiB),
                 vbr_budget_explicit != 0 ? "explicit" : "auto, from remaining memory");

@@ -280,6 +280,7 @@ private:
         size_t                size    = 0;        // total pool bytes
         size_t                used    = 0;        // high-water of placed extents (log-only)
         size_t                budget  = 0;         // per-pool share of vbr_budget_bytes_ (VA-size proportional)
+        size_t                budget_base = 0;      // init-armed/fallback share: the re-derivation floor
         std::vector<vbr_extent> k;                // indexed by kv-cache layer id (ikv)
         std::vector<vbr_extent> v;
         // backend VBR vtable that owns this pool's device (resolved from the buffer type's
@@ -329,6 +330,13 @@ private:
     // prepare() boundaries since the last applied degrade step — promote cooldown basis
     // (deterministic, unlike wall time); promotes wait for a quiet window after any degrade
     uint32_t vbr_quiet_boundaries_ = 0;
+    // auto-budget runtime re-derivation (explicit budgets never move): boundary counter (the
+    // FIRST boundary is skipped — lazy cuBLAS/CUDA-graph pools have not allocated yet and free
+    // overstates reality) + resolved growth headroom
+    uint64_t vbr_boundary_count_   = 0;
+    size_t   vbr_growth_headroom_  = 0;
+    bool     vbr_budget_explicit_  = false;
+    void     vbr_rederive_budget();
     // sink-stash staleness guard: set when any cell below stash_rows is freed (its content can be
     // rewritten by another request; injecting the old snapshot would corrupt the new rows)
     bool   vbr_stash_dirty_   = false;
