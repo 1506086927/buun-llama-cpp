@@ -31,7 +31,7 @@ runs stay coherent — the price orders were measured on KLD panels per model.
 
 | flag | meaning |
 |---|---|
-| `-ctk vbr` / `-ctv vbr` / `-ct vbr` | select VBR for K, V, or both. One side can stay a plain type (`-ctv f16`). |
+| `-ctk vbr` / `-ctv vbr` / `-ct vbr` | select VBR. In dynamic mode a one-sided selection implies vbr on the untouched side too; an explicitly non-default type (`-ctv q8_0`) PINS that side — it never degrades and counts in the aggregate at its fixed bits/value. |
 | `--vbr-budget <tier\|number>` (`--vbr-bits`) | `dynamic` (default) = runtime controller. A tier (`t8/t4/t3/t2/t1`) or a number selects a **fixed** static tier instead — no runtime degrades. |
 | `--vbr-floor <bits\|tier>` (`--vbr-min-bits`) | LITERAL aggregate bits/value floor for dynamic mode. The degrade order stops at the last step whose aggregate stays ≥ the floor — e.g. `4.25` means "t4 layout with a few units held one tier higher", **not** a snap-up to the next tier. Clamped to the ladder range [1.25, 8.125]. Default: t1 (1.25). |
 | `--vbr-vram <SIZE>` | explicit KV VRAM budget (e.g. `8G`). Default `auto` = derived by the fit pass. |
@@ -67,6 +67,9 @@ Notes:
   state only) but are disabled on SWA models.
 - Degrade progress lines are `INFO`-level: visible with `-v`. Greedy-identical output does
   NOT mean no degrades happened.
+- `--vbr-policy` exports its per-layer schedule through a process-global env: with a
+  speculative **draft model** in the same process, the schedule also applies to the
+  draft's cache (overriding `-ctkd/-ctvd`). Avoid `--vbr-policy` together with `-md`.
 
 ## Degrade orders
 

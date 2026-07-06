@@ -28,6 +28,15 @@ enum vbr_tier : uint8_t {
     VBR_TIER_COUNT,
 };
 
+// a type the degrade ladder can move: exactly the five tier types. Anything else living in
+// a VMM pool — an explicitly non-vbr side of a mixed -ct config, or the head_dim>512 f16
+// fallback layers — is PINNED: the transcode dequant has no source support for it, so a step
+// touching it must be skipped, never executed (it would GGML_ABORT mid-decode).
+static bool vbr_type_is_tier(ggml_type t) {
+    return t == GGML_TYPE_TURBO8_0 || t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO3_TCQ ||
+           t == GGML_TYPE_TURBO2_TCQ || t == GGML_TYPE_TURBO1_TCQ;
+}
+
 static ggml_type vbr_tier_type(uint8_t tier) {
     switch (tier) {
         case VBR_TIER_T8:     return GGML_TYPE_TURBO8_0;
@@ -2438,10 +2447,13 @@ void llama_kv_cache::vbr_floor_clamp_order() {
     if (floor_bpv <= 0.0) {
         floor_bpv = 8.0 * ggml_type_size(GGML_TYPE_TURBO1_TCQ) / ggml_blck_size(GGML_TYPE_TURBO1_TCQ);
     }
-    // simulate the order over the per-unit tiers of the initial layout
+    // simulate the order over the per-unit tiers of the initial layout. PINNED units (non-tier
+    // types) stay in the aggregate at their fixed bpv — the floor is a literal aggregate — but
+    // no step may move them (mirrors the runtime skip in vbr_degrade_next).
     std::vector<ggml_type> sim(layers.size() * 2, GGML_TYPE_COUNT);
     double  sum_bits = 0.0;
     int64_t sum_vals = 0;
+    size_t  n_pinned = 0;
     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
         for (int side = 0; side < 2; ++side) {
             const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
@@ -2452,10 +2464,16 @@ void llama_kv_cache::vbr_floor_clamp_order() {
             sim[ikv*2 + side] = t->type;
             sum_bits += 8.0 * ggml_row_size(t->type, t->ne[0]);
             sum_vals += t->ne[0];
+            n_pinned += !vbr_type_is_tier(t->type);
         }
     }
     if (sum_vals == 0) {
         return;
+    }
+    if (n_pinned > 0) {
+        LLAMA_LOG_INFO("%s: VBR: %zu (layer,side) units are PINNED at non-vbr types — degrade steps "
+                "touching them are skipped; they stay in the aggregate at their fixed bits/value\n",
+                __func__, n_pinned);
     }
     for (size_t i = 0; i < vbr_degrade_order_.size(); ++i) {
         const auto & st = vbr_degrade_order_[i];
@@ -2465,8 +2483,8 @@ void llama_kv_cache::vbr_floor_clamp_order() {
         }
         const size_t slot = (size_t) it->second * 2 + (st.is_v ? 1 : 0);
         const ggml_tensor * t = st.is_v ? layers[it->second].v : layers[it->second].k;
-        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr) {
-            continue;
+        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_type_is_tier(sim[slot])) {
+            continue; // absent or pinned (runtime skips these steps identically)
         }
         const ggml_type type_B = vbr_tier_type(st.tier);
         const size_t rA = ggml_row_size(sim[slot], t->ne[0]);
@@ -2766,6 +2784,9 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         vbr_extent  & e  = st.is_v ? pp->v[ikv] : pp->k[ikv];
         if (e.byte_len == 0) {
             continue;
+        }
+        if (!vbr_type_is_tier(t->type)) {
+            continue; // PINNED unit (non-vbr side / f16 fallback layer): the ladder never touches it
         }
         const int64_t   ne0    = t->ne[0];
         const ggml_type type_B = vbr_tier_type(st.tier);

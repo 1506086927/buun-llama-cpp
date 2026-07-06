@@ -238,6 +238,23 @@ int main(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_high_floor, LLAMA_EXAMPLE_COMMON));
         assert(vbr_high_floor.vbr_min_bits_value == 8.125);
 
+        // one-sided vbr in dynamic mode: an untouched (default f16) opposite side is implied
+        // vbr too; an explicitly non-default side stays pinned at its type
+        common_params vbr_imply_v;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_imply_v, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_imply_v.vbr_cache_type_k);
+        assert(vbr_imply_v.vbr_cache_type_v);
+        assert(vbr_imply_v.cache_type_v == GGML_TYPE_TURBO8_0);
+
+        common_params vbr_pin_v;
+        argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "-ctv", "q8_0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_pin_v, LLAMA_EXAMPLE_COMMON));
+        assert(vbr_pin_v.vbr_cache_type_k);
+        assert(!vbr_pin_v.vbr_cache_type_v);
+        assert(vbr_pin_v.cache_type_k == GGML_TYPE_TURBO8_0);
+        assert(vbr_pin_v.cache_type_v == GGML_TYPE_Q8_0);
+
         // --vbr-vram alone implies -ctk/-ctv vbr (dynamic)
         common_params vbr_vram_budget;
         argv = {"binary_name", "-m", "model.gguf", "--vbr-vram", "24G"};

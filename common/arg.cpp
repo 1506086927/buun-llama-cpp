@@ -972,6 +972,25 @@ static void common_params_postprocess_vbr(common_params & params) {
                     "(per-seq KV streams) — forcing --kv-unified\n", params.n_parallel);
             params.kv_unified = true;
         }
+        // one-sided vbr with the opposite side untouched (still the f16 default) means half
+        // the cache would never degrade — treat "vbr" as the mode it is and imply it on the
+        // free side (the one-flag quickstart intent). An explicitly non-default opposite side
+        // stays PINNED at that type: the runtime skips its degrade steps.
+        if (params.vbr_cache_type_k != params.vbr_cache_type_v) {
+            const bool k_is_vbr = params.vbr_cache_type_k;
+            ggml_type & other_type = k_is_vbr ? params.cache_type_v     : params.cache_type_k;
+            bool &      other_vbr  = k_is_vbr ? params.vbr_cache_type_v : params.vbr_cache_type_k;
+            if (other_type == GGML_TYPE_F16) {
+                other_vbr = true;
+                LOG_INF("VBR dynamic: applying vbr to the %s cache as well (it was unset); set "
+                        "-ct%s to a concrete type to pin it instead\n",
+                        k_is_vbr ? "V" : "K", k_is_vbr ? "v" : "k");
+            } else {
+                LOG_WRN("VBR dynamic: the %s cache stays PINNED at %s — it will not degrade and "
+                        "counts in the aggregate at its fixed bits/value\n",
+                        k_is_vbr ? "V" : "K", ggml_type_name(other_type));
+            }
+        }
         if (params.vbr_cache_type_k) {
             params.cache_type_k = GGML_TYPE_TURBO8_0;
         }
@@ -1030,12 +1049,20 @@ static void common_params_postprocess_vbr(common_params & params) {
         throw std::invalid_argument("--vbr-floor (" + common_vbr_format_bits(floor_bits) +
                 ") is above the fixed --vbr-bits budget (" + common_vbr_format_bits(fixed_budget_bits) + ")");
     }
+    if (params.vbr_vram_budget_explicit) {
+        LOG_WRN("VBR fixed mode: --vbr-vram only sizes the automatic n_ctx advert (no runtime "
+                "budget exists without the dynamic controller); it does nothing with an explicit "
+                "-c or with -fit off\n");
+    }
 
     common_setenv_override("VBR_BUDGET", schedule_name);
     params.vbr_capacity_bits = fixed_budget_bits;
     const double selected_bpv = common_vbr_apply_policy_ladder(params, fixed_budget_bits, floor_bits);
     if (selected_bpv > 0.0) {
         params.vbr_capacity_bits = selected_bpv;
+    } else if (floor_bits > 0.0) {
+        LOG_WRN("VBR fixed mode: --vbr-floor has no effect without --vbr-policy (the floor "
+                "selects the policy rung; a bare fixed tier ignores it)\n");
     }
 
     common_setenv_override("VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));

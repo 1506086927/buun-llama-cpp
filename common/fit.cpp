@@ -1027,10 +1027,19 @@ enum common_params_fit_status common_fit_params(
     const uint32_t  n_ctx_entry  = cparams->n_ctx;
     if (cparams->vbr_dynamic) {
         const ggml_type price_t = common_vbr_floor_price_tier(cparams->vbr_min_bits);
-        cparams->type_k = price_t;
-        cparams->type_v = price_t;
-        LOG_INF("%s: VBR dynamic: fitting with KV priced at the %s floor tier\n",
-                __func__, ggml_type_name(price_t));
+        // only the degradable (turbo-typed) sides price at the floor; a PINNED side (explicit
+        // non-vbr type in a mixed config) keeps its real cost — pricing it at the floor tier
+        // would over-advertise capacity by up to ~13x for that half of the cache
+        if (ggml_is_turbo_kv_type(cparams->type_k)) {
+            cparams->type_k = price_t;
+        }
+        if (ggml_is_turbo_kv_type(cparams->type_v)) {
+            cparams->type_v = price_t;
+        }
+        LOG_INF("%s: VBR dynamic: fitting with KV priced at the %s floor tier%s\n",
+                __func__, ggml_type_name(price_t),
+                (ggml_is_turbo_kv_type(type_k_entry) && ggml_is_turbo_kv_type(type_v_entry))
+                    ? "" : " (pinned side at its own cost)");
     }
 
     try {
