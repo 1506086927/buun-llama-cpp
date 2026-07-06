@@ -21,6 +21,16 @@ Set of LLM REST APIs and a web UI to interact with llama.cpp.
 
 For the full list of features, please refer to [server's changelog](https://github.com/ggml-org/llama.cpp/issues/9291)
 
+## VBR (variable-bit-rate KV cache)
+
+`-ctk vbr` runs the KV cache under the dynamic VBR controller: it starts at the turbo8
+tier and degrades tensors down a measured price order as the context fills, within an
+auto-derived (or `--vbr-vram`) VRAM budget. See [docs/vbr.md](../../docs/vbr.md) for
+flags, the floor semantics and limitations. Server specifics: `/props` and `/models`
+expose a `vbr` object; prompt-cache-ram, cache reuse, slot save/restore and (on SWA
+models) context checkpoints are disabled with warnings in dynamic mode, and unified KV
+is forced when `-np > 1`.
+
 ## Usage
 
 <!-- HELP_START -->
@@ -68,7 +78,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-kvo, --kv-offload, -nkvo, --no-kv-offload` | whether to enable KV cache offloading (default: enabled)<br/>(env: LLAMA_ARG_KV_OFFLOAD) |
 | `--repack, -nr, --no-repack` | whether to enable weight repacking (default: enabled)<br/>(env: LLAMA_ARG_REPACK) |
 | `--no-host` | bypass host buffer allowing extra buffers to be used<br/>(env: LLAMA_ARG_NO_HOST) |
-| `-ctk, --cache-type-k TYPE` | KV cache data type for K<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_K) |
+| `-ctk, --cache-type-k TYPE` | KV cache data type for K<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, turbo tiers, vbr<br/>(default: f16; `vbr` = dynamic VBR, see [docs/vbr.md](../../docs/vbr.md))<br/>(env: LLAMA_ARG_CACHE_TYPE_K) |
 | `-ctv, --cache-type-v TYPE` | KV cache data type for V<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_V) |
 | `-dt, --defrag-thold N` | KV cache defragmentation threshold (DEPRECATED)<br/>(env: LLAMA_ARG_DEFRAG_THOLD) |
 | `--mlock` | force system to keep model in RAM rather than swapping or compressing<br/>(env: LLAMA_ARG_MLOCK) |

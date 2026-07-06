@@ -1,7 +1,9 @@
-// GENERATED 2026-07-05 by make_pricing_tables.py from matrix v3 (box-2, 3169 cells,
-// deployment-true tap config, paired-anchor dumps, reliability-gated statistics).
-// Per-model lens: bench-validated or best split-half reliability (see pricing_tables/).
+// GENERATED 2026-07-05 by scripts/make-vbr-pricing-tables.py from matrix v3 (box-2, 3169
+// KLD cells, deployment-true tap config, paired-anchor dumps, reliability-gated statistics).
+// Per-model lens: bench-validated or best split-half reliability.
 // fp16->t8 band = frac lens (the only statistic that resolves that rung).
+// Models: q27 = Qwen3.6-27B (hybrid, 16/64 KV layers), moe = Qwen3.5-35B-A3B,
+//         g12/g26/g31 = gemma-family 12B/26B/31B (SWA-mixed).
 // Runtime override: VBR_DEGRADE_ORDER=<file>, tokens "<il><k|v>:<t8|t4|t3|t2|t1>".
 
 // q27: lens=trim1 (fp16->t8 band: frac), 160 steps, layers=16
