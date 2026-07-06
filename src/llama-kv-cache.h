@@ -166,6 +166,9 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    // monotone counter of in-place VBR tier flips — graph reuse fences on it
+    uint64_t vbr_tier_epoch() const { return vbr_tier_epoch_; }
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
@@ -298,6 +301,11 @@ private:
     // S3/S4: decode-time degrade controller (VMM mode only). The price order and its cursor stay
     // GLOBAL (layer-global price order); each step resolves the pool that owns its tensor.
     llama_memory_vbr_params vbr_params_;              // API/CLI inputs (ctor copy; env can override)
+    // bumped on every in-place tier flip (degrade/promote/full reset). Graph reuse must be
+    // fenced on it: a reused graph carries the OLD type/strides baked into its K/V views, and
+    // a free-VRAM-clamp wave (or a promote map-retry) can flip tiers MID-band where the n_kv
+    // shape check alone would still allow reuse.
+    uint64_t vbr_tier_epoch_ = 0;
     std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, F16->t8 band first
     size_t         vbr_degrade_cursor_ = 0;
     size_t         vbr_budget_bytes_   = 0;           // global mapped-physical budget; 0 = no trigger
@@ -466,6 +474,9 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    // VBR tier-flip epoch of the underlying cache (0 when VBR is off — the counter never moves)
+    uint64_t get_vbr_tier_epoch() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

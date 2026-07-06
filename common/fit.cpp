@@ -234,6 +234,12 @@ static void common_params_fit_impl(
         return 8.0 * ggml_type_size(t) / ggml_blck_size(t);
     };
 
+    auto vbr_scale_est = [&](uint64_t est) {
+        // beyond the trained context rope is invalid and compute growth unaccounted — cap
+        // every VBR-derived advert (explicit -c bypasses the estimators for power users)
+        est = std::min<uint64_t>(est, hp_nct);
+        return round_ctx_down(est);
+    };
     // captured BEFORE any mutation: vbr_dynamic_arm_budget writes the resolved auto budget back
     // into cparams->vbr_vram_budget_bytes, so explicit-vs-auto checks must use this snapshot
     const uint64_t vbr_budget_explicit = cparams->vbr_vram_budget_bytes;
@@ -292,12 +298,7 @@ static void common_params_fit_impl(
         // in dynamic mode the KV is priced at the floor tier for the whole fit (see
         // common_fit_params), so these byte->token estimates ARE floor capacities already; just
         // cap at the trained context (beyond it rope is invalid and compute growth unaccounted)
-        auto vbr_scale_est = [&](uint64_t est) {
-            // beyond the trained context rope is invalid and compute growth unaccounted — cap
-            // every VBR-derived advert (explicit -c bypasses the estimators for power users)
-            est = std::min<uint64_t>(est, hp_nct);
-            return round_ctx_down(est);
-        };
+
 
         const int64_t ctx_full = sum_context_bytes(dmds_full);
         if (ctx_full <= 0) {
@@ -379,7 +380,9 @@ static void common_params_fit_impl(
             return uint32_t(0);
         }
 
-        return round_ctx_down(n_ctx_est);
+        // vbr_scale_est caps at n_ctx_train: an uncapped estimate here advertised megatoken
+        // contexts on small models (RoPE-invalid + compute-buffer OOM at warmup)
+        return vbr_scale_est(n_ctx_est);
     };
 
     auto vbr_select_ctx = [&](const dmds_t & dmds_full, const std::vector<int64_t> & projected_free_per_device, int64_t projected_free_host) {

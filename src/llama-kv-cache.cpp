@@ -2670,6 +2670,7 @@ void llama_kv_cache::vbr_full_reset() {
                 }
                 if (t->type != e.type0) {
                     vbr_set_tensor_type(t, side ? layers[ikv].v_stream : layers[ikv].k_stream, e.type0);
+                    vbr_tier_epoch_++; // fence graph reuse off the old views
                     e.byte_len = ggml_nbytes(t);
                     undone++;
                 }
@@ -2824,6 +2825,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
             pp->wave_pending = true;
         }
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
+        vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
         e.byte_len = ggml_nbytes(t);
         vbr_degrade_cursor_--;
 
@@ -2935,6 +2937,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         // flip metadata now (host state, consumed at graph BUILD time); data ptr = fixed VA. The
         // fence guarantees the built graph never RUNS before the bytes are tier B.
         vbr_set_tensor_type(t, st.is_v ? layers[ikv].v_stream : layers[ikv].k_stream, type_B);
+        vbr_tier_epoch_++; // fence graph reuse off the old views (type/strides changed in place)
         e.byte_len = ggml_nbytes(t);
         // queue the tail release: pages wholly past keep_live return to the pool at the NEXT decode
         // boundary — the in-flight transcode still READS the tier-A extent, which reaches into them
@@ -3875,6 +3878,39 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
 
+    if (vbr_vmm_active()) {
+        // settle in-flight degrade waves: the S5 fence only orders graph_compute, not the
+        // tensor_get path io.write_tensor uses — an unsettled wave would serialize torn bytes
+        // under the already-flipped type
+        for (const auto & p : vbr_pools_) {
+            if (p.backend != nullptr) {
+                ggml_backend_synchronize(p.backend);
+            }
+            if (p.vmm != nullptr && p.be != nullptr) {
+                p.be->sync_device(p.device);
+            }
+        }
+        // a degraded-tier snapshot can never restore (state_read requires the fresh context's
+        // entry tiers) — refuse at SAVE time instead of failing the user at load time
+        for (const auto & p : vbr_pools_) {
+            if (p.vmm == nullptr) {
+                continue;
+            }
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                for (int side = 0; side < 2; ++side) {
+                    const vbr_extent  & e = side ? p.v[ikv] : p.k[ikv];
+                    const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
+                    if (e.byte_len != 0 && t != nullptr && t->type != e.type0) {
+                        throw std::runtime_error(
+                            "cannot serialize a dynamic-VBR KV cache after tier degrades — the "
+                            "snapshot could never restore; save before the budget triggers, or "
+                            "run without dynamic VBR");
+                    }
+                }
+            }
+        }
+    }
+
     io.write(&n_stream, sizeof(n_stream));
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -3950,6 +3986,11 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
 
         bool res = true;
         res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id);
+        if (res && seq_id == -1 && vbr_vmm_active()) {
+            // the whole-cache branch positions cells directly (no apply_ubatch), so nothing has
+            // grown the VMM physical backing yet — state_read_data would write into unmapped VA
+            vbr_vmm_ensure_mapped();
+        }
         res = res && state_read_data(io, strm, cell_count, sinfo);
 
         if (!res) {
@@ -4500,6 +4541,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_cur];
+}
+
+uint64_t llama_kv_cache_context::get_vbr_tier_epoch() const {
+    return kv->vbr_tier_epoch();
 }
 
 uint32_t llama_kv_cache_context::get_n_kv() const {

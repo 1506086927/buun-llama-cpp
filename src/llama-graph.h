@@ -326,6 +326,11 @@ public:
     const llama_cparams cparams;
 };
 
+// VBR tier-flip epoch of a memory context (0 when VBR is off); defined in llama-graph.cpp
+// where the context types are complete
+uint64_t llm_graph_vbr_epoch(const llama_kv_cache_context * mctx);
+uint64_t llm_graph_vbr_epoch(const llama_kv_cache_iswa_context * mctx);
+
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv(
@@ -336,6 +341,7 @@ public:
         hparams(hparams),
         cparams(cparams),
         mctx(mctx),
+        vbr_epoch(llm_graph_vbr_epoch(mctx)),
         tree_mask(tree_mask) {
     }
     ~llm_graph_input_attn_kv() = default;
@@ -371,6 +377,9 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    // VBR tier-flip epoch captured at graph build; can_reuse fences on it (in-place tier
+    // flips rewrite the cache tensors' type/strides under a reused graph's baked views)
+    uint64_t vbr_epoch = 0;
     const llama_tree_mask * tree_mask;
 };
 
@@ -384,7 +393,8 @@ public:
             const llama_kv_cache_context * mctx) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        vbr_epoch(llm_graph_vbr_epoch(mctx)) {
     }
     ~llm_graph_input_attn_k() = default;
 
@@ -405,6 +415,9 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_context * mctx;
+    // VBR tier-flip epoch captured at graph build; can_reuse fences on it (in-place tier
+    // flips rewrite the cache tensors' type/strides under a reused graph's baked views)
+    uint64_t vbr_epoch = 0;
 };
 
 class llm_graph_input_attn_k_dsa : public llm_graph_input_i {
@@ -453,7 +466,8 @@ public:
             const llama_kv_cache_iswa_context * mctx) :
         hparams(hparams),
         cparams(cparams),
-        mctx(mctx) {
+        mctx(mctx),
+        vbr_epoch(llm_graph_vbr_epoch(mctx)) {
     }
     ~llm_graph_input_attn_kv_iswa() = default;
 
@@ -492,6 +506,9 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+    // VBR tier-flip epoch captured at graph build; can_reuse fences on it (in-place tier
+    // flips rewrite the cache tensors' type/strides under a reused graph's baked views)
+    uint64_t vbr_epoch = 0;
 };
 
 class llm_graph_input_attn_cross : public llm_graph_input_i {

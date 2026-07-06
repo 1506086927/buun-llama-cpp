@@ -674,6 +674,14 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     turbo_vmean_fill(self_vmean, hparams);
 }
 
+uint64_t llm_graph_vbr_epoch(const llama_kv_cache_context * mctx) {
+    return mctx->get_vbr_tier_epoch();
+}
+
+uint64_t llm_graph_vbr_epoch(const llama_kv_cache_iswa_context * mctx) {
+    return mctx->get_base()->get_vbr_tier_epoch() + mctx->get_swa()->get_vbr_tier_epoch();
+}
+
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
 
@@ -685,6 +693,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // in-place VBR tier flips rewrite the cache tensors' type/strides; this graph's K/V views
+    // and set_rows dst were baked at build time (a mid-band free-VRAM-clamp wave flips tiers
+    // without an n_kv shape change, so the checks above cannot see it)
+    res &= vbr_epoch == llm_graph_vbr_epoch(mctx);
 
     return res;
 }
@@ -705,6 +718,9 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // fence reuse off in-place VBR tier flips (see llm_graph_input_attn_kv)
+    res &= vbr_epoch == llm_graph_vbr_epoch(mctx);
 
     return res;
 }
@@ -795,6 +811,9 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
     }
+
+    // fence reuse off in-place VBR tier flips in either cache (see llm_graph_input_attn_kv)
+    res &= vbr_epoch == llm_graph_vbr_epoch(mctx);
 
     return res;
 }
