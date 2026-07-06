@@ -111,6 +111,11 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // effective bits/value of the attention KV storage, aggregated over all KV tensors at
+    // their CURRENT types (dynamic VBR tier flips move this at runtime; f16 = 16, q8_0 = 8.5,
+    // turbo tiers struct-true). -1 when the memory holds no attention KV (recurrent-only).
+    virtual double kv_bpv() const { return -1.0; }
+
     //
     // ops
     //

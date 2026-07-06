@@ -660,6 +660,10 @@ json result_timings::to_json() const {
         base["draft_n_accepted"] = draft_n_accepted;
     }
 
+    if (kv_bpv >= 0.0) {
+        base["kv_bpv"] = kv_bpv;
+    }
+
     return base;
 }
 

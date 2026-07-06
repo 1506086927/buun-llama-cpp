@@ -169,6 +169,11 @@ public:
     // monotone counter of in-place VBR tier flips — graph reuse fences on it
     uint64_t vbr_tier_epoch() const { return vbr_tier_epoch_; }
 
+    // effective bits/value of this cache at the CURRENT tensor types (llama_memory_i)
+    double kv_bpv() const override;
+    // totals for cross-cache aggregation (iSWA weights its children by stored values)
+    void   kv_bpv_accum(double & bits, double & vals) const;
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;

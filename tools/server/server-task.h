@@ -275,6 +275,10 @@ struct result_timings {
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
 
+    // effective bits/value of the attention KV cache at its current tensor types (moves at
+    // runtime under dynamic VBR); emitted only when >= 0
+    double kv_bpv = -1.0;
+
     json to_json() const;
 };
 

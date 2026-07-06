@@ -3003,6 +3003,29 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
     }
 }
 
+void llama_kv_cache::kv_bpv_accum(double & bits, double & vals) const {
+    // cells are uniform within one cache, so weight each tensor by ne0 x cells; the per-cache
+    // ratio reduces to sum(row_bits)/sum(ne0), but the totals let iSWA combine two caches of
+    // different sizes correctly
+    const double cells = (double) get_size();
+    for (const auto & l : layers) {
+        for (const ggml_tensor * t : { l.k, l.v }) {
+            if (t == nullptr) {
+                continue;
+            }
+            bits += 8.0 * (double) ggml_row_size(t->type, t->ne[0]) * cells;
+            vals += (double) t->ne[0] * cells;
+        }
+    }
+}
+
+double llama_kv_cache::kv_bpv() const {
+    double bits = 0.0;
+    double vals = 0.0;
+    kv_bpv_accum(bits, vals);
+    return vals > 0.0 ? bits / vals : -1.0;
+}
+
 bool llama_kv_cache::get_can_shift() const {
     // VBR VMM v1: build_graph_shift views the FULL kv_size cells — executing it would touch
     // unmapped VA. TODO(S6+): bound the shift views to the mapped watermark instead.

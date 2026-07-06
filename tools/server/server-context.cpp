@@ -445,6 +445,11 @@ struct server_slot {
             timings.draft_n_accepted = n_draft_accepted;
         }
 
+        // live effective KV bits/value (moves under dynamic VBR as tiers degrade/reset)
+        if (ctx_tgt != nullptr) {
+            timings.kv_bpv = llama_memory_kv_bpv(llama_get_memory(ctx_tgt));
+        }
+
         return timings;
     }
 
@@ -551,6 +556,14 @@ struct server_slot {
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
         };
+
+        // live effective KV bits/value (moves under dynamic VBR); pollable via GET /slots
+        if (ctx_tgt != nullptr) {
+            const double kv_bpv = llama_memory_kv_bpv(llama_get_memory(ctx_tgt));
+            if (kv_bpv >= 0.0) {
+                res["kv_bpv"] = kv_bpv;
+            }
+        }
 
         const auto & ptask = task ? task : task_prev;
 

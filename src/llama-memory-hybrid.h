@@ -59,6 +59,8 @@ public:
 
     bool get_can_shift() const override;
 
+    double kv_bpv() const override { return mem_attn->kv_bpv(); }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

@@ -244,6 +244,14 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, 
     return std::make_unique<llama_kv_cache_iswa_context>(this, lctx, optimize);
 }
 
+double llama_kv_cache_iswa::kv_bpv() const {
+    double bits = 0.0;
+    double vals = 0.0;
+    kv_base->kv_bpv_accum(bits, vals);
+    kv_swa ->kv_bpv_accum(bits, vals);
+    return vals > 0.0 ? bits / vals : -1.0;
+}
+
 bool llama_kv_cache_iswa::get_can_shift() const {
     return kv_base->get_can_shift() &&
            kv_swa->get_can_shift() &&

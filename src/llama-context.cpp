@@ -5569,6 +5569,14 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+double llama_memory_kv_bpv(llama_memory_t mem) {
+    if (!mem) {
+        return -1.0;
+    }
+
+    return mem->kv_bpv();
+}
+
 static llama_memory_recurrent * get_recurrent_mem(llama_memory_t mem) {
     if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem))      return h->get_mem_recr();
     if (auto * h = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) return h->get_mem_recr();

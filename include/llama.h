@@ -791,6 +791,12 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // effective bits/value of the attention KV cache at its CURRENT tensor types, aggregated
+    // over all KV layers (f16 = 16, q8_0 = 8.5, turbo tiers struct-true). Under dynamic VBR
+    // this moves at runtime as tiers degrade/reset. Returns -1 when the context's memory
+    // holds no attention KV. [EXPERIMENTAL]
+    LLAMA_API double llama_memory_kv_bpv(llama_memory_t mem);
+
     // Expand the recurrent state to new_n_seq_max cells (for deferred backup allocation).
     // Returns true on success. No-op if the memory is already large enough or has no recurrent component.
     LLAMA_API bool llama_memory_recurrent_expand(llama_memory_t mem, uint32_t new_n_seq_max);

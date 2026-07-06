@@ -386,6 +386,8 @@ export interface ApiProcessingState {
 	promptTokens?: number;
 	promptMs?: number;
 	cacheTokens?: number;
+	// effective KV cache bits/value (from timings.kv_bpv; moves under dynamic VBR)
+	kvBpv?: number;
 }
 
 /**
