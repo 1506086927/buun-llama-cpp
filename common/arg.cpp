@@ -4237,20 +4237,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--draft", "--draft-n", "--draft-max"}, "N",
-        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.n_max),
-        [](common_params & params, int value) {
-            params.speculative.n_max = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
-    add_opt(common_arg(
-        {"--draft-min", "--draft-n-min"}, "N",
-        string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.n_min),
-        [](common_params & params, int value) {
-            params.speculative.n_min = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MIN"));
-    add_opt(common_arg(
         {"--tree-budget"}, "N",
         string_format("DDTree node budget for tree verification (default: %d, 0 = flat)", params.speculative.tree_budget),
         [](common_params & params, int value) {
