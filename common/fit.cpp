@@ -487,6 +487,15 @@ static void common_params_fit_impl(
 
     // step 2: try reducing memory use by reducing the context size
 
+    // the controller budget is context-independent (b reduces to free - model - compute -
+    // margin), but it was only armed on the margins-met paths above — every step-2/3/4 exit
+    // (context shrink, explicit -c margin miss, layer redistribution) left the runtime on the
+    // conservative floor-cost fallback. Arm it here, once, for all of them. Host-only (nd == 0)
+    // is skipped: dynamic VBR needs a VMM-capable device and the controller is inert without one.
+    if (nd >= 1) {
+        vbr_dynamic_arm_budget(dmds_full, projected_free_per_device, 0);
+    }
+
     {
         int64_t global_surplus = sum_projected_free;
         if (nd == 0) {
