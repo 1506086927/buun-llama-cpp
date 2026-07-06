@@ -1671,6 +1671,11 @@ private:
 
         bool update_cache = false;
 
+        // best similarity seen even BELOW the threshold — feeds the vbr route-home tier and the
+        // LRU log line (a hopping conversation was undiagnosable: "selected by LRU" never said
+        // how close the rejected candidates came)
+        float sim_best_any = 0;
+
         // find the slot that has at least n% prompt similarity
         if (ret == nullptr && slot_prompt_similarity != 0.0f) {
             float sim_best = 0;
@@ -1691,6 +1696,8 @@ private:
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
                 const float sim_cur = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
 
+                sim_best_any = std::max(sim_best_any, sim_cur);
+
                 // select the current slot if the criteria match
                 if (sim_cur > sim_best && sim_cur > slot_prompt_similarity) {
                     sim_best = sim_cur;
@@ -1709,6 +1716,43 @@ private:
                 if (f_keep < 0.5f) {
                     update_cache = true;
                 }
+            }
+        }
+
+        // dynamic VBR: route a returning conversation HOME before the LRU tier colonizes a fresh
+        // slot. In the unified pool an idle slot's cells are live cost for everyone (mapped pages,
+        // attention span, the one shared quality budget), and the LRU tier below ranks never-used
+        // slots FIRST — a rewritten-context prompt that fails the similarity threshold would stack
+        // slot after slot while its own history rots elsewhere. Any nonzero LCP (a shared system
+        // prompt suffices) identifies the home slot; genuinely-new streams (zero LCP everywhere)
+        // still take the LRU spread below.
+        if (ret == nullptr && server_vbr_dynamic_active(params_base)) {
+            size_t lcp_best = 0;
+
+            for (server_slot & slot : slots) {
+                if (slot.is_processing()) {
+                    continue;
+                }
+
+                const auto & tokens = slot.prompt.tokens;
+
+                if (tokens.empty()) {
+                    continue;
+                }
+
+                const size_t lcp = tokens.get_common_prefix(task.tokens);
+                if (lcp > lcp_best) {
+                    lcp_best = lcp;
+
+                    ret = &slot;
+                }
+            }
+
+            if (ret != nullptr) {
+                SLT_INF(*ret, "selected slot by route-home (vbr), lcp = %zu tokens (sim %.3f <= %.3f thold)\n",
+                        lcp_best, (double) lcp_best / task.tokens.size(), slot_prompt_similarity);
+
+                update_cache = true;
             }
         }
 
@@ -1736,7 +1780,8 @@ private:
             }
 
             if (ret != nullptr) {
-                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
+                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 " (best rejected sim = %.3f)\n",
+                        t_last, sim_best_any);
 
                 update_cache = true;
             }
