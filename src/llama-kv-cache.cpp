@@ -3102,6 +3102,112 @@ double llama_kv_cache::kv_bpv() const {
     return vals > 0.0 ? bits / vals : -1.0;
 }
 
+llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const {
+    llama_memory_vbr_state_data st = {};
+
+    // full-reset feasibility: used cells the asking seq does not exclusively own. Cells above
+    // used_max_p1 are empty by definition, so the scan is bounded by live occupancy.
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+        const uint32_t top = cells.used_max_p1();
+        for (uint32_t i = 0; i < top; ++i) {
+            if (cells.is_empty(i)) {
+                continue;
+            }
+            if (seq_id < 0 || !(cells.seq_count(i) == 1 && cells.seq_has(i, seq_id))) {
+                st.used_cells_other++;
+            }
+        }
+    }
+
+    if (!vbr_vmm_active() || vbr_budget_bytes_ == 0) {
+        return st; // no controller: zeros besides the occupancy count
+    }
+    st.cursor = (int32_t) vbr_degrade_cursor_;
+
+    const uint32_t wm_next = vbr_watermark_cells(n_tokens_extra);
+
+    // deficits: max over pools, exactly like the degrade trigger. raw = configured budget only
+    // (page-exact, deterministic — the policy input); clamped = the live budget_eff (telemetry).
+    int64_t deficit_raw     = INT64_MIN;
+    int64_t deficit_clamped = INT64_MIN;
+    std::vector<int64_t> pool_proj(vbr_pools_.size(), 0);
+    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+        const auto & p = vbr_pools_[pi];
+        if (p.vmm == nullptr) {
+            continue;
+        }
+        pool_proj[pi] = (int64_t) vbr_vmm_projected_bytes(p, wm_next);
+        deficit_raw     = std::max(deficit_raw,     pool_proj[pi] - (int64_t) p.budget);
+        deficit_clamped = std::max(deficit_clamped, pool_proj[pi] - (int64_t) vbr_budget_eff(p));
+    }
+    if (deficit_raw == INT64_MIN) {
+        return st; // no VMM pools — controller effectively inert
+    }
+    st.deficit_raw     = deficit_raw;
+    st.deficit_clamped = deficit_clamped;
+
+    // bpv_if_degraded: walk the ladder from the CURRENT cursor with the same skip rules as
+    // vbr_degrade_next until every pool's RAW projection fits (or the floor clamp stops it) —
+    // the aggregate the controller would land at if the deficit were paid by tiers alone.
+    // Mirrors the vbr_floor_clamp_order simulation; aggregate basis = VMM-pooled units.
+    std::vector<ggml_type> sim(layers.size() * 2, GGML_TYPE_COUNT);
+    double  sum_bits = 0.0;
+    int64_t sum_vals = 0;
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        for (int side = 0; side < 2; ++side) {
+            const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
+            const vbr_pool    * p = t != nullptr ? vbr_pool_of(t) : nullptr;
+            if (p == nullptr || p->vmm == nullptr) {
+                continue;
+            }
+            sim[ikv*2 + side] = t->type;
+            sum_bits += 8.0 * (double) ggml_row_size(t->type, t->ne[0]);
+            sum_vals += t->ne[0];
+        }
+    }
+    auto pools_fit = [&]() {
+        for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+            if (vbr_pools_[pi].vmm != nullptr && pool_proj[pi] > (int64_t) vbr_pools_[pi].budget) {
+                return false;
+            }
+        }
+        return true;
+    };
+    for (size_t i = vbr_degrade_cursor_;
+         i < std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) && !pools_fit(); ++i) {
+        const auto & stp = vbr_degrade_order_[i];
+        const auto it = map_layer_ids.find(stp.il);
+        if (it == map_layer_ids.end()) {
+            continue;
+        }
+        const size_t slot = (size_t) it->second * 2 + (stp.is_v ? 1 : 0);
+        const ggml_tensor * t = stp.is_v ? layers[it->second].v : layers[it->second].k;
+        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_type_is_movable(sim[slot])) {
+            continue;
+        }
+        const ggml_type type_B = vbr_tier_type(stp.tier);
+        const size_t rA = ggml_row_size(sim[slot], t->ne[0]);
+        const size_t rB = ggml_row_size(type_B,    t->ne[0]);
+        if (sim[slot] == type_B || rB >= rA) {
+            continue;
+        }
+        const vbr_pool * p = vbr_pool_of(t);
+        for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+            if (&vbr_pools_[pi] == p) {
+                pool_proj[pi] += (int64_t) GGML_PAD(rB * (size_t) wm_next, p->gran)
+                               - (int64_t) GGML_PAD(rA * (size_t) wm_next, p->gran);
+                break;
+            }
+        }
+        sum_bits += 8.0 * ((double) rB - (double) rA);
+        sim[slot] = type_B;
+    }
+    st.bpv_if_degraded = sum_vals > 0 ? sum_bits / (double) sum_vals : 0.0;
+
+    return st;
+}
+
 bool llama_kv_cache::get_can_shift() const {
     // VBR VMM v1: build_graph_shift views the FULL kv_size cells — executing it would touch
     // unmapped VA. TODO(S6+): bound the shift views to the mapped watermark instead.

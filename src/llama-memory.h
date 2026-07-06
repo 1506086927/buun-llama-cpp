@@ -116,6 +116,12 @@ struct llama_memory_i {
     // turbo tiers struct-true). -1 when the memory holds no attention KV (recurrent-only).
     virtual double kv_bpv() const { return -1.0; }
 
+    // dynamic-VBR pressure/quality state (llama.h: llama_memory_vbr_state_data). Default =
+    // all zeros: "no controller, no pressure, nothing resident" — safe for policy consumers.
+    virtual llama_memory_vbr_state_data memory_vbr_state(llama_seq_id /*seq_id*/, uint32_t /*n_tokens_extra*/) const {
+        return {};
+    }
+
     //
     // ops
     //

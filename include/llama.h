@@ -797,6 +797,28 @@ extern "C" {
     // holds no attention KV. [EXPERIMENTAL]
     LLAMA_API double llama_memory_kv_bpv(llama_memory_t mem);
 
+    // TurboQuant dynamic VBR: point-in-time pressure/quality state of the attention KV memory.
+    // All-zero when the memory has no active dynamic-VBR controller. [EXPERIMENTAL]
+    struct llama_memory_vbr_state_data {
+        int64_t  deficit_raw;      // projected bytes over the CONFIGURED budget at the current
+                                   // watermark extended by n_tokens_extra (<= 0: fits). Page-exact
+                                   // and free-VRAM independent -- safe to drive policy (e.g. cache
+                                   // eviction) deterministically.
+        int64_t  deficit_clamped;  // same, against the live free-VRAM-clamped budget. Moves with
+                                   // co-tenant VRAM use -- telemetry/emergency signal, NOT policy.
+        double   bpv_if_degraded;  // aggregate KV bits/value the degrade ladder would land at if
+                                   // deficit_raw were paid by tier degradation alone
+        int32_t  cursor;           // applied degrade steps (0 = pristine entry tiers)
+        uint32_t used_cells_other; // used cells NOT owned exclusively by seq_id (seq_id < 0
+                                   // counts every used cell) -- 0 means removing seq_id's cells
+                                   // would empty the cache (full-reset feasibility)
+    };
+
+    // seq_id: the sequence asking (for used_cells_other); n_tokens_extra: tokens about to be
+    // decoded on top of the current occupancy (a launch passes the incoming prompt's suffix).
+    LLAMA_API struct llama_memory_vbr_state_data llama_memory_vbr_state(
+            llama_memory_t mem, llama_seq_id seq_id, uint32_t n_tokens_extra);
+
     // Expand the recurrent state to new_n_seq_max cells (for deferred backup allocation).
     // Returns true on success. No-op if the memory is already large enough or has no recurrent component.
     LLAMA_API bool llama_memory_recurrent_expand(llama_memory_t mem, uint32_t new_n_seq_max);

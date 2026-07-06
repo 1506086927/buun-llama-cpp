@@ -252,6 +252,30 @@ double llama_kv_cache_iswa::kv_bpv() const {
     return vals > 0.0 ? bits / vals : -1.0;
 }
 
+llama_memory_vbr_state_data llama_kv_cache_iswa::memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const {
+    const llama_memory_vbr_state_data b = kv_base->memory_vbr_state(seq_id, n_tokens_extra);
+    const llama_memory_vbr_state_data s = kv_swa ->memory_vbr_state(seq_id, n_tokens_extra);
+
+    llama_memory_vbr_state_data r = {};
+    // each child runs an independent controller with its own budget share: either one over
+    // budget means degrades happen, so pressure combines as max, exactly like the trigger
+    r.deficit_raw      = std::max(b.deficit_raw,     s.deficit_raw);
+    r.deficit_clamped  = std::max(b.deficit_clamped, s.deficit_clamped);
+    r.cursor           = b.cursor + s.cursor;
+    r.used_cells_other = b.used_cells_other + s.used_cells_other;
+
+    // value-weighted like kv_bpv: weight each child's landing bpv by its total KV values
+    double bits_base = 0.0, vals_base = 0.0;
+    double bits_swa  = 0.0, vals_swa  = 0.0;
+    kv_base->kv_bpv_accum(bits_base, vals_base);
+    kv_swa ->kv_bpv_accum(bits_swa,  vals_swa);
+    const double vals_sum = vals_base + vals_swa;
+    r.bpv_if_degraded = vals_sum > 0.0
+        ? (b.bpv_if_degraded * vals_base + s.bpv_if_degraded * vals_swa) / vals_sum
+        : 0.0;
+    return r;
+}
+
 bool llama_kv_cache_iswa::get_can_shift() const {
     return kv_base->get_can_shift() &&
            kv_swa->get_can_shift() &&

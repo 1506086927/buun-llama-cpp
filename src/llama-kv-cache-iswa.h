@@ -48,6 +48,8 @@ public:
 
     double kv_bpv() const override; // value-weighted combination of the base and SWA caches
 
+    llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

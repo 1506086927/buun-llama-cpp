@@ -5582,6 +5582,14 @@ double llama_memory_kv_bpv(llama_memory_t mem) {
     return mem->kv_bpv();
 }
 
+struct llama_memory_vbr_state_data llama_memory_vbr_state(llama_memory_t mem, llama_seq_id seq_id, uint32_t n_tokens_extra) {
+    if (!mem) {
+        return {};
+    }
+
+    return mem->memory_vbr_state(seq_id, n_tokens_extra);
+}
+
 static llama_memory_recurrent * get_recurrent_mem(llama_memory_t mem) {
     if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem))      return h->get_mem_recr();
     if (auto * h = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) return h->get_mem_recr();

@@ -171,6 +171,8 @@ public:
 
     // effective bits/value of this cache at the CURRENT tensor types (llama_memory_i)
     double kv_bpv() const override;
+
+    llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
     // totals for cross-cache aggregation (iSWA weights its children by stored values)
     void   kv_bpv_accum(double & bits, double & vals) const;
 
