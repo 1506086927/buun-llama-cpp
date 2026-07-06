@@ -1012,7 +1012,7 @@ static void common_params_postprocess_vbr(common_params & params) {
         const std::string budget_desc = (params.vbr_vram_budget_explicit && vram_budget_bytes > 0)
             ? std::to_string(vram_budget_bytes / (1024ull*1024ull)) + " MiB (explicit)"
             : "auto (remaining VRAM, resolved by fit)";
-        LOG_INF("VBR dynamic runtime controller: KV budget %s, entry tier turbo8, floor %.4g bits/value, "
+        LOG_INF("VBR dynamic runtime controller: KV budget %s, entry tier f16, floor %.4g bits/value, "
                 "price-ordered decode-time degrades\n",
                 budget_desc.c_str(), params.vbr_capacity_bits);
         return;
