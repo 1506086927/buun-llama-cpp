@@ -917,6 +917,51 @@ private:
         prompt_cache->update();
     }
 
+    // dynamic VBR: clear-only reclaim of idle slots (the prompt cache is disabled under the VBR
+    // gates, so unlike cache_idle_slots there is nothing to save into — the cost is a re-prefill
+    // if that conversation returns). Never touches processing slots or a slot an explicitly
+    // pinned deferred task is waiting on. Returns the number of slots cleared.
+    int vbr_clear_idle_slots(int except_id, const char * reason) {
+        int cleared = 0;
+        for (auto & s : slots) {
+            if (s.id == except_id || s.is_processing() || s.prompt.n_tokens() == 0) {
+                continue;
+            }
+            if (queue_tasks.has_deferred_for_slot(s.id)) {
+                SLT_INF(s, "vbr reclaim (%s): kept — a deferred id_slot task pins this slot\n", reason);
+                continue;
+            }
+            SLT_WRN(s, "vbr reclaim (%s): clearing %d cached tokens\n", reason, (int) s.prompt.n_tokens());
+            s.prompt_clear(false);
+            s.prompt.checkpoints.clear(); // host-RAM recurrent blobs would linger until slot reuse
+            cleared++;
+        }
+        return cleared;
+    }
+
+    // reclaim-before-degrade: when the incoming work's projected footprint would push the
+    // degrade ladder BELOW the quality floor, pay with idle caches instead of tiers. Above the
+    // floor the trade inverts — a within-band degrade is near-lossless and cheaper than
+    // destroying another conversation's re-prefillable cache, so caches are kept. Policy reads
+    // deficit_raw only: page-exact and free-VRAM independent, so WHETHER a cache is erased
+    // never depends on driver jitter or co-tenants (the cache's own live clamp still handles
+    // those with tier degrades).
+    void vbr_reclaim_before_degrade(int except_id, uint32_t n_tokens_extra, const char * reason) {
+        if (!server_vbr_dynamic_active(params_base) || params_base.vbr_reclaim_floor_bpv <= 0.0f) {
+            return;
+        }
+        const auto st = llama_memory_vbr_state(llama_get_memory(ctx_tgt), -1, n_tokens_extra);
+        if (st.deficit_raw <= 0 || st.bpv_if_degraded >= (double) params_base.vbr_reclaim_floor_bpv) {
+            return;
+        }
+        const int cleared = vbr_clear_idle_slots(except_id, reason);
+        if (cleared > 0) {
+            SRV_WRN("vbr reclaim (%s): cleared %d idle slot(s) — deficit %.2f MiB, degrading instead would land %.3f bpv < floor %.3f\n",
+                    reason, cleared, st.deficit_raw / 1024.0 / 1024.0, st.bpv_if_degraded,
+                    (double) params_base.vbr_reclaim_floor_bpv);
+        }
+    }
+
     void recurrent_shrink_for_prefill(const char * reason) {
         if (!recurrent_expanded || !needs_reeval || n_seq_max_full <= n_parallel_user) {
             return;
@@ -2686,6 +2731,16 @@ private:
                             }
                         }
 
+                        // dynamic VBR: if this launch's projected footprint would degrade the
+                        // pool below the quality floor, clear idle caches first. The probe is
+                        // sized by the post-LCP SUFFIX — the common prefix refills in place with
+                        // zero cell growth, and probing the full prompt evicted other clients'
+                        // caches for growth that was never going to happen.
+                        if (server_vbr_dynamic_active(params_base) && task.n_tokens() > 0) {
+                            const size_t lcp = slot->prompt.tokens.get_common_prefix(task.tokens);
+                            vbr_reclaim_before_degrade(slot->id, (uint32_t) (task.n_tokens() - lcp), "launch");
+                        }
+
                         if (!launch_slot_with_task(*slot, std::move(task))) {
                             SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                             break; // drop the task
@@ -3830,6 +3885,13 @@ private:
             && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH);
         if (can_batch_multiseq) {
             llama_set_force_split_seq(ctx_tgt, false);
+        }
+
+        // dynamic VBR: mid-decode pressure — generation can cross a page/budget boundary long
+        // after launch. Same floor-gated reclaim before the cache pays with tiers (idle slots
+        // only; every generating slot is processing and untouchable).
+        if (batch.n_tokens > 0) {
+            vbr_reclaim_before_degrade(-1, (uint32_t) batch.n_tokens, "decode");
         }
 
         // process the created batch of tokens

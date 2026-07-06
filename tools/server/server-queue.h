@@ -47,6 +47,18 @@ public:
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
     void pop_deferred_task(int id_slot);
 
+    // true if any deferred task explicitly pins id_slot — a reclaim sweep must not clear the
+    // cache that task deferred itself to come back for
+    bool has_deferred_for_slot(int id_slot) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        for (const auto & task : queue_tasks_deferred) {
+            if (task.id_slot == id_slot) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
     void wait_until_no_sleep();

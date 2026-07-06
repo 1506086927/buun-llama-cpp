@@ -634,6 +634,11 @@ struct common_params {
     bool vbr_policy_explicit = false;   // whether --vbr-policy was provided
     bool vbr_cache_type_k = false;      // whether K was selected via the VBR cache-type alias
     bool vbr_cache_type_v = false;      // whether V was selected via the VBR cache-type alias
+    // dynamic VBR server policy: clear idle slots' KV before a degrade wave would land the
+    // aggregate BELOW this bits/value. 8.125 = protect the f16/t8 near-lossless band (above it,
+    // degrading beats destroying another client's re-prefillable cache); 0 = never reclaim;
+    // >= 16 = reclaim before any degrade (single-user maximal-quality profile)
+    float vbr_reclaim_floor_bpv = 8.125f;
     // canonical predicates — use these instead of re-deriving the flag combinations
     bool vbr_enabled() const {
         return vbr_cache_type_k || vbr_cache_type_v || vbr_budget_explicit ||

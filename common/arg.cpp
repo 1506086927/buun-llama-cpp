@@ -2817,6 +2817,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_VBR_VRAM_BUDGET"));
     add_opt(common_arg(
+        {"--vbr-reclaim-floor"}, "BPV",
+        "dynamic VBR (server): clear idle slots' KV caches before a degrade wave would land the aggregate below this bits/value (default: 8.125 = protect the near-lossless f16/t8 band; 0 = never reclaim; 16 = reclaim before any degrade)",
+        [](common_params & params, const std::string & value) {
+            params.vbr_reclaim_floor_bpv = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VBR_RECLAIM_FLOOR"));
+    add_opt(common_arg(
         {"--vbr-policy"}, "PATH",
         "VBR runtime policy ladder JSON or directory; selects the lowest-KLD measured schedule that fits the requested VBR budget/floor (default: auto via VBR_POLICY_LADDER)",
         [](common_params & params, const std::string & value) {
