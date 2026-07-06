@@ -127,17 +127,14 @@ static std::vector<std::string> turbo_vbr_split(const std::string & s, char deli
     return out;
 }
 
-static const char * turbo_vbr_getenv(const char * name, const char * legacy_name) {
+static const char * turbo_vbr_getenv(const char * name) {
     const char * e = getenv(name);
-    if (e && e[0]) {
-        return e;
-    }
-    return legacy_name ? getenv(legacy_name) : nullptr;
+    return e && e[0] ? e : nullptr;
 }
 
-static bool turbo_vbr_env_enabled(const char * name, const char * legacy_name) {
-    const char * e = turbo_vbr_getenv(name, legacy_name);
-    return e && e[0] && atoi(e) != 0;
+static bool turbo_vbr_env_enabled(const char * name) {
+    const char * e = turbo_vbr_getenv(name);
+    return e && atoi(e) != 0;
 }
 
 static bool turbo_vbr_type_from_str(const std::string & raw, ggml_type & out) {
@@ -154,19 +151,20 @@ static bool turbo_vbr_type_from_str(const std::string & raw, ggml_type & out) {
     } else if (s == "t4" || s == "turbo4" || s == "turbo4_0") {
         out = GGML_TYPE_TURBO4_0;
         return true;
-    } else if (s == "t3" || s == "turbo3" || s == "turbo3_0") {
-        out = GGML_TYPE_TURBO3_0;
+    } else if (s == "turbo3_0") {
+        out = GGML_TYPE_TURBO3_0; // vanilla PolarQuant tier: explicit _0 spelling only
         return true;
-    } else if (s == "t2" || s == "turbo2" || s == "turbo2_0") {
+    } else if (s == "turbo2_0") {
         out = GGML_TYPE_TURBO2_0;
         return true;
-    } else if (s == "t3tcq" || s == "turbo3tcq" || s == "turbo3_tcq") {
+    } else if (s == "t3" || s == "turbo3" || s == "t3tcq" || s == "turbo3tcq" || s == "turbo3_tcq") {
+        // bare tier aliases mean the TCQ codec, matching --vbr-floor and degrade-order files
         out = GGML_TYPE_TURBO3_TCQ;
         return true;
-    } else if (s == "t2tcq" || s == "turbo2tcq" || s == "turbo2_tcq") {
+    } else if (s == "t2" || s == "turbo2" || s == "t2tcq" || s == "turbo2tcq" || s == "turbo2_tcq") {
         out = GGML_TYPE_TURBO2_TCQ;
         return true;
-    } else if (s == "t1tcq" || s == "turbo1tcq" || s == "turbo1_tcq") {
+    } else if (s == "t1" || s == "turbo1" || s == "t1tcq" || s == "turbo1tcq" || s == "turbo1_tcq") {
         out = GGML_TYPE_TURBO1_TCQ;
         return true;
     }
@@ -255,7 +253,7 @@ static std::string turbo_vbr_read_schedule_env(const char * env, std::string & s
     if (!path.empty()) {
         std::ifstream f(path);
         if (!f) {
-            LLAMA_LOG_WARN("llama_kv_cache: could not open TURBO_VBR_LAYER_SCHEDULE file %s\n", path.c_str());
+            LLAMA_LOG_WARN("llama_kv_cache: could not open VBR_LAYER_SCHEDULE file %s\n", path.c_str());
             return {};
         }
         std::ostringstream ss;
@@ -268,11 +266,11 @@ static std::string turbo_vbr_read_schedule_env(const char * env, std::string & s
 }
 
 static bool turbo_vbr_layer_strict_enabled(void) {
-    return turbo_vbr_env_enabled("VBR_LAYER_STRICT", "TURBO_VBR_LAYER_STRICT");
+    return turbo_vbr_env_enabled("VBR_LAYER_STRICT");
 }
 
 static int turbo_vbr_schedule_ctx(void) {
-    const char * e = turbo_vbr_getenv("VBR_SCHEDULE_CTX", "TURBO_VBR_SCHEDULE_CTX");
+    const char * e = turbo_vbr_getenv("VBR_SCHEDULE_CTX");
     if (!e || !e[0]) {
         return 8192;
     }
@@ -303,12 +301,12 @@ static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
     policy.k.assign(n_layer, base_k);
     policy.v.assign(n_layer, base_v);
 
-    const char * env = turbo_vbr_getenv("VBR_LAYER_SCHEDULE", "TURBO_VBR_LAYER_SCHEDULE");
+    const char * env = turbo_vbr_getenv("VBR_LAYER_SCHEDULE");
     std::string src;
     std::string schedule = turbo_vbr_read_schedule_env(env, src);
     if (schedule.empty()) {
         if (env && env[0] && turbo_vbr_layer_strict_enabled()) {
-            throw std::runtime_error("TURBO_VBR_LAYER_SCHEDULE is empty or could not be read while TURBO_VBR_LAYER_STRICT=1 is set");
+            throw std::runtime_error("VBR_LAYER_SCHEDULE is empty or could not be read while VBR_LAYER_STRICT=1 is set");
         }
         return policy;
     }
@@ -556,9 +554,11 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+    const llama_memory_vbr_params & vbr) :
     model(model), hparams(hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+    vbr_params_(vbr) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
@@ -567,7 +567,7 @@ llama_kv_cache::llama_kv_cache(
         turbo_vbr_layer_policy_from_env(hparams.n_layer, type_k, type_v, kv_size);
     if (vbr_layer_policy.enabled && turbo_vbr_layer_strict_enabled() && vbr_layer_policy.ignored_bands > 0) {
         throw std::runtime_error(format(
-                "TURBO_VBR_LAYER_SCHEDULE contains unsupported segmented bands but TURBO_VBR_LAYER_STRICT=1 was set: %s",
+                "VBR_LAYER_SCHEDULE contains unsupported segmented bands but VBR_LAYER_STRICT=1 was set: %s",
                 turbo_vbr_segmented_reject_reason(vbr_layer_policy).c_str()));
     }
 
@@ -871,11 +871,27 @@ llama_kv_cache::llama_kv_cache(
     // (layer,side) tensor at a fixed page-aligned offset sized for the MAX tier (F16 x kv_size),
     // physical pages mapped on demand as occupancy grows (vbr_vmm_ensure_mapped). Tier degrades
     // then shrink a tensor in place and unmap its tail; freed pages are fungible across tensors,
-    // so nothing ever relocates. Env-gated for S2 bring-up; S4 ties this to cparams.vbr_dynamic.
-    const bool vbr_vmm_wanted = getenv("VBR_VMM") != nullptr && !hparams.no_alloc &&
+    // so nothing ever relocates. Driven by cparams.vbr_dynamic (threaded through create_memory);
+    // VBR_VMM / VBR_MODE env remain developer overrides in BOTH directions (VBR_VMM=0 forces off).
+    bool vbr_dynamic_wanted = vbr_params_.dynamic;
+    if (const char * e = getenv("VBR_VMM")) {
+        vbr_dynamic_wanted = atoi(e) != 0;
+    } else if (const char * m = getenv("VBR_MODE")) {
+        vbr_dynamic_wanted = strcmp(m, "dynamic") == 0;
+    }
+    const bool vbr_vmm_wanted = vbr_dynamic_wanted && !hparams.no_alloc &&
                                 (vbr_layer_policy.enabled || is_turbo) && n_stream == 1 && !v_trans;
-    LLAMA_LOG_DEBUG("%s: VBR_VMM gate: env=%d no_alloc=%d policy=%d is_turbo=%d n_stream=%u v_trans=%d -> wanted=%d\n",
-            __func__, getenv("VBR_VMM") != nullptr, (int) hparams.no_alloc, (int) vbr_layer_policy.enabled,
+    if (vbr_dynamic_wanted && !vbr_vmm_wanted && !hparams.no_alloc) {
+        // fail loud, not silent: the caller asked for the degrade controller and would otherwise
+        // get a static max-tier cache while the logs still advertise dynamic VBR
+        LLAMA_LOG_WARN("%s: dynamic VBR requested but the controller cannot arm (%s) — this cache "
+                "stays static at its entry tiers\n", __func__,
+                !(vbr_layer_policy.enabled || is_turbo) ? "KV is not turbo-typed" :
+                n_stream != 1 ? "KV is split per sequence (n_stream > 1; run with --kv-unified)" :
+                "the V cache is transposed (flash attention is off)");
+    }
+    LLAMA_LOG_DEBUG("%s: VBR_VMM gate: dynamic=%d no_alloc=%d policy=%d is_turbo=%d n_stream=%u v_trans=%d -> wanted=%d\n",
+            __func__, (int) vbr_dynamic_wanted, (int) hparams.no_alloc, (int) vbr_layer_policy.enabled,
             (int) is_turbo, n_stream, (int) v_trans, (int) vbr_vmm_wanted);
 
     auto try_vmm_alloc = [&](ggml_context * c, ggml_backend_buffer_type_t bft) -> ggml_backend_buffer_t {
@@ -1082,31 +1098,31 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_INFO("%s: VBR pool #%zu (device %d): %.2f MiB buffer, %.2f MiB used\n",
                     __func__, pi, p.device, p.size/1024.0/1024.0, p.used/1024.0/1024.0);
         }
-        // S3/S4: arm the decode-time degrade controller (VMM mode only). The envs are the
-        // single runtime knob; the CLI dynamic path feeds them from three places:
-        //   VBR_VMM=1 + VBR_MODE=dynamic  — common_params_postprocess_vbr (always in dynamic);
-        //   VBR_BUDGET_MIB                — postprocess (explicit --vbr-vram) or the fit pass
-        //                                   (auto, from remaining VRAM); absent in dynamic mode
-        //                                   -> floor-layout-cost fallback below;
-        //   VBR_MIN_BITS                  — the --vbr-floor aggregate clamp (see
-        //                                   vbr_floor_clamp_order).
-        // VBR_STASH_ROWS / VBR_DEGRADE_ORDER remain direct overrides for experiments.
+        // S3/S4: arm the decode-time degrade controller (VMM mode only). Inputs come from
+        // cparams (llama_memory_vbr_params, threaded through create_memory): budget_bytes is
+        // either the explicit --vbr-vram value or the fit pass's auto budget; min_bits is the
+        // --vbr-floor aggregate clamp (see vbr_floor_clamp_order). VBR_BUDGET_MIB / VBR_MIN_BITS
+        // env remain developer overrides; VBR_STASH_ROWS / VBR_DEGRADE_ORDER are direct
+        // experiment overrides.
         if (vbr_vmm_active()) {
             vbr_load_degrade_order();
             vbr_floor_clamp_order();
+            vbr_budget_bytes_ = (size_t) vbr_params_.budget_bytes;
             if (const char * env = getenv("VBR_BUDGET_MIB")) {
                 vbr_budget_bytes_ = (size_t) strtoull(env, nullptr, 10) * 1024 * 1024;
+            }
+            if (vbr_budget_bytes_ > 0) {
                 LLAMA_LOG_INFO("%s: VBR budget: %.2f MiB mapped-physical (degrade trigger armed)\n",
                         __func__, vbr_budget_bytes_/1024.0/1024.0);
-            } else if (const char * mode = getenv("VBR_MODE"); mode && strcmp(mode, "dynamic") == 0) {
-                // dynamic mode reached us without a fit-resolved budget (fit disabled, failed,
-                // or took a branch without the VBR hook): fall back to the floor-layout cost —
-                // the minimum budget that guarantees the advertised full context fits. VRAM
-                // above it goes unused in this path (conservative; the fit-armed budget is
-                // the one that spends all headroom on quality).
+            } else {
+                // dynamic mode reached us without a resolved budget (fit disabled, failed, or a
+                // garbage override): fall back to the floor-layout cost — the minimum budget that
+                // guarantees the advertised full context fits. VRAM above it goes unused in this
+                // path (conservative; the fit-armed budget is the one that spends all headroom
+                // on quality).
                 vbr_budget_bytes_ = vbr_floor_cost_bytes_;
                 LLAMA_LOG_INFO("%s: VBR budget: %.2f MiB mapped-physical (floor-layout cost of the "
-                        "full context; fit did not resolve an auto budget — conservative fallback)\n",
+                        "full context; no auto budget was resolved — conservative fallback)\n",
                         __func__, vbr_budget_bytes_/1024.0/1024.0);
             }
             // split the global budget across the VMM pools proportional to each pool's VA-size
@@ -2496,15 +2512,15 @@ void llama_kv_cache::vbr_synth_generic_order() {
             __func__, vbr_degrade_order_.size(), n);
 }
 
-// --vbr-floor (env VBR_MIN_BITS, decimal bits/value): a LITERAL aggregate floor. Walk the order
-// against the initial layout and clamp the cursor at the first step that would take the aggregate
-// below the floor — e.g. floor 4.25 with t4 = 4.125 bpv stops with a few units still a tier
-// higher. Strict-prefix clamp: the aggregate is monotone decreasing along the order, and skipping
-// ahead to a cheaper later step would violate the measured price order. The default t1 floor
-// (1.25) equals the full order's end point, so nothing clamps.
+// --vbr-floor (cparams min_bits; env VBR_MIN_BITS override, decimal bits/value): a LITERAL
+// aggregate floor. Walk the order against the initial layout and clamp the cursor at the first
+// step that would take the aggregate below the floor — e.g. floor 4.25 with t4 = 4.125 bpv stops
+// with a few units still a tier higher. Strict-prefix clamp: the aggregate is monotone decreasing
+// along the order, and skipping ahead to a cheaper later step would violate the measured price
+// order. The default t1 floor (1.25) equals the full order's end point, so nothing clamps.
 void llama_kv_cache::vbr_floor_clamp_order() {
     vbr_degrade_limit_ = vbr_degrade_order_.size();
-    double floor_bpv = 0.0;
+    double floor_bpv = vbr_params_.min_bits;
     if (const char * env = getenv("VBR_MIN_BITS")) {
         floor_bpv = atof(env); // "auto"/"none" parse to 0 -> the t1 default below
     }

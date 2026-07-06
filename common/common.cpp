@@ -1592,13 +1592,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
-    cparams.vbr_min_bits            = params.vbr_min_bits_value;
-    cparams.vbr_capacity_bits       = params.vbr_capacity_bits;
-    cparams.vbr_vram_budget_bytes   = params.vbr_vram_budget_bytes;
-    cparams.vbr_enabled             = params.vbr_cache_type_k || params.vbr_cache_type_v || params.vbr_budget_explicit || params.vbr_min_bits_explicit || params.vbr_vram_budget_explicit;
-    cparams.vbr_dynamic             = cparams.vbr_enabled && (params.vbr_budget == "dynamic" || params.vbr_budget == "auto");
-    cparams.vbr_type_k              = params.vbr_cache_type_k;
-    cparams.vbr_type_v              = params.vbr_cache_type_v;
+    {
+        const bool vbr_selected = params.vbr_cache_type_k || params.vbr_cache_type_v || params.vbr_budget_explicit || params.vbr_min_bits_explicit || params.vbr_vram_budget_explicit;
+        cparams.vbr_min_bits          = params.vbr_min_bits_value;
+        cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
+        cparams.vbr_dynamic           = vbr_selected && (params.vbr_budget == "dynamic" || params.vbr_budget == "auto");
+    }
 
     return cparams;
 }

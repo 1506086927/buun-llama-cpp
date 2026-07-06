@@ -640,21 +640,17 @@ static void common_setenv_override(const char * name, const std::string & value)
 #endif
 }
 
-static const char * common_getenv_compat(const char * name, const char * legacy_name) {
+static const char * common_getenv_nonempty(const char * name) {
     const char * value = getenv(name);
-    if (value && value[0]) {
-        return value;
-    }
-    return legacy_name ? getenv(legacy_name) : nullptr;
+    return value && value[0] ? value : nullptr;
 }
 
-static bool common_env_compat_present(const char * name, const char * legacy_name) {
-    const char * value = common_getenv_compat(name, legacy_name);
-    return value && value[0];
+static bool common_env_present(const char * name) {
+    return common_getenv_nonempty(name) != nullptr;
 }
 
 static void common_setenv_default(const char * name, const std::string & value) {
-    if (common_env_compat_present(name, nullptr)) {
+    if (common_env_present(name)) {
         return;
     }
 #if defined(_WIN32)
@@ -766,7 +762,7 @@ static std::string common_vbr_policy_arg(const common_params & params, bool & ex
         return params.vbr_policy;
     }
 
-    const char * env = common_getenv_compat("VBR_POLICY_LADDER", "TURBO_VBR_POLICY_LADDER");
+    const char * env = common_getenv_nonempty("VBR_POLICY_LADDER");
     if (env && env[0]) {
         explicit_policy = true;
         return env;
@@ -858,8 +854,8 @@ static double common_vbr_apply_policy_ladder(
         return 0.0;
     }
 
-    const bool schedule_present = common_env_compat_present("VBR_LAYER_SCHEDULE", "TURBO_VBR_LAYER_SCHEDULE");
-    const bool schedule_from_policy = common_env_compat_present("VBR_LAYER_SCHEDULE_FROM_POLICY", "TURBO_VBR_LAYER_SCHEDULE_FROM_POLICY");
+    const bool schedule_present = common_env_present("VBR_LAYER_SCHEDULE");
+    const bool schedule_from_policy = common_env_present("VBR_LAYER_SCHEDULE_FROM_POLICY");
     if (schedule_present && !schedule_from_policy) {
         if (explicit_policy) {
             throw std::invalid_argument("--vbr-policy/VBR_POLICY_LADDER cannot be combined with VBR_LAYER_SCHEDULE");
@@ -870,28 +866,19 @@ static double common_vbr_apply_policy_ladder(
 
     const common_vbr_policy_choice choice = common_vbr_select_policy(policy_path, cap_bits, min_bits);
     common_setenv_override("VBR_LAYER_SCHEDULE", "@" + choice.schedule_path);
-    common_setenv_override("TURBO_VBR_LAYER_SCHEDULE", "@" + choice.schedule_path);
     common_setenv_override("VBR_LAYER_SCHEDULE_FROM_POLICY", "1");
-    common_setenv_override("TURBO_VBR_LAYER_SCHEDULE_FROM_POLICY", "1");
     common_setenv_override("VBR_LAYER_STRICT", "1");
-    common_setenv_override("TURBO_VBR_LAYER_STRICT", "1");
     common_setenv_default("VBR_SCHEDULE_CTX", "8192");
-    common_setenv_default("TURBO_VBR_SCHEDULE_CTX", "8192");
     params.vbr_selected_family = "static";
     params.vbr_selected_policy = choice.name;
     params.vbr_selected_schedule = choice.schedule_path;
     params.vbr_selected_bpv = choice.bpv;
     params.vbr_selected_kld = choice.full_kld;
     common_setenv_override("VBR_SELECTED_FAMILY", params.vbr_selected_family);
-    common_setenv_override("TURBO_VBR_SELECTED_FAMILY", params.vbr_selected_family);
     common_setenv_override("VBR_SELECTED_POLICY", params.vbr_selected_policy);
-    common_setenv_override("TURBO_VBR_SELECTED_POLICY", params.vbr_selected_policy);
     common_setenv_override("VBR_SELECTED_BPV", common_vbr_format_bits(params.vbr_selected_bpv));
-    common_setenv_override("TURBO_VBR_SELECTED_BPV", common_vbr_format_bits(params.vbr_selected_bpv));
     common_setenv_override("VBR_SELECTED_KLD", std::to_string(params.vbr_selected_kld));
-    common_setenv_override("TURBO_VBR_SELECTED_KLD", std::to_string(params.vbr_selected_kld));
     common_setenv_override("VBR_SELECTED_SCHEDULE", params.vbr_selected_schedule);
-    common_setenv_override("TURBO_VBR_SELECTED_SCHEDULE", params.vbr_selected_schedule);
     LOG_INF("VBR policy selected: cap=%g, floor=%g, family=static, selected=%s, bpv=%g, full_kld=%g, schedule=%s\n",
             cap_bits,
             min_bits,
@@ -927,14 +914,12 @@ static void common_params_postprocess_vbr(common_params & params) {
     params.vbr_min_bits = floor_name;
     params.vbr_min_bits_value = floor_bits;
     params.vbr_capacity_bits = floor_bits > 0.0 ? common_vbr_capacity_surrogate_bits(floor_bits) : 0.0;
-    // Env-consumption map for the VBR_* exports in this function: the RUNTIME reads exactly four —
-    // VBR_VMM + VBR_BUDGET_MIB (controller gate/budget; also set by the fit pass in auto mode),
-    // VBR_MIN_BITS (llama-kv-cache floor clamp) and VBR_MODE (dynamic fallback budget). Everything
-    // else (VBR_CAPACITY_BITS, VBR_VRAM_BUDGET, VBR_SELECTED_*, TURBO_* legacy twins) is
-    // EXPORT-ONLY telemetry for wrapper scripts — no in-process consumer.
-    common_setenv_override("TURBO_VBR_MIN_BITS", floor_name);
-    common_setenv_override("VBR_MIN_BITS", floor_name);
-    common_setenv_override("TURBO_VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
+    // The runtime channel is cparams (llama_context_params.vbr_dynamic / vbr_vram_budget_bytes /
+    // vbr_min_bits, mapped from these params in common_context_params_to_llama and threaded
+    // through create_memory); this function sets NO runtime env. The VBR_VMM / VBR_MODE /
+    // VBR_BUDGET_MIB / VBR_MIN_BITS envs remain DEVELOPER overrides read by llama-kv-cache on
+    // top of cparams. The exports below (VBR_CAPACITY_BITS, VBR_VRAM_BUDGET, VBR_SELECTED_*)
+    // are telemetry for wrapper scripts — no in-process consumer.
     common_setenv_override("VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
 
     std::string vram_budget;
@@ -944,7 +929,6 @@ static void common_params_postprocess_vbr(common_params & params) {
     }
     params.vbr_vram_budget = vram_budget;
     params.vbr_vram_budget_bytes = vram_budget_bytes;
-    common_setenv_override("TURBO_VBR_VRAM_BUDGET", vram_budget);
     common_setenv_override("VBR_VRAM_BUDGET", vram_budget);
 
     std::string budget = common_vbr_lower(params.vbr_budget);
@@ -965,16 +949,15 @@ static void common_params_postprocess_vbr(common_params & params) {
         // --vbr-floor is a LITERAL aggregate bits/value floor enforced by the controller (the
         // degrade order stops at the last step whose aggregate stays >= the floor — e.g. 4.25 with
         // t4 = 4.125 bpv means "t4 layout with a few units held one tier higher"), NOT a snap-up
-        // to the next physical tier. Envs are set loudly — the CLI wins over any pre-set VBR_VMM /
-        // VBR_BUDGET_MIB (a stale env silently fighting the flag = instrument-is-the-bug trap).
+        // to the next physical tier.
         if (params.vbr_policy_explicit) {
             LOG_WRN("VBR dynamic: --vbr-policy is ignored in dynamic mode (the runtime controller "
                     "uses the baked/override degrade order, not a policy ladder)\n");
         }
-        if (getenv("VBR_VMM") || getenv("VBR_BUDGET_MIB")) {
-            LOG_WRN("VBR dynamic: overriding pre-set VBR_VMM/VBR_BUDGET_MIB env with CLI values\n");
+        if (getenv("VBR_VMM") || getenv("VBR_MODE") || getenv("VBR_BUDGET_MIB") || getenv("VBR_MIN_BITS")) {
+            LOG_WRN("VBR dynamic: VBR_VMM/VBR_MODE/VBR_BUDGET_MIB/VBR_MIN_BITS env is set — developer "
+                    "env overrides take precedence over the CLI flags in llama-kv-cache\n");
         }
-        common_setenv_override("VBR_VMM", "1");
         // Dynamic VBR requires single-stream KV (the VMM pool + degrade controller are gated on
         // n_stream == 1). With -np > 1 the default per-sequence streams silently disarm the whole
         // controller and the cache degrades to a static max-tier buffer — force unified KV instead
@@ -985,23 +968,16 @@ static void common_params_postprocess_vbr(common_params & params) {
                     "(per-seq KV streams) — forcing --kv-unified\n", params.n_parallel);
             params.kv_unified = true;
         }
-        if (params.vbr_vram_budget_explicit && vram_budget_bytes > 0) {
-            const uint64_t budget_mib = std::max<uint64_t>(1, vram_budget_bytes / (1024ull * 1024ull));
-            common_setenv_override("VBR_BUDGET_MIB", std::to_string(budget_mib));
-        }
         if (params.vbr_cache_type_k) {
             params.cache_type_k = GGML_TYPE_TURBO8_0;
         }
         if (params.vbr_cache_type_v) {
             params.cache_type_v = GGML_TYPE_TURBO8_0;
         }
-        common_setenv_override("TURBO_VBR_MODE", "dynamic");
-        common_setenv_override("VBR_MODE", "dynamic");
         // capacity contract for telemetry/server metadata: the floor the advertised n_ctx is
         // computed at (explicit --vbr-floor, else the t1 floor tier)
         params.vbr_capacity_bits = floor_bits > 0.0 ? floor_bits
             : 8.0 * ggml_type_size(GGML_TYPE_TURBO1_TCQ) / ggml_blck_size(GGML_TYPE_TURBO1_TCQ);
-        common_setenv_override("TURBO_VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
         common_setenv_override("VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
         params.vbr_selected_family = "dynamic";
         params.vbr_selected_policy = "runtime-controller";
@@ -1046,16 +1022,13 @@ static void common_params_postprocess_vbr(common_params & params) {
         params.cache_type_v = fixed_type;
     }
 
-    common_setenv_override("TURBO_VBR_MODE", "fixed");
-    common_setenv_override("TURBO_VBR_BUDGET", schedule_name);
-    common_setenv_override("VBR_MODE", "fixed");
     common_setenv_override("VBR_BUDGET", schedule_name);
     params.vbr_capacity_bits = fixed_budget_bits;
     const double selected_bpv = common_vbr_apply_policy_ladder(params, fixed_budget_bits);
     if (selected_bpv > 0.0) {
         params.vbr_capacity_bits = selected_bpv;
     }
-    common_setenv_override("TURBO_VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
+
     common_setenv_override("VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
 }
 

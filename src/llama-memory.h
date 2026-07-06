@@ -25,6 +25,16 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 };
 
+// TurboQuant dynamic-VBR runtime parameters, threaded from llama_context_params through
+// create_memory into the attention KV caches (backend side: ggml-vbr.h). The VBR_VMM /
+// VBR_MODE / VBR_BUDGET_MIB / VBR_MIN_BITS environment variables remain available as
+// developer overrides on top of these.
+struct llama_memory_vbr_params {
+    bool     dynamic      = false; // arm the VMM pool + decode-time degrade controller
+    uint64_t budget_bytes = 0;     // mapped-physical KV budget; 0 = floor-layout-cost fallback
+    double   min_bits     = 0.0;   // aggregate bits/value floor (0 = bottom-tier floor)
+};
+
 enum llama_memory_status {
     LLAMA_MEMORY_STATUS_SUCCESS = 0,
     LLAMA_MEMORY_STATUS_NO_UPDATE,

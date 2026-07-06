@@ -231,13 +231,20 @@ static void common_params_fit_impl(
     auto vbr_type_bits = [](enum ggml_type t) {
         return 8.0 * ggml_type_size(t) / ggml_blck_size(t);
     };
+    // captured BEFORE any mutation: vbr_dynamic_arm_budget writes the resolved auto budget back
+    // into cparams->vbr_vram_budget_bytes, so explicit-vs-auto checks must use this snapshot
+    const uint64_t vbr_budget_explicit = cparams->vbr_vram_budget_bytes;
+    // "the VBR/turbo cache family is in play": turbo-typed KV or any dynamic-VBR input. A plain
+    // -ctk turbo3_tcq gets the same capacity estimation as --vbr-bits t3 — same cache, same math.
+    const bool vbr_selected = ggml_is_turbo_kv_type(cparams->type_k) || ggml_is_turbo_kv_type(cparams->type_v) ||
+                              cparams->vbr_dynamic || vbr_budget_explicit != 0 || cparams->vbr_min_bits > 0.0;
     auto vbr_dynamic_arm_budget = [&](const dmds_t & dmds_full,
                                       const std::vector<int64_t> & projected_free_per_device,
                                       int64_t projected_free_host) {
         if (!cparams->vbr_dynamic) {
             return;
         }
-        uint64_t budget = cparams->vbr_vram_budget_bytes; // explicit --vbr-vram (env already set at arg parse)
+        uint64_t budget = vbr_budget_explicit; // explicit --vbr-vram
         if (budget == 0) {
             int64_t b = 0;
             if (nd == 0) {
@@ -248,25 +255,21 @@ static void common_params_fit_impl(
                 }
             }
             if (b <= 0) {
-                LOG_WRN("%s: VBR dynamic: no VRAM headroom for an auto KV budget — degrade controller NOT armed "
-                        "(cache stays at the entry tier)\n", __func__);
+                LOG_WRN("%s: VBR dynamic: no VRAM headroom for an auto KV budget — the runtime falls "
+                        "back to the floor-layout cost of the full context\n", __func__);
                 return;
             }
             budget = (uint64_t) b;
         }
-        const std::string budget_str = std::to_string(std::max<uint64_t>(1, budget / MiB));
-#if defined(_WIN32)
-        _putenv_s("VBR_BUDGET_MIB", budget_str.c_str());
-#else
-        setenv("VBR_BUDGET_MIB", budget_str.c_str(), 1);
-#endif
-        LOG_INF("%s: VBR dynamic: KV VRAM budget %s MiB (%s) — decode-time degrade controller armed\n",
-                __func__, budget_str.c_str(),
-                cparams->vbr_vram_budget_bytes != 0 ? "explicit" : "auto, from remaining memory");
+        // hand the resolved budget to the runtime through cparams (context not created yet)
+        cparams->vbr_vram_budget_bytes = budget;
+        LOG_INF("%s: VBR dynamic: KV VRAM budget %" PRIu64 " MiB (%s) — decode-time degrade controller armed\n",
+                __func__, std::max<uint64_t>(1, budget / MiB),
+                vbr_budget_explicit != 0 ? "explicit" : "auto, from remaining memory");
     };
 
     auto vbr_estimate_ctx_from_total_budget = [&](uint64_t budget_bytes, const dmds_t & dmds_full) {
-        if (!cparams->vbr_enabled || cparams->n_ctx != 0 || hp_nct == 0 || budget_bytes == 0) {
+        if (!vbr_selected || cparams->n_ctx != 0 || hp_nct == 0 || budget_bytes == 0) {
             return uint32_t(0);
         }
         // in dynamic mode the KV is priced at the floor tier for the whole fit (see
@@ -309,7 +312,7 @@ static void common_params_fit_impl(
     };
 
     auto vbr_estimate_ctx_from_remaining = [&](const dmds_t & dmds_full, const std::vector<int64_t> & projected_free_per_device, int64_t projected_free_host) {
-        if (!cparams->vbr_enabled || cparams->n_ctx != 0 || cparams->vbr_vram_budget_bytes != 0 || hp_nct == 0) {
+        if (!vbr_selected || cparams->n_ctx != 0 || vbr_budget_explicit != 0 || hp_nct == 0) {
             return uint32_t(0);
         }
         // dynamic mode with an auto budget: this path only ever GROWS n_ctx past the model
@@ -368,8 +371,8 @@ static void common_params_fit_impl(
         vbr_dynamic_arm_budget(dmds_full, projected_free_per_device, projected_free_host);
 
         uint32_t vbr_n_ctx = 0;
-        if (cparams->vbr_vram_budget_bytes != 0) {
-            vbr_n_ctx = vbr_estimate_ctx_from_total_budget(cparams->vbr_vram_budget_bytes, dmds_full);
+        if (vbr_budget_explicit != 0) {
+            vbr_n_ctx = vbr_estimate_ctx_from_total_budget(vbr_budget_explicit, dmds_full);
         } else {
             vbr_n_ctx = vbr_estimate_ctx_from_remaining(dmds_full, projected_free_per_device, projected_free_host);
         }
@@ -382,10 +385,10 @@ static void common_params_fit_impl(
             LOG_INF("%s: VBR dynamic: advertised n_ctx = %" PRIu32 " = KV budget capacity at the %.4g bits/value floor (%s budget)\n",
                 __func__, cparams->n_ctx,
                 cparams->vbr_min_bits > 0.0 ? cparams->vbr_min_bits : vbr_type_bits(GGML_TYPE_TURBO1_TCQ),
-                cparams->vbr_vram_budget_bytes != 0 ? "explicit" : "auto");
+                vbr_budget_explicit != 0 ? "explicit" : "auto");
         } else {
             LOG_TRC("%s: VBR selected n_ctx = %" PRIu32 " from %s\n",
-                __func__, cparams->n_ctx, cparams->vbr_vram_budget_bytes != 0 ? "explicit KV VRAM budget" : "remaining memory budget");
+                __func__, cparams->n_ctx, vbr_budget_explicit != 0 ? "explicit KV VRAM budget" : "remaining memory budget");
         }
         return true;
     };

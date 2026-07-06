@@ -1949,6 +1949,14 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    // TurboQuant dynamic-VBR inputs for the attention KV caches (no-op unless armed);
+    // recurrent/DSA caches do not take them
+    const llama_memory_vbr_params vbr = {
+        /*.dynamic      =*/ cparams.vbr_dynamic,
+        /*.budget_bytes =*/ cparams.vbr_vram_budget_bytes,
+        /*.min_bits     =*/ cparams.vbr_min_bits,
+    };
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -1978,7 +1986,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         hparams.n_swa,
                         hparams.swa_type,
                         nullptr,
-                        nullptr);
+                        nullptr,
+                        vbr);
             } break;
         case LLM_ARCH_LLADA:
         case LLM_ARCH_LLADA_MOE:
@@ -2068,7 +2077,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* vbr               */ vbr);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -2087,7 +2097,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* vbr               */ vbr);
                     }
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
@@ -2124,7 +2135,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.n_ubatch,
                                 1,
                                 filter,
-                                reuse);
+                                reuse,
+                                vbr);
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
@@ -2142,7 +2154,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 hparams.n_swa,
                                 hparams.swa_type,
                                 filter,
-                                nullptr);
+                                nullptr,
+                                vbr);
                     }
                 }
             }

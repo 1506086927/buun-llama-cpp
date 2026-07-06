@@ -24,7 +24,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) : hparams(model.hparams), unified(unified) {
+    const  layer_reuse_cb & reuse,
+    const llama_memory_vbr_params & vbr) : hparams(model.hparams), unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -57,19 +58,45 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         size_swa = size_base;
     }
 
+    // split the dynamic-VBR budget across the two caches proportional to their worst-case
+    // (entry-tier) footprints — layers x cells; both instances arming with the FULL budget
+    // would target ~2x the configured mapped-physical total before degrading
+    llama_memory_vbr_params vbr_base = vbr;
+    llama_memory_vbr_params vbr_swa  = vbr;
+    if (vbr.budget_bytes > 0) {
+        uint64_t n_base_l = 0;
+        uint64_t n_swa_l  = 0;
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            if (filter && !filter(il)) {
+                continue;
+            }
+            (hparams.is_swa(il) ? n_swa_l : n_base_l)++;
+        }
+        const double w_base = (double) n_base_l * size_base;
+        const double w_swa  = (double) n_swa_l  * size_swa;
+        if (w_base + w_swa > 0.0) {
+            vbr_base.budget_bytes = (uint64_t) ((double) vbr.budget_bytes * (w_base / (w_base + w_swa)));
+            vbr_swa.budget_bytes  = vbr.budget_bytes - vbr_base.budget_bytes;
+            if (vbr.dynamic) {
+                LLAMA_LOG_INFO("%s: VBR budget split: %.2f MiB base / %.2f MiB SWA (by entry-tier footprint)\n",
+                        __func__, vbr_base.budget_bytes/1024.0/1024.0, vbr_swa.budget_bytes/1024.0/1024.0);
+            }
+        }
+    }
+
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
 
     kv_base = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, filter_base, reuse);
+            0, LLAMA_SWA_TYPE_NONE, filter_base, reuse, vbr_base);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     kv_swa = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
-            hparams.n_swa, hparams.swa_type, filter_swa, reuse);
+            hparams.n_swa, hparams.swa_type, filter_swa, reuse, vbr_swa);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {

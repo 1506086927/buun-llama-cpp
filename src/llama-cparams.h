@@ -46,13 +46,9 @@ struct llama_cparams {
     bool kv_unified;
     bool logits_all;
     bool pipeline_parallel;
-    bool vbr_enabled;
     bool vbr_dynamic;
-    bool vbr_type_k;
-    bool vbr_type_v;
 
     double vbr_min_bits = 0.0;
-    double vbr_capacity_bits = 0.0;
     uint64_t vbr_vram_budget_bytes = 0;
 
     enum llama_context_type ctx_type;

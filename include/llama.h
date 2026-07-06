@@ -363,9 +363,9 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
-        double vbr_min_bits;              // requested aggregate VBR floor in effective bits/value, 0 = auto/disabled; not a per-codec ban [EXPERIMENTAL]
-        double vbr_capacity_bits;         // selected supported VBR capacity floor in effective bits/value, 0 = auto/disabled [EXPERIMENTAL]
-        uint64_t vbr_vram_budget_bytes;   // explicit VBR KV VRAM budget, 0 = auto [EXPERIMENTAL]
+        // TurboQuant dynamic VBR (see vbr_dynamic below) [EXPERIMENTAL]
+        double vbr_min_bits;              // aggregate KV floor in effective bits/value, 0 = bottom-tier floor; not a per-codec ban
+        uint64_t vbr_vram_budget_bytes;   // mapped-physical KV VRAM budget in bytes, 0 = floor-layout-cost fallback
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -387,10 +387,9 @@ extern "C" {
         bool no_fused_gdn; // disable fused Gated Delta Net kernels (use decomposed ops)
         bool logits_all;  // if false, reserve logits buffer for n_seqs outputs only (saves VRAM on big-vocab models);
                           // set true when per-token logits are needed (e.g. perplexity)
-        bool vbr_enabled; // VBR cache family was selected for at least one KV side [EXPERIMENTAL]
-        bool vbr_dynamic; // VBR should decay dynamically with context growth [EXPERIMENTAL]
-        bool vbr_type_k;  // K cache type came from the VBR alias [EXPERIMENTAL]
-        bool vbr_type_v;  // V cache type came from the VBR alias [EXPERIMENTAL]
+        bool vbr_dynamic; // arm the decode-time KV degrade controller (turbo-typed caches decay
+                          // tier-by-tier as the context fills; requires flash attention and a
+                          // backend exporting the ggml-vbr.h interface) [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

@@ -39,10 +39,6 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 
 static bool turbo_vbr_layer_schedule_enabled() {
     const char * e = getenv("VBR_LAYER_SCHEDULE");
-    if (e && e[0]) {
-        return true;
-    }
-    e = getenv("TURBO_VBR_LAYER_SCHEDULE");
     return e && e[0];
 }
 
@@ -204,13 +200,19 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
     cparams.logits_all = params.logits_all;
-    cparams.vbr_enabled = params.vbr_enabled;
     cparams.vbr_dynamic = params.vbr_dynamic;
-    cparams.vbr_type_k = params.vbr_type_k;
-    cparams.vbr_type_v = params.vbr_type_v;
     cparams.vbr_min_bits = params.vbr_min_bits;
-    cparams.vbr_capacity_bits = params.vbr_capacity_bits;
     cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
+
+    // Dynamic VBR requires single-stream KV (the VMM pool + degrade controller are gated on
+    // n_stream == 1). Force unified KV here — at context init, AFTER tools have applied their
+    // post-parse n_parallel/n_seq_max mutations (perplexity, imatrix, batched-bench) — so the
+    // controller cannot silently disarm while the logs advertise dynamic VBR.
+    if (cparams.vbr_dynamic && cparams.n_seq_max > 1 && !cparams.kv_unified) {
+        LLAMA_LOG_WARN("%s: dynamic VBR with n_seq_max = %u would split the KV per sequence and "
+                "disarm the degrade controller — forcing unified KV\n", __func__, cparams.n_seq_max);
+        cparams.kv_unified = true;
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -251,14 +253,11 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
-    if (cparams.vbr_enabled) {
-        LLAMA_LOG_INFO("%s: vbr           = %s, K=%s, V=%s, min_bits=%g, capacity_bits=%g, vram_budget=%" PRIu64 "\n",
+    if (cparams.vbr_dynamic || cparams.vbr_vram_budget_bytes > 0 || cparams.vbr_min_bits > 0.0) {
+        LLAMA_LOG_INFO("%s: vbr           = %s, min_bits=%g, vram_budget=%" PRIu64 "\n",
                 __func__,
-                cparams.vbr_dynamic ? "dynamic" : "fixed",
-                cparams.vbr_type_k ? "true" : "false",
-                cparams.vbr_type_v ? "true" : "false",
+                cparams.vbr_dynamic ? "dynamic" : "static",
                 cparams.vbr_min_bits,
-                cparams.vbr_capacity_bits,
                 cparams.vbr_vram_budget_bytes);
     }
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
@@ -4917,7 +4916,6 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.vbr_min_bits                =*/ 0.0,
-        /*.vbr_capacity_bits           =*/ 0.0,
         /*.vbr_vram_budget_bytes       =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
@@ -4929,10 +4927,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.no_fused_gdn               =*/ false,
         /*.logits_all                  =*/ true,
-        /*.vbr_enabled                 =*/ false,
         /*.vbr_dynamic                 =*/ false,
-        /*.vbr_type_k                  =*/ false,
-        /*.vbr_type_v                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.dflash_n_slots              =*/ 1,
