@@ -927,10 +927,10 @@ static void common_params_postprocess_vbr(common_params & params) {
     }
     params.vbr_budget = budget;
     if (common_vbr_budget_is_dynamic(budget)) {
-        // the dynamic ladder spans t8 (entry) down to t1tcq: a floor above t8 means the cache
-        // starts below its own floor (never degrades), one below t1 is unreachable — clamp both
+        // the dynamic ladder spans f16 (entry) down to t1tcq: a floor at/above 16 means the
+        // cache never degrades at all, one below t1 is unreachable — clamp both
         const double floor_lo = common_vbr_type_bits(GGML_TYPE_TURBO1_TCQ);
-        const double floor_hi = common_vbr_type_bits(GGML_TYPE_TURBO8_0);
+        const double floor_hi = 16.0;
         if (floor_bits > 0.0 && (floor_bits < floor_lo - 1e-9 || floor_bits > floor_hi + 1e-9)) {
             const double clamped = floor_bits < floor_lo ? floor_lo : floor_hi;
             LOG_WRN("VBR dynamic: --vbr-floor %.4g is outside the degrade ladder [%.4g, %.4g] — clamping to %.4g\n",
@@ -944,6 +944,7 @@ static void common_params_postprocess_vbr(common_params & params) {
         // transcodes). The cache starts at the turbo8 entry tier (the baked degrade order's F16
         // band no-ops on a t8 start) and whole (layer,side) tensors degrade selectively as mapped
         // bytes approach the KV VRAM budget:
+        //   entry = F16; the baked orders' fp16->t8 band degrades it first under pressure;
         //   --vbr-vram <SIZE>  explicit budget, armed here;
         //   --vbr-vram auto    (default) budget derived from remaining VRAM after model/overhead
         //                      by the fit pass (common_fit_params), which also advertises
@@ -991,11 +992,14 @@ static void common_params_postprocess_vbr(common_params & params) {
                         k_is_vbr ? "V" : "K", ggml_type_name(other_type));
             }
         }
+        // dynamic entry tier = F16: full quality (and f16 decode speed) until budget pressure;
+        // the measured orders' first band (fp16->t8) then fires layer by layer. VBR maximizes
+        // quality within the VRAM budget — starting lower would spend nothing and cost quality.
         if (params.vbr_cache_type_k) {
-            params.cache_type_k = GGML_TYPE_TURBO8_0;
+            params.cache_type_k = GGML_TYPE_F16;
         }
         if (params.vbr_cache_type_v) {
-            params.cache_type_v = GGML_TYPE_TURBO8_0;
+            params.cache_type_v = GGML_TYPE_F16;
         }
         // capacity contract for telemetry/server metadata: the floor the advertised n_ctx is
         // computed at (explicit --vbr-floor, else the t1 floor tier)

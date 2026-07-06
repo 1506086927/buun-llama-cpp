@@ -413,7 +413,9 @@ llama_context::llama_context(
             const bool turbo_k = ggml_is_turbo_kv_type(params.type_k);
             const bool turbo_v = ggml_is_turbo_kv_type(params.type_v);
             const bool vbr_layer_schedule = turbo_vbr_layer_schedule_enabled();
-            if (turbo_k || turbo_v || vbr_layer_schedule) {
+            // dynamic VBR with the f16 entry tier: no turbo types at init, but later degrades
+            // flip tensors to turbo (FA-only decode) and the VMM gate needs v_trans == false
+            if (turbo_k || turbo_v || vbr_layer_schedule || params.vbr_dynamic) {
                 if (!cparams.flash_attn) {
                     LLAMA_LOG_WARN("%s: turbo/VBR KV cache requires Flash Attention — enabling automatically\n", __func__);
                     cparams.flash_attn = true;

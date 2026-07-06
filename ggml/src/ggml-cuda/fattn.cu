@@ -1206,6 +1206,22 @@ static __global__ void k_vbr_f16_to_f32_scaled(const half * __restrict__ src, fl
     if (i < n) { dst[i] = __half2float(src[i]) * scale; }
 }
 
+// F16 source rows (nb1-strided) -> dense scratch_f16. The f16 entry tier stores plain
+// original-domain rows (no rotation, no mean-sub), so the "dequant" is a gather; the encode
+// tap then runs UNsuppressed for f16 sources (see vbr-transcode.cu).
+static __global__ void k_vbr_f16_gather(const char * __restrict__ src, half * __restrict__ dst,
+                                        const int64_t ne0, const int64_t n_rows, const size_t nb1) {
+    const int64_t row = blockIdx.x;
+    if (row >= n_rows) {
+        return;
+    }
+    const half * s = (const half *)(src + (size_t) row * nb1);
+    half       * d = dst + row * ne0;
+    for (int64_t i = threadIdx.x; i < ne0; i += blockDim.x) {
+        d[i] = s[i];
+    }
+}
+
 // V decode-alpha for a tier (1.0 for non-TCQ / K). The runtime V decode multiplies recon by this.
 // NOTE: the TCQ-type guard is load-bearing — tcq_compute_alpha_v returns the TURBO_TCQ_DECODE_ALPHA_V
 // static override for ANY type, so calling it unguarded would apply a spurious alpha to turbo4/8.
@@ -1260,6 +1276,11 @@ void vbr_dequant_turbo_to_f32(const char * src, ggml_type src_type, ggml_type ty
             // LUT + inverse FWHT -> ORIGINAL domain, which is exactly this function's contract.
             k_turbo1_tcq_dequant_f16<<<grid, 128, 0, stream>>>(
                 src, scratch_f16, ne0, n_cells, 1, nb1, nb1, nb1, alpha, iv);
+            break;
+        case GGML_TYPE_F16:
+            // f16 entry tier: plain original-domain rows; gather only (alpha unused: the f16
+            // path has no TCQ decode alpha, and the epilogue's /alpha_v(B) still applies)
+            k_vbr_f16_gather<<<grid, 128, 0, stream>>>(src, scratch_f16, ne0, n_cells, nb1);
             break;
         default:
             GGML_ABORT("vbr_dequant_turbo_to_f32: unsupported src_type %d", (int) src_type);

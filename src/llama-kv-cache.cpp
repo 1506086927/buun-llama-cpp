@@ -29,12 +29,14 @@ enum vbr_tier : uint8_t {
     VBR_TIER_COUNT,
 };
 
-// a type the degrade ladder can move: exactly the five tier types. Anything else living in
-// a VMM pool — an explicitly non-vbr side of a mixed -ct config, or the head_dim>512 f16
-// fallback layers — is PINNED: the transcode dequant has no source support for it, so a step
-// touching it must be skipped, never executed (it would GGML_ABORT mid-decode).
-static bool vbr_type_is_tier(ggml_type t) {
-    return t == GGML_TYPE_TURBO8_0 || t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO3_TCQ ||
+// a type the degrade ladder can move: the five turbo tiers plus F16, which is the dynamic
+// entry tier (full-quality until budget pressure; the measured orders' first band is
+// fp16->t8). Anything else living in a VMM pool — an explicitly non-vbr side of a mixed
+// -ct config (q8_0, bf16) — is PINNED: the transcode dequant has no source support for it,
+// so a step touching it must be skipped, never executed (it would GGML_ABORT mid-decode).
+static bool vbr_type_is_movable(ggml_type t) {
+    return t == GGML_TYPE_F16 ||
+           t == GGML_TYPE_TURBO8_0 || t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO3_TCQ ||
            t == GGML_TYPE_TURBO2_TCQ || t == GGML_TYPE_TURBO1_TCQ;
 }
 
@@ -565,8 +567,11 @@ llama_kv_cache::llama_kv_cache(
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
-    // create a context for each buffer type
-    const bool is_turbo = ggml_type_is_turbo(type_k) || ggml_type_is_turbo(type_v) || vbr_layer_policy.has_turbo;
+    // create a context for each buffer type. Dynamic VBR counts as turbo-managed even when
+    // the ENTRY types are f16 — later degrades flip tensors to turbo tiers, which need the
+    // rotation matrices, the padded allocs and the VMM/extent machinery from the start.
+    const bool is_turbo = ggml_type_is_turbo(type_k) || ggml_type_is_turbo(type_v) ||
+                          vbr_layer_policy.has_turbo || vbr_params_.dynamic;
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
@@ -725,14 +730,14 @@ llama_kv_cache::llama_kv_cache(
         uint32_t n_embd_k_alloc = n_embd_k_gqa;
         uint32_t n_embd_v_alloc = n_embd_v_gqa;
         {
-            if (ggml_type_is_turbo(layer_type_k)) {
+            if (ggml_type_is_turbo(layer_type_k) || vbr_params_.dynamic) {
                 uint32_t head_k = hparams.n_embd_head_k(il);
                 uint32_t padded = ((head_k + 127) / 128) * 128;
                 if (padded > head_k) {
                     n_embd_k_alloc = padded * hparams.n_head_kv(il);
                 }
             }
-            if (ggml_type_is_turbo(layer_type_v) && !v_trans) {
+            if ((ggml_type_is_turbo(layer_type_v) || vbr_params_.dynamic) && !v_trans) {
                 uint32_t head_v = hparams.n_embd_head_v(il);
                 uint32_t padded = ((head_v + 127) / 128) * 128;
                 if (padded > head_v) {
@@ -769,7 +774,8 @@ llama_kv_cache::llama_kv_cache(
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (turbo_rotation == nullptr &&
-            (ggml_type_is_turbo(type_k) || ggml_type_is_turbo(type_v) || vbr_layer_policy.has_turbo)) {
+            (ggml_type_is_turbo(type_k) || ggml_type_is_turbo(type_v) || vbr_layer_policy.has_turbo ||
+             vbr_params_.dynamic)) {
             turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation, "turbo_rotation");  // R (forward)
             turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
@@ -2496,7 +2502,7 @@ void llama_kv_cache::vbr_floor_clamp_order() {
             sim[ikv*2 + side] = t->type;
             sum_bits += 8.0 * ggml_row_size(t->type, t->ne[0]);
             sum_vals += t->ne[0];
-            n_pinned += !vbr_type_is_tier(t->type);
+            n_pinned += !vbr_type_is_movable(t->type);
         }
     }
     if (sum_vals == 0) {
@@ -2515,7 +2521,7 @@ void llama_kv_cache::vbr_floor_clamp_order() {
         }
         const size_t slot = (size_t) it->second * 2 + (st.is_v ? 1 : 0);
         const ggml_tensor * t = st.is_v ? layers[it->second].v : layers[it->second].k;
-        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_type_is_tier(sim[slot])) {
+        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_type_is_movable(sim[slot])) {
             continue; // absent or pinned (runtime skips these steps identically)
         }
         const ggml_type type_B = vbr_tier_type(st.tier);
@@ -2722,6 +2728,13 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                 break;
             }
         }
+        if (type_B == GGML_TYPE_F16) {
+            // promotion CAPS at t8: the transcode dequant emits stored-domain rows (V - mu_V,
+            // K-mean-subtracted) and the f16 decode path never restores the means — promoting
+            // into f16 would serve mean-shifted values. The f16 entry tier returns losslessly
+            // at full reset (metadata-only on an empty cache).
+            return false;
+        }
         const int64_t ne0 = t->ne[0];
         const size_t rA = ggml_row_size(t->type, ne0);
         const size_t rB = ggml_row_size(type_B,  ne0);
@@ -2817,8 +2830,8 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         if (e.byte_len == 0) {
             continue;
         }
-        if (!vbr_type_is_tier(t->type)) {
-            continue; // PINNED unit (non-vbr side / f16 fallback layer): the ladder never touches it
+        if (!vbr_type_is_movable(t->type)) {
+            continue; // PINNED unit (explicit non-vbr side): the ladder never touches it
         }
         const int64_t   ne0    = t->ne[0];
         const ggml_type type_B = vbr_tier_type(st.tier);
@@ -2864,7 +2877,10 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
             int64_t      stash_rows = 0;
             if (vbr_stash_rows_ > 0) {
                 char * sbase = vbr_stash_ensure(*pp);
-                if (e.stash_valid == 0) {
+                // capture only from a TURBO recon (stored-domain, taps already applied); an f16
+                // source holds full-domain rows — defer capture to the first turbo hop, which
+                // matches the previous t8-entry fidelity exactly
+                if (e.stash_valid == 0 && ggml_is_turbo_kv_type(t->type)) {
                     e.stash_valid = (uint32_t) std::min<int64_t>(vbr_stash_rows_, n_cells);
                     pp->be->kv_stash_capture(pp->backend, t, sbase + e.stash_off,
                                                        e.stash_valid, st.is_v != 0);

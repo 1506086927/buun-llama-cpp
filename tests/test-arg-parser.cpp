@@ -178,14 +178,15 @@ int main(void) {
     {
         printf("test-arg-parser: test VBR cache type and budget flags\n\n");
 
-        // dynamic mode (the default): the cache STARTS at the turbo8 entry tier and the runtime
-        // controller degrades it toward the floor; the runtime channel is cparams
+        // dynamic mode (the default): the cache STARTS at the F16 entry tier (full quality
+        // until budget pressure; the measured fp16->t8 band degrades first) and the runtime
+        // controller walks it toward the floor; the runtime channel is cparams
         // (llama_context_params), postprocess exports NO runtime env.
         common_params vbr_params;
         argv = {"binary_name", "-m", "model.gguf", "-ctk", "VBR", "-ctv", "vbr"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_params, LLAMA_EXAMPLE_COMMON));
-        assert(vbr_params.cache_type_k == GGML_TYPE_TURBO8_0);
-        assert(vbr_params.cache_type_v == GGML_TYPE_TURBO8_0);
+        assert(vbr_params.cache_type_k == GGML_TYPE_F16);
+        assert(vbr_params.cache_type_v == GGML_TYPE_F16);
         assert(vbr_params.vbr_cache_type_k);
         assert(vbr_params.vbr_cache_type_v);
         assert(vbr_params.vbr_budget == "dynamic");
@@ -204,7 +205,7 @@ int main(void) {
         common_params vbr_t2_floor;
         argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "-ctv", "vbr", "--vbr-min-bits", "2.25"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_t2_floor, LLAMA_EXAMPLE_COMMON));
-        assert(vbr_t2_floor.cache_type_k == GGML_TYPE_TURBO8_0);
+        assert(vbr_t2_floor.cache_type_k == GGML_TYPE_F16);
         assert(vbr_t2_floor.vbr_min_bits == "2.25");
         assert(vbr_t2_floor.vbr_min_bits_value == 2.25);
         assert(vbr_t2_floor.vbr_capacity_bits == 2.25);
@@ -236,7 +237,7 @@ int main(void) {
         common_params vbr_high_floor;
         argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "--vbr-floor", "f16"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_high_floor, LLAMA_EXAMPLE_COMMON));
-        assert(vbr_high_floor.vbr_min_bits_value == 8.125);
+        assert(vbr_high_floor.vbr_min_bits_value == 16.0); // f16 tops the ladder now (= never degrade)
 
         // one-sided vbr in dynamic mode: an untouched (default f16) opposite side is implied
         // vbr too; an explicitly non-default side stays pinned at its type
@@ -245,14 +246,14 @@ int main(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_imply_v, LLAMA_EXAMPLE_COMMON));
         assert(vbr_imply_v.vbr_cache_type_k);
         assert(vbr_imply_v.vbr_cache_type_v);
-        assert(vbr_imply_v.cache_type_v == GGML_TYPE_TURBO8_0);
+        assert(vbr_imply_v.cache_type_v == GGML_TYPE_F16);
 
         common_params vbr_pin_v;
         argv = {"binary_name", "-m", "model.gguf", "-ctk", "vbr", "-ctv", "q8_0"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), vbr_pin_v, LLAMA_EXAMPLE_COMMON));
         assert(vbr_pin_v.vbr_cache_type_k);
         assert(!vbr_pin_v.vbr_cache_type_v);
-        assert(vbr_pin_v.cache_type_k == GGML_TYPE_TURBO8_0);
+        assert(vbr_pin_v.cache_type_k == GGML_TYPE_F16);
         assert(vbr_pin_v.cache_type_v == GGML_TYPE_Q8_0);
 
         // --vbr-vram alone implies -ctk/-ctv vbr (dynamic)

@@ -1,7 +1,7 @@
 # VBR: variable-bit-rate KV cache
 
-VBR runs the KV cache on the TurboQuant codec ladder (turbo8 → turbo4 → turbo3_tcq →
-turbo2_tcq → turbo1_tcq, 8.125 → 1.25 effective bits/value) and, in dynamic mode, changes
+VBR runs the KV cache on the TurboQuant codec ladder (f16 → turbo8 → turbo4 → turbo3_tcq →
+turbo2_tcq → turbo1_tcq, 16 → 1.25 effective bits/value) and, in dynamic mode, changes
 tiers **at runtime**: the cache starts at the high-quality entry tier and individual
 (layer, K/V) tensors are transcoded down the ladder in place as the context fills, following
 a measured per-model price order. You get near-entry-tier quality at short contexts and
@@ -15,7 +15,8 @@ llama-server -m model.gguf -ctk vbr
 
 That single flag is the complete product:
 
-- the cache starts at the **turbo8** entry tier;
+- the cache starts at **f16** — full quality and f16 decode speed until there is actual
+  budget pressure (layers keep f16 speed until their own degrade step fires);
 - a KV VRAM budget is derived automatically from the memory left after weights/compute
   (the fit pass), or falls back to the floor-layout cost of the full context;
 - when `-c` is unset, the advertised context is the budget's capacity at the **floor**
@@ -33,7 +34,7 @@ runs stay coherent — the price orders were measured on KLD panels per model.
 |---|---|
 | `-ctk vbr` / `-ctv vbr` / `-ct vbr` | select VBR. In dynamic mode a one-sided selection implies vbr on the untouched side too; an explicitly non-default type (`-ctv q8_0`) PINS that side — it never degrades and counts in the aggregate at its fixed bits/value. |
 | `--vbr-budget <tier\|number>` (`--vbr-bits`) | `dynamic` (default) = runtime controller. A tier (`t8/t4/t3/t2/t1`) or a number selects a **fixed** static tier instead — no runtime degrades. |
-| `--vbr-floor <bits\|tier>` (`--vbr-min-bits`) | LITERAL aggregate bits/value floor for dynamic mode. The degrade order stops at the last step whose aggregate stays ≥ the floor — e.g. `4.25` means "t4 layout with a few units held one tier higher", **not** a snap-up to the next tier. Clamped to the ladder range [1.25, 8.125]. Default: t1 (1.25). |
+| `--vbr-floor <bits\|tier>` (`--vbr-min-bits`) | LITERAL aggregate bits/value floor for dynamic mode. The degrade order stops at the last step whose aggregate stays ≥ the floor — e.g. `4.25` means "t4 layout with a few units held one tier higher", **not** a snap-up to the next tier. Clamped to the ladder range [1.25, 16]. Default: t1 (1.25). |
 | `--vbr-vram <SIZE>` | explicit KV VRAM budget (e.g. `8G`). Default `auto` = derived by the fit pass. |
 | `--vbr-policy <json>` | fixed mode only: a measured policy ladder; the best rung ≤ the fixed budget (and ≥ the floor) is selected and its per-layer schedule applied. |
 
