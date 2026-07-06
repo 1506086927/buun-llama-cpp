@@ -401,6 +401,28 @@ struct common_params_speculative {
         return std::find(types.begin(), types.end(), t) != types.end();
     }
 
+    // model-free self-speculation (no -md): drafts come from the target context alone but are
+    // still VERIFIED through the target, so hybrid/recurrent targets need the same rollback
+    // backup sequence as draft-model speculation (see server load_model n_parallel doubling)
+    bool has_model_free_type() const {
+        for (const auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                case COMMON_SPECULATIVE_TYPE_SUFFIX:
+                case COMMON_SPECULATIVE_TYPE_COPYSPEC:
+                case COMMON_SPECULATIVE_TYPE_RECYCLE:
+                    return true;
+                default:
+                    break;
+            }
+        }
+        return false;
+    }
+
     // fork: single-type compat helper (most fork code checks one type at a time)
     common_speculative_type type() const {
         if (types.empty() || (types.size() == 1 && types[0] == COMMON_SPECULATIVE_TYPE_NONE)) {

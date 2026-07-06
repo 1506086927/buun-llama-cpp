@@ -1222,8 +1222,16 @@ private:
         }
 
         // Double n_parallel only when actual speculative decoding is active
-        // (external draft model or MTP), not for phantom --spec-type draft without -md.
-        if (params_base.speculative.has_dft() || params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
+        // (draft model, MTP, or model-free self-speculation), not for phantom
+        // --spec-type draft without -md. Model-free types verify their drafts through
+        // the TARGET context too, so hybrid/recurrent targets need the same backup
+        // sequence for partial-accept rollback: without the doubling n_seq_max stays at
+        // n_parallel_user and llama_memory_recurrent::seq_cp silently no-ops on the
+        // out-of-range backup seq — rollback then WIPES the recurrent state instead of
+        // restoring it (#74: output stays plausible but wrong, degrading over time).
+        if (params_base.speculative.has_dft() ||
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+            params_base.speculative.has_model_free_type()) {
             params_base.n_parallel = n_parallel_user * 2;
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
@@ -1514,6 +1522,25 @@ private:
             };
 
             slot.reset();
+        }
+
+        // safety net (#74): hybrid/recurrent partial-accept rollback requires one backup
+        // sequence per user slot. If a future speculative type slips past the n_parallel
+        // doubling above, refuse to speculate instead of silently corrupting the
+        // recurrent state on the first partially-accepted draft.
+        if (needs_reeval && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+            llama_n_seq_max(ctx_tgt) < (uint32_t) (2 * n_parallel_user)) {
+            bool any_spec = spec != nullptr;
+            for (auto & slot : slots) {
+                any_spec = any_spec || slot.can_speculate();
+                slot.spec.reset();
+                slot.spec_shared = nullptr;
+            }
+            spec.reset();
+            if (any_spec) {
+                SRV_ERR("speculative decoding disabled: hybrid/recurrent rollback needs n_seq_max >= %d, context has %u\n",
+                        2 * n_parallel_user, llama_n_seq_max(ctx_tgt));
+            }
         }
 
         {
@@ -3198,7 +3225,14 @@ private:
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
                 slot.prompt.tokens.push_back(slot.sampled);
 
-                if (slot.task->params.speculative.n_min > (int) draft.size()) {
+                // an empty draft (e.g. ngram-mod with no index match) must take the
+                // no-speculation path: the else-branch would leave spec_draft empty while
+                // spec_i_batch holds one index, so the accept loop (gated on
+                // !spec_draft.empty()) never consumes it and never samples a token this
+                // cycle — the stale index leaks into the next cycle, re-decoding
+                // slot.sampled every step until a real draft breaks the
+                // idxs.size() == draft.size() + 1 invariant (#74)
+                if (draft.empty() || slot.task->params.speculative.n_min > (int) draft.size()) {
                     SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
                     slot.i_batch = slot.spec_i_batch[0];
                     slot.spec_draft.clear();
@@ -4264,6 +4298,31 @@ private:
 
                 // save the original draft size
                 const size_t n_draft = slot.spec_draft.size();
+
+                // defensive (#74): never feed a desynced spec state into
+                // common_sampler_sample_and_accept_n (it hard-asserts on
+                // idxs.size() == draft.size() + 1). The batch build site always appends
+                // the current cycle's (n_draft + 1) contiguous indices LAST, so any
+                // excess can only be a stale prefix leaked from an earlier cycle.
+                // Unreachable with the empty-draft gate in place — this converts any
+                // future recurrence from a server abort into a loud warning.
+                if (slot.spec_i_batch.size() != n_draft + 1) {
+                    SLT_WRN(slot, "spec state desync (spec_i_batch = %zu, spec_draft = %zu) - recovering\n",
+                            slot.spec_i_batch.size(), n_draft);
+
+                    if (slot.spec_i_batch.size() > n_draft + 1) {
+                        // drop the stale prefix, keep the current cycle's indices
+                        slot.spec_i_batch.erase(slot.spec_i_batch.begin(), slot.spec_i_batch.end() - (n_draft + 1));
+                    } else {
+                        // should be unreachable: verify only as many draft tokens as
+                        // there are logit indices (n_draft keeps the original size so
+                        // the prompt rollback below stays consistent)
+                        slot.spec_draft.resize(slot.spec_i_batch.empty() ? 0 : slot.spec_i_batch.size() - 1);
+                        if (slot.spec_i_batch.empty()) {
+                            slot.spec_i_batch.push_back(batch.n_tokens > 0 ? batch.n_tokens - 1 : 0);
+                        }
+                    }
+                }
 
                 // the accepted tokens from the speculation
                 const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft);
