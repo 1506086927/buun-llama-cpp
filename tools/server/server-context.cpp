@@ -1531,6 +1531,26 @@ private:
             params_base.n_parallel = n_parallel_user * 2;
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
+
+            // n_outputs_max was computed above (server_n_outputs_max) with the pre-doubling
+            // n_parallel. The target context is created just below with the DOUBLED n_parallel,
+            // so its n_seq_max grows accordingly and output_reserve(n_seq_max) needs the cap to
+            // cover it. For spec types whose n_outputs_per_seq is 1 (notably the fork DFlash
+            // type, which returns n_max==0), the original cap stayed at n_parallel_user and
+            // tripped GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max) in output_reserve.
+            // Recompute with the doubled n_parallel so the cap tracks the real n_seq_max.
+            params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+            // The fork DFlash drafter verifies a full block (up to block_size tokens, typ. 16,
+            // plus ddtree branches) against the TARGET per step, so the target's output_reserve
+            // peaks well above n_seq_max. But common_speculative_n_max is 0 for the fork DFlash
+            // type and block_size isn't known until the draft model loads (which happens after
+            // this target context is created), so server_n_outputs_max undercounts here.
+            // Reserve a generous per-sequence output budget as a floor. Cost is n_vocab*cap*4B;
+            // this floor (<= n_seq_max_full*32) is at most a few tens of MB and clamped to n_batch.
+            const int32_t dflash_verify_floor =
+                std::min<int32_t>((int32_t) params_base.n_batch, (int32_t) n_seq_max_full * 32);
+            params_base.n_outputs_max = std::max<int32_t>(params_base.n_outputs_max, dflash_verify_floor);
         }
 
         // attach a progress callback

@@ -1737,15 +1737,19 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             // apply sigmoid to beta on GPU
             ggml_tensor * b_sigmoid = ggml_sigmoid(ctx, b_in);
 
-            // state view: reads directly from recurrent memory GPU buffer (zero-copy)
-            // upstream GDN expects flat state: (S_v*S_v*H, K=1, n_seqs=1, 1)
+            // state view: reads directly from recurrent memory GPU buffer (zero-copy).
+            // ggml_gated_delta_net requires a 4D initial state [S_v, S_v, H, n_seqs] (same
+            // layout the forward pass builds via ggml_reshape_4d, see qwen3next.cpp). The
+            // recurrent cell holds S*S*H_v contiguous f32, so view it as [S, S, H_v, 1].
+            // (Was a flat [S*S*H_v,1,1,1] view for the pre-sync op, which the synced op's
+            // state-shape asserts now reject.)
             ggml_tensor * s_tensor = mem_recurrent->s_l[il];
             size_t s_byte_offset = (size_t)cell_idx * n_embd_s * ggml_element_size(s_tensor);
-            int64_t state_flat = S * S * H_v;
-            ggml_tensor * s_view = ggml_view_4d(ctx, s_tensor, state_flat, (int64_t)1, (int64_t)1, (int64_t)1,
-                state_flat * ggml_element_size(s_tensor),
-                state_flat * ggml_element_size(s_tensor),
-                state_flat * ggml_element_size(s_tensor),
+            const size_t s_esz = ggml_element_size(s_tensor);
+            ggml_tensor * s_view = ggml_view_4d(ctx, s_tensor, S, S, H_v, (int64_t)1,
+                S * s_esz,
+                S * S * s_esz,
+                S * S * H_v * s_esz,
                 s_byte_offset);
 
             // GDN op: same kernel as forward pass, bit-identical state update
