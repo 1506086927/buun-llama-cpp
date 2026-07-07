@@ -1546,10 +1546,13 @@ private:
             // peaks well above n_seq_max. But common_speculative_n_max is 0 for the fork DFlash
             // type and block_size isn't known until the draft model loads (which happens after
             // this target context is created), so server_n_outputs_max undercounts here.
-            // Reserve a generous per-sequence output budget as a floor. Cost is n_vocab*cap*4B;
-            // this floor (<= n_seq_max_full*32) is at most a few tens of MB and clamped to n_batch.
-            const int32_t dflash_verify_floor =
-                std::min<int32_t>((int32_t) params_base.n_batch, (int32_t) n_seq_max_full * 32);
+            // Reserve a generous per-sequence output budget as a floor. The cap only bounds
+            // output_reserve's lazily-grown buffers and is clamped to n_batch — the same
+            // ceiling a non-speculative context gets by default — so it costs nothing until
+            // a batch actually requests that many outputs.
+            constexpr int32_t DFLASH_VERIFY_OUTPUTS_PER_SEQ = 32; // ~2x block_size headroom
+            const int32_t dflash_verify_floor = std::min<int32_t>(
+                (int32_t) params_base.n_batch, (int32_t) n_seq_max_full * DFLASH_VERIFY_OUTPUTS_PER_SEQ);
             params_base.n_outputs_max = std::max<int32_t>(params_base.n_outputs_max, dflash_verify_floor);
         }
 

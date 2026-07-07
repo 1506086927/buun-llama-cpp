@@ -1744,8 +1744,11 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             // (Was a flat [S*S*H_v,1,1,1] view for the pre-sync op, which the synced op's
             // state-shape asserts now reject.)
             ggml_tensor * s_tensor = mem_recurrent->s_l[il];
-            size_t s_byte_offset = (size_t)cell_idx * n_embd_s * ggml_element_size(s_tensor);
             const size_t s_esz = ggml_element_size(s_tensor);
+            size_t s_byte_offset = (size_t)cell_idx * n_embd_s * s_esz;
+            // one recurrent cell (n_embd_s) must be exactly the 4D state — the 1d
+            // read-back views below rely on the same equality
+            GGML_ASSERT((int64_t) n_embd_s == S * S * H_v);
             ggml_tensor * s_view = ggml_view_4d(ctx, s_tensor, S, S, H_v, (int64_t)1,
                 S * s_esz,
                 S * S * s_esz,
