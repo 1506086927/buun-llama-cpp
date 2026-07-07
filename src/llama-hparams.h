@@ -163,7 +163,10 @@ struct llama_hparams {
     uint32_t n_embd_head_kda = 0;
 
     // for DFlash drafter
-    uint32_t dflash_block_size        = 16;
+    // NOTE: must default to 0 so non-DFlash drafters (e.g. gemma4-assistant MTP) are not
+    // mis-detected as DFlash by the server's block_size>0 auto-detect. DFlash's
+    // load_arch_hparams sets the real value (16, or from GGUF).
+    uint32_t dflash_block_size        = 0;
     uint32_t dflash_mask_token_id     = 0;
     uint32_t dflash_n_target_features = 25600;
     uint32_t dflash_n_target_layers   = 0;
