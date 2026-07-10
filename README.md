@@ -4,15 +4,144 @@
 
 > **This is a highly experimental fork of llama.cpp. Use at your own discretion.**
 
-A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with **Trellis-Coded Quantization (TCQ)** for KV cache compression. 2-3x more context in the same VRAM, with quality that matches or beats FP16.
+A research and development fork of [llama.cpp](https://github.com/ggml-org/llama.cpp), providing unique KV cache codecs, inference techniques, and bleeding edge features.
+
+## VBR — Variable Bit-Rate KV Cache
+
+Why pay 3-bit or 4-bit quality for a context length you only sometimes reach? VBR quantizes the KV cache
+*dynamically as your session grows* — giving you the highest-quality cache possible at any given depth.
+It quantizes the cache **layer by layer, using our best KV codecs**, from the least-sensitive layers to
+the most-sensitive, and only as far down the ladder as your VRAM and context actually require.
+
+The cache starts at **FP16** and stays there until there is real budget pressure; then it degrades one
+(layer, side) tensor at a time — first to an aggregate 15.75 bits/value, then 15.51, and so on down the
+ladder (`f16 → turbo8 → turbo4 → turbo3_tcq → turbo2_tcq → turbo1_tcq`), following a per-model price
+order measured on KLD panels. For Qwen35 (16 attention layers) that is **160** distinct steps from FP16
+down to turbo1_tcq; for Gemma4-31B (60 layers), **600** — the finest-grained quality control we can give
+you at every moment of a session.
+
+And because VBR always draws from the best codecs on the ladder, **you never have to track KV formats
+again**: new codecs and research roll straight into VBR, so `-ct vbr` will always hand you the best
+possible cache.
+
+### Recommended usage
+
+On a dedicated GPU, just run:
+
+```sh
+llama-server -m model.gguf -ct vbr
+```
+
+That single flag is the whole product: it derives a KV VRAM budget from whatever is left after weights
+and compute, advertises the largest context that fits at the floor tier (capped at the model's training
+length), and degrades tiers on the fly as context fills. No context length to guess, no codec to pick.
+Run with `-v` to watch the `VBR degrade #…` steps fire.
+
+### Settings
+
+| flag | meaning |
+|---|---|
+| `-ct vbr` (or `-ctk vbr` / `-ctv vbr`) | Enable VBR. A one-sided selection implies VBR on the other side too; explicitly pinning a side (`-ctv q8_0`) holds it at fixed bits and never degrades it. |
+| `-c <N>` | Cap the context at N tokens; VBR then spends your whole VRAM budget running *that* window at the highest quality it can, instead of advertising the max floor-tier capacity. E.g. `-c 30000` = the best-quality cache that fits a 30k window. |
+| `--vbr-vram <SIZE>` | Explicit KV VRAM budget (e.g. `8G`). Default `auto` = whatever VRAM is left after weights and compute. |
+| `--vbr-floor <bits\|tier>` | Literal aggregate bits/value floor for dynamic mode (default t1 = 1.25). Degrades stop at the last step still ≥ the floor. |
+| `--vbr-budget <tier\|number>` | Default `dynamic` (runtime controller). A tier (`t8/t4/t3/t2/t1`) or a number instead selects a **fixed** static tier — no runtime degrades. |
+
+**Requirements:** a CUDA or ROCm backend (turbo-typed KV needs the TurboQuant interface; layers whose KV
+lands on the CPU fall back to q8_0). Flash attention is required and force-enabled. Dynamic mode uses
+unified KV (forced automatically with `-np > 1`). Context-shift / self-extend and slot/session
+save-restore are disabled in dynamic mode (they would snapshot tier-typed KV that can't restore across a
+degrade — tier-aware save-restore is planned); context checkpoints stay enabled on hybrid models. Generation stops cleanly when the context
+fills. Models without a baked price order use a generic cross-model order.
+
+## TCQ (trellis-coded KV cache)
+
+Standard KV cache quantization treats each value independently. TCQ constrains the quantization
+indices to follow a 512-state trellis, giving a much larger effective codebook at the same bit rate
+(with FWHT rotation and context-adaptive norm scaling on top). At the 3-bit setting, the trellis cuts
+median KL-divergence by **~40% versus scalar quantization** while using slightly *fewer* bits
+(3.25 vs 3.50 bpv), and lands perplexity on par with an f16 KV cache.
 
 **Paper**: [Closing the Gap: Trellis-Coded Quantization for KV Cache at 2-3 Bits](https://huggingface.co/datasets/spiritbuun/turboquant-tcq-kv-cache)
 
-## What is TCQ?
+### Quality (Qwen3.6-27B Q6_K, 16K, RTX 3090)
 
-Standard KV cache quantization treats each value independently. TCQ constrains quantization indices to follow a 512-state trellis, enabling a much larger effective codebook at the same bit rate. Combined with FWHT rotation and context-adaptive norm scaling, this achieves **10-44% KL-divergence reduction** over scalar quantization at 2-3 bits per value.
+`turbo3` is scalar 3-bit, `turbo3_tcq` the trellis-coded version at fewer bits — the gap is exactly what
+the trellis buys. `pp` = prefill t/s on a 16K prompt, `tg` = decode t/s at 16K depth.
 
-At 3.25 bits per value, TCQ produces **lower perplexity than FP16** KV cache (5.802 vs 5.805).
+| Codec | bpv | PPL | median KLD | pp (t/s) | tg (t/s) |
+|-------|-----|-----|------------|----------|----------|
+| turbo3 (scalar) | 3.5 | 5.730 | 0.00279 | 1015 | 28.1 |
+| turbo3_tcq | 3.25 | 5.668 | 0.00163 | 818 | 26.6 |
+
+The trellis cuts median KLD ~40% (and edges PPL below f16) at fewer bits. Its cost lands in **prefill** —
+the Viterbi re-encode drops prompt processing to ~818 t/s vs ~1015 for scalar turbo3; decode is barely
+affected on a dedicated GPU.
+
+### Speed
+
+The trellis cost is compute, so it depends on hardware. On dedicated GPUs (e.g. RTX 3090) the fused
+tensor-core decode path keeps generation at essentially vanilla / f16 speed (the `tg` numbers above). On
+weaker-compute hardware (e.g. the Strix Halo iGPU) the cost is exposed and the TCQ types can be up to
+~40% slower than their scalar counterparts — there, prefer the scalar or higher-bit codecs.
+
+### How it works
+
+1. **FWHT rotation** with random sign flips converts correlated KV vectors into i.i.d. Gaussian entries
+2. **Viterbi encoding** on a 512-state (3-bit) or 256-state (2-bit) right-shift trellis finds the globally optimal codeword assignment
+3. **O(1) sliding-window decode** -- each value decodes via a bit window lookup, no trellis traversal at inference
+4. **Context-adaptive alpha** -- logarithmic norm scaling formula automatically adjusts dequantization scale per context length
+
+### Custom codebooks
+
+Trained codebooks are included in `codebooks/`. The defaults are compiled into the CUDA kernels, but you can override them:
+
+```sh
+TURBO_TCQ_CB=codebooks/3bit/product_aware_iter080.bin \
+TURBO_TCQ_CB2=codebooks/2bit/product_aware_iter090.bin \
+./build/bin/llama-server -m model.gguf -ngl 99 -fa \
+  -ctk turbo3_tcq -ctv turbo3_tcq
+```
+
+Codebook training scripts are in `scripts/tcq_train_*.py`.
+
+## Codecs
+
+These are the individual KV cache codecs the fork ships. In practice you rarely pick one by hand —
+**dynamic VBR mixes them per layer automatically and is the recommended default**; the codecs below are
+mainly for testing and comparison.
+
+Measured on Qwen3.6-27B Q6_K at 16K context (18 chunks of the wikitext-2 test set) on an RTX 3090.
+Median KL-divergence is versus an f16 KV cache (0 = identical logits); `pp` is prefill throughput on a
+16K prompt and `tg` is decode throughput at 16K depth. Ordered by KL-divergence (quality) — lower is
+better.
+
+| Codec | bpv | PPL | median KLD | pp (t/s) | tg (t/s) |
+|-------|-----|-----|------------|----------|----------|
+| f16 | 16.0 | 5.683 | 0 (ref) | 1104 | 30.7 |
+| q8_0 | 8.5 | 5.698 | 0.00020 | 1050 | 27.4 |
+| turbo8 | 8.125 | 5.693 | 0.00020 | 1013 | 28.6 |
+| turbo4 | 4.125 | 5.723 | 0.00090 | 1017 | 28.4 |
+| q4_0 | 4.5 | 5.705 | 0.00115 | 1033 | 26.9 |
+| turbo3_tcq | 3.25 | 5.668 | 0.00163 | 818 | 26.6 |
+| turbo3 | 3.5 | 5.730 | 0.00279 | 1015 | 28.1 |
+| turbo2_tcq | 2.25 | 5.711 | 0.00561 | 985 | 28.5 |
+| turbo2 | 2.5 | 5.964 | 0.01083 | 1013 | 28.2 |
+| turbo1_tcq | 1.25 | 6.012 | 0.02633 | 991 | 28.5 |
+
+## MTP + Vision (`--mmproj-gpu-swap`)
+
+On VRAM-constrained GPUs, MTP speculative decoding and the vision encoder (mmproj) may not fit in VRAM simultaneously. For example, Qwen3.6-27B Q6_K + MTP uses ~22.6 GiB on a 24 GiB RTX 3090, leaving no room for mmproj's ~1.1 GiB GPU footprint.
+
+`--mmproj-gpu-swap` solves this by keeping mmproj on CPU at startup, then temporarily swapping MTP out of VRAM when an image arrives, loading mmproj to GPU for fast encoding (~1-2s instead of 30-60s on CPU), and swapping back afterward. MTP has no persistent state, so the swap is lossless.
+
+```sh
+./build/bin/llama-server -m Qwen3.6-27B-Q6_K.gguf \
+  --mmproj mmproj.gguf --spec-type draft-mtp \
+  --mmproj-gpu-swap -ngl 99
+```
+
+When combined with auto-fit (no `-c` flag), the server automatically sizes context to leave room for the swap. With a single slot, it also auto-enables `--kv-unified` to avoid splitting the KV cache into separate streams, which doubles usable per-slot context.
 
 ## Build
 
@@ -50,9 +179,17 @@ Test on ROCm 7.13 + AMD Radeon AI PRO R9700
 
 ## Recommended configurations
 
-### turbo4 (4.25 bpv) -- lossless quality, great compression
+**For most use, just use VBR** — it picks the best codec per layer automatically and spends all your spare VRAM on quality:
 
-The safe default. Virtually no quality loss vs FP16 with ~3.8x KV cache compression and no speed penalty.
+```sh
+./build/bin/llama-server -m model.gguf -ngl 99 -ct vbr
+```
+
+The fixed-tier codecs below are for pinning a specific tier — benchmarking, a fixed budget, or a backend without VBR support.
+
+### turbo4 (4.125 bpv) -- low divergence, great compression
+
+The safe fixed-tier default. 4-bit KV cache at ~3.8x compression with no speed penalty — higher fidelity (lower KL-divergence from FP16) than the 2–3 bit codecs below.
 
 ```sh
 ./build/bin/llama-server -m model.gguf -ngl 99 -fa \
@@ -61,7 +198,7 @@ The safe default. Virtually no quality loss vs FP16 with ~3.8x KV cache compress
 
 ### 3-bit TCQ (3.25 bpv) -- best quality at 3-bit
 
-Beats FP16 quality at short context, stays within 2% at long context. ~5x KV cache compression.
+The best-quality 3-bit option — about 40% lower KL-divergence than scalar turbo3 at the same tier. ~5x KV cache compression.
 
 ```sh
 ./build/bin/llama-server -m model.gguf -ngl 99 -fa \
@@ -86,7 +223,7 @@ Beats FP16 quality at short context, stays within 2% at long context. ~5x KV cac
   -ctk turbo3_tcq -ctv turbo2_tcq
 ```
 
-### Scalar turbo3 / turbo2 (3.25 / 2.25 bpv) -- no trellis
+### Scalar turbo3 / turbo2 (3.5 / 2.5 bpv) -- no trellis
 
 Scalar quantization without TCQ. Faster encode, worse quality than TCQ equivalents.
 
@@ -99,68 +236,6 @@ Scalar quantization without TCQ. Faster encode, worse quality than TCQ equivalen
 ./build/bin/llama-server -m model.gguf -ngl 99 -fa \
   -ctk turbo2 -ctv turbo2
 ```
-
-## Quality (KL-divergence, Qwen3.5-27B Q6_K, RTX 3090)
-
-Lower is better. Measured against FP16 KV cache base logits.
-
-| Config | bpv | KLD @2K | KLD @7K |
-|--------|-----|---------|---------|
-| turbo3_tcq (symmetric) | 3.25 | 0.058 | 0.074 |
-| turbo3_tcq-K / turbo2_tcq-V | 2.75 | 0.078 | 0.101 |
-| turbo2_tcq (symmetric) | 2.25 | 0.101 | 0.136 |
-
-3-bit TCQ at 2K context achieves **lower perplexity than FP16** (5.802 vs 5.805) due to a mild regularizing effect from norm scaling.
-
-## Speed (Qwen3.5-27B Q6_K, RTX 3090)
-
-| Config | Decode (tg64) | vs q8_0 |
-|--------|---------------|---------|
-| q8_0 | 31.04 tok/s | -- |
-| turbo3_tcq | 30.04 tok/s | 97% |
-| turbo3 (scalar) | 30.04 tok/s | 97% |
-
-Decode speed is constant across context lengths (30 tok/s at 4K, 65K, and 128K). Prefill uses tensor-core MMA path at 99%+ of q8_0 speed.
-
-## Custom codebooks
-
-Trained codebooks are included in `codebooks/`. The defaults are compiled into the CUDA kernels, but you can override them:
-
-```sh
-TURBO_TCQ_CB=codebooks/3bit/product_aware_iter080.bin \
-TURBO_TCQ_CB2=codebooks/2bit/product_aware_iter090.bin \
-./build/bin/llama-server -m model.gguf -ngl 99 -fa \
-  -ctk turbo3_tcq -ctv turbo3_tcq
-```
-
-Codebook training scripts are in `scripts/tcq_train_*.py`.
-
-## How it works
-
-1. **FWHT rotation** with random sign flips converts correlated KV vectors into i.i.d. Gaussian entries
-2. **Viterbi encoding** on a 512-state (3-bit) or 256-state (2-bit) right-shift trellis finds the globally optimal codeword assignment
-3. **O(1) sliding-window decode** -- each value decodes via a bit window lookup, no trellis traversal at inference
-4. **Context-adaptive alpha** -- logarithmic norm scaling formula automatically adjusts dequantization scale per context length
-
-## Supported models
-
-Any GGUF model with `head_dim` that is a multiple of 128 works natively. Models with other head dimensions (e.g., Phi-3 at 96, Qwen3-0.6B at 64) are supported via automatic zero-padding.
-
-Tested on: Qwen3.5-27B, Qwen3-32B, Gemma-3-27B, Gemma-4-31B, Harmonic-Hermes-9B, Phi-3-mini, and others.
-
-## MTP + Vision (`--mmproj-gpu-swap`)
-
-On VRAM-constrained GPUs, MTP speculative decoding and the vision encoder (mmproj) may not fit in VRAM simultaneously. For example, Qwen3.6-27B Q6_K + MTP uses ~22.6 GiB on a 24 GiB RTX 3090, leaving no room for mmproj's ~1.1 GiB GPU footprint.
-
-`--mmproj-gpu-swap` solves this by keeping mmproj on CPU at startup, then temporarily swapping MTP out of VRAM when an image arrives, loading mmproj to GPU for fast encoding (~1-2s instead of 30-60s on CPU), and swapping back afterward. MTP has no persistent state, so the swap is lossless.
-
-```sh
-./build/bin/llama-server -m Qwen3.6-27B-Q6_K.gguf \
-  --mmproj mmproj.gguf --spec-type draft-mtp \
-  --mmproj-gpu-swap -ngl 99
-```
-
-When combined with auto-fit (no `-c` flag), the server automatically sizes context to leave room for the swap. With a single slot, it also auto-enables `--kv-unified` to avoid splitting the KV cache into separate streams, which doubles usable per-slot context.
 
 ---
 
