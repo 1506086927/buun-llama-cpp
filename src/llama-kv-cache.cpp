@@ -1754,7 +1754,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // boundary (lazy cuBLAS init), or when a degrades/promotes happen, or every 8th token.
             if (!vbr_budget_explicit_) {
                 const bool budget_dirty = vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ < VBR_STABLE_QUICK;
-                const bool budget_periodic = (vbr_boundary_count_ == 0 || vbr_boundary_count_ % 8 == 0);
+                // vbr_boundary_count_ is a free-running per-boundary counter (incremented once per
+                // prepare() below) — NOT coupled to whether we actually re-derive, or the throttle
+                // could never advance its own gate. count==0 is the first boundary (skipped inside
+                // vbr_rederive_budget for lazy cuBLAS); every 8th boundary re-derives thereafter.
+                const bool budget_periodic = (vbr_boundary_count_ % 8 == 0);
                 if (budget_dirty || budget_periodic) {
                     vbr_rederive_budget();
                 }
@@ -1834,9 +1838,23 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                 return {};
             }
         } else {
-            // Fast path: settled, no work to do — just increment boundary counter and update last_used
+            // Fast path: settled — skip the budget/degrade bookkeeping, but STILL eagerly map to the
+            // predicted watermark. try_map is a no-op when the watermark hasn't grown (wm <= wm_cells),
+            // so this is nearly free; when occupancy creeps up under the stable threshold it keeps a
+            // map failure RECOVERABLE here instead of a mid-batch GGML_ABORT in ensure_mapped that
+            // would kill every client.
+            const uint32_t wm_next = vbr_watermark_cells(n_tokens);
+            if (!vbr_vmm_try_map(wm_next)) {
+                LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) — "
+                        "failing this batch recoverably\n", __func__, wm_next);
+                return {};
+            }
             vbr_quiet_boundaries_++;
         }
+        // free-running boundary counter: drives the auto-budget re-derive throttle above and the
+        // first-boundary skip inside vbr_rederive_budget(). Advances every boundary regardless of
+        // which path ran, so the %8 cadence is real wall-boundary time.
+        vbr_boundary_count_++;
         vbr_last_used_ = used_now;
     }
 
@@ -2360,11 +2378,12 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
 // actually give it: share x (mapped + free − growth_headroom), quantized to 64 MiB so driver
 // jitter cannot move a tier decision between identical runs, RE-DERIVED not max-ratcheted (a
 // sawtooth co-tenant's trough must not be captured as permanent), floored at the init-armed
-// value (never stingier than startup), and never touched at all for explicit budgets.
+// value (never stingier than startup), and never touched at all for explicit budgets. Throttled
+// by the caller (see prepare()); vbr_boundary_count_ is advanced there, not here.
 void llama_kv_cache::vbr_rederive_budget() {
     // skip the FIRST boundary: cuBLAS workspaces and CUDA-graph pools allocate lazily during
     // the first graph_compute, so free measured before it overstates reality
-    if (vbr_boundary_count_++ == 0) {
+    if (vbr_boundary_count_ == 0) {
         return;
     }
     constexpr size_t quantum = 64ull * 1024 * 1024;
