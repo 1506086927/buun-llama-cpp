@@ -847,6 +847,11 @@ void common_init();
 void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);
 
+// Resolve a VBR floor spec ("t8"/"t4"/"t3tcq"/"t2tcq"/"t1tcq", "auto"/"none", or a bits value) to an
+// aggregate floor in effective bits/value (0 == bottom-tier floor). Throws std::invalid_argument on
+// bad input. Single source of truth for the floor→bits mapping, shared by the main CLI and llama-bench.
+double common_vbr_floor_bits(const std::string & floor);
+
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);
 void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_params * role_model = nullptr);

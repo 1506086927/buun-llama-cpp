@@ -461,6 +461,17 @@ static bool common_vbr_floor_to_bits(const std::string & raw, std::string & out,
     return true;
 }
 
+// public wrapper (declared in common.h): floor spec -> aggregate bits/value, throwing on bad input.
+// Reuses the same table as the main CLI so llama-bench can't drift from the -ctk vbr / --vbr-floor path.
+double common_vbr_floor_bits(const std::string & floor) {
+    std::string name;
+    double bits = 0.0;
+    if (!common_vbr_floor_to_bits(floor, name, bits)) {
+        throw std::invalid_argument("unsupported VBR floor: " + floor);
+    }
+    return bits;
+}
+
 // smallest tier whose bits/value covers `bits` (ceil onto the ladder); F16 above t8
 static ggml_type common_vbr_capacity_surrogate_type(double bits) {
     if (bits <= 0.0) {

@@ -352,6 +352,9 @@ struct cmd_params {
     std::vector<bool>                no_host;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
+    bool                             vbr;        // arm dynamic VBR (F16 entry + decode-time degrade controller)
+    std::string                      vbr_floor;  // aggregate floor tier (t8/t4/t3tcq/t2tcq/t1tcq, auto = bottom)
+    std::string                      vbr_vram;   // KV VRAM budget: auto (floor-layout fallback) or explicit MiB
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -397,6 +400,9 @@ static const cmd_params cmd_params_defaults = {
     /* no_host              */ { false },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
+    /* vbr                  */ false,
+    /* vbr_floor            */ "auto",
+    /* vbr_vram             */ "auto",
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -449,6 +455,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ub, --ubatch-size <n>                      (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
     printf("  -ctk, --cache-type-k <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
+    printf("  --vbr-floor <t8|t4|t3tcq|t2tcq|t1tcq|auto>  arm dynamic VBR (F16 entry, both sides), aggregate floor tier\n");
+    printf("                                              (also enabled by -ctk vbr / -ctv vbr; default floor: bottom tier)\n");
+    printf("  --vbr-vram <auto|MiB>                       VBR KV VRAM budget (default: auto = floor-layout-cost fallback)\n");
     printf("  -t, --threads <n>                           (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                    (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
     printf("  --cpu-strict <0|1>                          (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
@@ -640,6 +649,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 
                 std::vector<ggml_type> types;
                 for (const auto & t : p) {
+                    if (t == "vbr") {
+                        // dynamic VBR: F16 entry tier, controller armed in to_llama_cparams (both
+                        // sides). Floor via --vbr-floor (default: bottom tier).
+                        params.vbr = true;
+                        types.push_back(GGML_TYPE_F16);
+                        continue;
+                    }
                     ggml_type gt = ggml_type_from_name(t);
                     if (gt == GGML_TYPE_COUNT) {
                         invalid_param = true;
@@ -660,6 +676,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 
                 std::vector<ggml_type> types;
                 for (const auto & t : p) {
+                    if (t == "vbr") {
+                        // dynamic VBR: F16 entry tier, controller armed in to_llama_cparams (both
+                        // sides). Floor via --vbr-floor (default: bottom tier).
+                        params.vbr = true;
+                        types.push_back(GGML_TYPE_F16);
+                        continue;
+                    }
                     ggml_type gt = ggml_type_from_name(t);
                     if (gt == GGML_TYPE_COUNT) {
                         invalid_param = true;
@@ -671,6 +694,20 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.type_v.insert(params.type_v.end(), types.begin(), types.end());
+            } else if (arg == "--vbr-floor" || arg == "--vbr-min-bits") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.vbr       = true;
+                params.vbr_floor = argv[i];
+            } else if (arg == "--vbr-vram" || arg == "--vbr-budget") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.vbr      = true;
+                params.vbr_vram = argv[i];
             } else if (arg == "-dev" || arg == "--device") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1197,6 +1234,10 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    bool               vbr;
+    double             vbr_min_bits;
+    uint64_t           vbr_budget_bytes;
+    bool               vbr_budget_explicit;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1275,12 +1316,34 @@ struct cmd_params_instance {
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
 
+        if (vbr) {
+            // dynamic VBR: F16 entry tier (full quality until budget pressure), controller armed
+            // via cparams; the baked degrade order transcodes fp16->t8->... down to the floor. This
+            // mirrors the main CLI's -ctk vbr / --vbr-floor path (common_params_postprocess_vbr).
+            cparams.type_k                = GGML_TYPE_F16;
+            cparams.type_v                = GGML_TYPE_F16;
+            cparams.vbr_dynamic           = true;
+            cparams.vbr_min_bits          = vbr_min_bits;
+            cparams.vbr_vram_budget_bytes = vbr_budget_bytes;
+            cparams.vbr_budget_explicit   = vbr_budget_explicit;
+        }
+
         return cparams;
     }
 };
 
 static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_params & params) {
     std::vector<cmd_params_instance> instances;
+
+    // dynamic VBR (see -ctk vbr / --vbr-floor): resolve the floor bits and budget once for all
+    // instances. budget 0 = floor-layout-cost fallback, self-armed by the controller (no fit pass).
+    const double vbr_min_bits = params.vbr ? common_vbr_floor_bits(params.vbr_floor) : 0.0;
+    uint64_t vbr_budget_bytes     = 0;
+    bool     vbr_budget_explicit  = false;
+    if (params.vbr && params.vbr_vram != "auto" && params.vbr_vram != "dynamic" && !params.vbr_vram.empty()) {
+        vbr_budget_bytes    = (uint64_t) std::stoull(params.vbr_vram) * 1024ull * 1024ull;
+        vbr_budget_explicit = true;
+    }
 
     // this ordering minimizes the number of times that each model needs to be reloaded
     // clang-format off
@@ -1343,6 +1406,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .vbr          = */ params.vbr,
+                /* .vbr_min_bits = */ vbr_min_bits,
+                /* .vbr_budget_bytes    = */ vbr_budget_bytes,
+                /* .vbr_budget_explicit = */ vbr_budget_explicit,
             };
             instances.push_back(instance);
         }
@@ -1380,6 +1447,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .vbr          = */ params.vbr,
+                /* .vbr_min_bits = */ vbr_min_bits,
+                /* .vbr_budget_bytes    = */ vbr_budget_bytes,
+                /* .vbr_budget_explicit = */ vbr_budget_explicit,
             };
             instances.push_back(instance);
         }
@@ -1417,6 +1488,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .vbr          = */ params.vbr,
+                /* .vbr_min_bits = */ vbr_min_bits,
+                /* .vbr_budget_bytes    = */ vbr_budget_bytes,
+                /* .vbr_budget_explicit = */ vbr_budget_explicit,
             };
             instances.push_back(instance);
         }
@@ -1443,6 +1518,7 @@ struct test {
     int                      poll;
     ggml_type                type_k;
     ggml_type                type_v;
+    bool                     vbr;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
     llama_split_mode         split_mode;
@@ -1483,6 +1559,7 @@ struct test {
         poll           = inst.poll;
         type_k         = inst.type_k;
         type_v         = inst.type_v;
+        vbr            = inst.vbr;
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
         split_mode     = inst.split_mode;
@@ -1635,8 +1712,8 @@ struct test {
                                             cpu_mask,
                                             std::to_string(cpu_strict),
                                             std::to_string(poll),
-                                            ggml_type_name(type_k),
-                                            ggml_type_name(type_v),
+                                            vbr ? "vbr" : ggml_type_name(type_k),
+                                            vbr ? "vbr" : ggml_type_name(type_v),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
                                             split_mode_str(split_mode),
