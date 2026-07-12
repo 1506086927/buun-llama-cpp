@@ -528,6 +528,18 @@ static ggml_tensor * ggml_mul_mat_aux(
 // llama_kv_cache
 //
 
+// fresh cells are fully sized here, in the same initializer that decides ownership — the ctor
+// body must never resize v_cells: when the cache shares another cache's cells (mem_other,
+// [TAG_KV_CACHE_SHARE_CELLS]) the vector aliases the SOURCE cache's live stream layout
+static std::shared_ptr<llama_kv_cells_vec> kv_cells_make(uint32_t n_stream, uint32_t kv_size) {
+    auto cells = std::make_shared<llama_kv_cells_vec>();
+    cells->resize(n_stream);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        (*cells)[s].resize(kv_size);
+    }
+    return cells;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -549,7 +561,7 @@ llama_kv_cache::llama_kv_cache(
     model(model), hparams(hparams), vbr_params_(vbr), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
-    v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
+    v_cells_impl(other ? other->v_cells_impl : kv_cells_make(unified ? 1 : n_seq_max, kv_size)),
     v_cells(*v_cells_impl) {
 
     // dynamic VBR tier flips mutate tensors in place and bump only the owning cache's
@@ -626,16 +638,9 @@ llama_kv_cache::llama_kv_cache(
         v_heads[s] = 0;
     }
 
-    // shared cells ([TAG_KV_CACHE_SHARE_CELLS]) adopt the source cache's stream layout —
-    // resizing here would shrink the source's streams when the two caches disagree on n_stream
-    if (!other) {
-        v_cells.resize(n_stream);
-        for (uint32_t s = 0; s < n_stream; ++s) {
-            v_cells[s].resize(kv_size);
-        }
-    } else {
-        GGML_ASSERT(v_cells.size() >= n_stream);
-    }
+    // fresh cells were sized by kv_cells_make in the initializer; shared cells keep the
+    // source cache's layout — either way this cache's streams must fit inside the vector
+    GGML_ASSERT(v_cells.size() >= n_stream);
 
     // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
