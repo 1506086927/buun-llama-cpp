@@ -223,6 +223,13 @@ DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO2_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO3_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO1_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO2_TCQ)
+// f16<->t8 entry band: VBR enters at f16 and the FIRST band every layer crosses is f16->t8, which
+// the adjacent-tier set above skipped (it started at t8). A straddled layer there (K or V still f16)
+// otherwise falls to the materialize path — the penalty GROWS with context (-50% @ d64k measured),
+// exactly the regime the dynamic controller churns through as context grows. f16 side needs no
+// dequant and (as K) no WHT rotation, so the fused kernel is strictly cheaper than matched t8:t8.
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO8_0, GGML_TYPE_F16)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_F16,      GGML_TYPE_TURBO8_0)
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)

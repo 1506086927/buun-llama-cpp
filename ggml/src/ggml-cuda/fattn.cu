@@ -2107,7 +2107,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                (k == GGML_TYPE_TURBO3_TCQ && v == GGML_TYPE_TURBO2_TCQ) ||
                (k == GGML_TYPE_TURBO2_TCQ && v == GGML_TYPE_TURBO3_TCQ) ||
                (k == GGML_TYPE_TURBO2_TCQ && v == GGML_TYPE_TURBO1_TCQ) ||
-               (k == GGML_TYPE_TURBO1_TCQ && v == GGML_TYPE_TURBO2_TCQ);
+               (k == GGML_TYPE_TURBO1_TCQ && v == GGML_TYPE_TURBO2_TCQ) ||
+               // f16<->t8: the VBR entry band (f16 is the tier above t8). Was missing, so every
+               // f16->t8 straddle ate the materialize path (grows to -50% @ d64k). f16 side is free.
+               (k == GGML_TYPE_TURBO8_0   && v == GGML_TYPE_F16)        ||
+               (k == GGML_TYPE_F16        && v == GGML_TYPE_TURBO8_0);
     };
     const bool turbo_fused_asym = turbo_fused_asym_pair(K->type, V->type) && Q->ne[0] == 256 &&
         (t1_fused_ok || (K->type != GGML_TYPE_TURBO1_TCQ && V->type != GGML_TYPE_TURBO1_TCQ));
@@ -2153,7 +2157,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // rotated once to match. Only V is decoded to the original domain inside the loader.
         ggml_tensor Q_rot_fused;
         ggml_tensor * orig_q_fused = nullptr;
-        const bool fused_k_original_domain = false;
+        // f16 K is stored in the ORIGINAL (unrotated) domain, so Q must NOT be WHT-rotated for it
+        // (rotated-Q . unrotated-K would be wrong). Turbo K is stored rotated → rotate Q to match.
+        // Only K drives Q rotation; V is always decoded to the original domain inside the loader.
+        const bool fused_k_original_domain = (K->type == GGML_TYPE_F16);
         if (!fused_k_original_domain && Q->ne[0] % 128 == 0) {
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
             if (q_size > q_rot_buf_size[device]) {
@@ -2201,6 +2208,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         else TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO3_TCQ)
         else TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO1_TCQ)
         else TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO2_TCQ)
+        else TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_TURBO8_0,   GGML_TYPE_F16)
+        else TURBO_FUSED_DISPATCH_ASYM(GGML_TYPE_F16,        GGML_TYPE_TURBO8_0)
 #undef TURBO_FUSED_DISPATCH_ASYM
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
         else TURBO_FUSED_DISPATCH(GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
