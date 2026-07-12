@@ -852,6 +852,10 @@ std::string common_params_get_system_info(const common_params & params);
 // bad input. Single source of truth for the floor→bits mapping, shared by the main CLI and llama-bench.
 double common_vbr_floor_bits(const std::string & floor);
 
+// Resolve a VBR VRAM budget spec ("auto"/"none" or a size with optional K/M/G[i]B suffix) to bytes
+// (0 == auto). Throws std::invalid_argument on bad input. Shared with the main CLI's parser.
+uint64_t common_vbr_vram_bytes(const std::string & vram);
+
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);
 void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_params * role_model = nullptr);

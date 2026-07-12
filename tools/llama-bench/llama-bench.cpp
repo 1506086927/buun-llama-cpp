@@ -457,7 +457,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ctv, --cache-type-v <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  --vbr-floor <t8|t4|t3tcq|t2tcq|t1tcq|auto>  arm dynamic VBR (F16 entry, both sides), aggregate floor tier\n");
     printf("                                              (also enabled by -ctk vbr / -ctv vbr; default floor: bottom tier)\n");
-    printf("  --vbr-vram <auto|MiB>                       VBR KV VRAM budget (default: auto = floor-layout-cost fallback)\n");
+    printf("  --vbr-vram <auto|SIZE[K|M|G]>                VBR KV VRAM budget (default: auto = floor-layout-cost fallback)\n");
     printf("  -t, --threads <n>                           (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                    (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
     printf("  --cpu-strict <0|1>                          (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
@@ -1337,13 +1337,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
 
     // dynamic VBR (see -ctk vbr / --vbr-floor): resolve the floor bits and budget once for all
     // instances. budget 0 = floor-layout-cost fallback, self-armed by the controller (no fit pass).
-    const double vbr_min_bits = params.vbr ? common_vbr_floor_bits(params.vbr_floor) : 0.0;
-    uint64_t vbr_budget_bytes     = 0;
-    bool     vbr_budget_explicit  = false;
-    if (params.vbr && params.vbr_vram != "auto" && params.vbr_vram != "dynamic" && !params.vbr_vram.empty()) {
-        vbr_budget_bytes    = (uint64_t) std::stoull(params.vbr_vram) * 1024ull * 1024ull;
-        vbr_budget_explicit = true;
-    }
+    const double   vbr_min_bits       = params.vbr ? common_vbr_floor_bits(params.vbr_floor) : 0.0;
+    // canonical parser (shared with the CLI): "auto" -> 0, size specs -> bytes; explicit == a real cap.
+    const uint64_t vbr_budget_bytes    = params.vbr ? common_vbr_vram_bytes(params.vbr_vram) : 0;
+    const bool     vbr_budget_explicit = vbr_budget_bytes != 0;
 
     // this ordering minimizes the number of times that each model needs to be reloaded
     // clang-format off

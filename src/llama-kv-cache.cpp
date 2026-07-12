@@ -1748,6 +1748,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                            vbr_quiet_boundaries_ >= VBR_STABLE_QUICK &&
                            std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA);
 
+        // predicted watermark for THIS boundary; both paths eagerly map to it once, after the if/else.
+        uint32_t wm_next = 0;
         if (!vbr_stable) {
             // auto budgets track reality: throttle re-derive from live free VRAM — during steady
             // decode occupancy barely changes, so querying every token is waste. Fire on the first
@@ -1772,7 +1774,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             if (vbr_degrade_cursor_ > 0 && used_now == 0) {
                 vbr_full_reset();
             }
-            const uint32_t wm_next = vbr_watermark_cells(n_tokens);
+            wm_next = vbr_watermark_cells(n_tokens);
             vbr_shrink_watermark(); // occupancy drops release phantom tail pages first
             static const bool vbr_promote_on = [] {
                 const char * e = getenv("VBR_PROMOTE"); // kill switch for experiments; default ON
@@ -1825,31 +1827,24 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                     p.wave_pending = false;
                 }
             }
-            // Eager physical backing to the predicted watermark: map failures surface HERE, where no
-            // graphs exist and init_batch can fail RECOVERABLY (llama_decode returns an error; the
-            // server's decode-failure ladder — idle purge, batch halving — finally works under VBR
-            // instead of a process abort killing every client). Runs after the fence arm so an
-            // already-queued transcode wave stays fenced for the NEXT batch's graph either way.
-            // apply_ubatch's ensure_mapped remains as the mid-batch backstop for placements past
-            // the prediction.
-            if (!vbr_vmm_try_map(wm_next)) {
-                LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) — "
-                        "failing this batch recoverably\n", __func__, wm_next);
-                return {};
-            }
         } else {
-            // Fast path: settled — skip the budget/degrade bookkeeping, but STILL eagerly map to the
-            // predicted watermark. try_map is a no-op when the watermark hasn't grown (wm <= wm_cells),
-            // so this is nearly free; when occupancy creeps up under the stable threshold it keeps a
-            // map failure RECOVERABLE here instead of a mid-batch GGML_ABORT in ensure_mapped that
-            // would kill every client.
-            const uint32_t wm_next = vbr_watermark_cells(n_tokens);
-            if (!vbr_vmm_try_map(wm_next)) {
-                LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) — "
-                        "failing this batch recoverably\n", __func__, wm_next);
-                return {};
-            }
+            // Fast path: settled — skip the budget/degrade bookkeeping. wm_next stays the current
+            // watermark; the shared eager map below still covers occupancy that creeps up under the
+            // stable threshold.
+            wm_next = vbr_watermark_cells(n_tokens);
             vbr_quiet_boundaries_++;
+        }
+        // Eager physical backing to the predicted watermark, for BOTH paths: map failures surface HERE,
+        // where no graphs exist and init_batch fails RECOVERABLY (llama_decode returns an error; the
+        // server's decode-failure ladder — idle purge, batch halving — works under VBR instead of a
+        // process abort killing every client). try_map is a no-op when the watermark hasn't grown
+        // (wm <= wm_cells). Runs after the non-stable path's fence arm so an already-queued transcode
+        // wave stays fenced for the NEXT batch's graph. apply_ubatch's ensure_mapped is the mid-batch
+        // backstop for placements past the prediction.
+        if (!vbr_vmm_try_map(wm_next)) {
+            LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) — "
+                    "failing this batch recoverably\n", __func__, wm_next);
+            return {};
         }
         // free-running boundary counter: drives the auto-budget re-derive throttle above and the
         // first-boundary skip inside vbr_rederive_budget(). Advances every boundary regardless of

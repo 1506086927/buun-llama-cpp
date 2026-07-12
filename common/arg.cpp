@@ -534,6 +534,18 @@ static bool common_vbr_parse_vram_budget(const std::string & raw, std::string & 
     return true;
 }
 
+// public wrapper (declared in common.h): VRAM budget spec -> bytes (0 == auto), throwing on bad input.
+// Reuses the canonical parser so llama-bench's --vbr-vram agrees with the main CLI (K/M/G[i]B suffixes,
+// finiteness/overflow validation) instead of re-rolling a bare-MiB parse that would silently diverge.
+uint64_t common_vbr_vram_bytes(const std::string & vram) {
+    std::string name;
+    uint64_t bytes = 0;
+    if (!common_vbr_parse_vram_budget(vram, name, bytes)) {
+        throw std::invalid_argument("unsupported VBR VRAM budget: " + vram);
+    }
+    return bytes;
+}
+
 static void common_setenv_override(const char * name, const std::string & value) {
 #if defined(_WIN32)
     _putenv_s(name, value.c_str());
