@@ -180,7 +180,10 @@ static __global__ void argmax_f32(
 
 // Top-K kernel: each block handles one row, outputs K best tokens + log-probs.
 // Uses a register-based min-heap per thread, then merges via shared memory.
-// K is a runtime parameter but must be <= 32.
+// K is a runtime parameter; MAXK is the compiled heap capacity. K <= MAXK is
+// asserted at the launch site — ggml_topk_ext() admits K up to 64, so both a
+// 32 and a 64 instance are dispatched (keeps the common K<=32 stack frame small).
+template <int MAXK>
 static __global__ void topk_f32(
         const float * __restrict__ x,
         int32_t * __restrict__ dst,
@@ -196,9 +199,8 @@ static __global__ void topk_f32(
     const bool use_gumbel = (seed != 0);
 
     // Per-thread top-K heap (min-heap: smallest score at index 0)
-    // Max K=32, stored in registers
-    float  heap_val[32];
-    int32_t heap_idx[32];
+    float  heap_val[MAXK];
+    int32_t heap_idx[MAXK];
     for (int i = 0; i < K; i++) {
         heap_val[i] = -FLT_MAX;
         heap_idx[i] = -1;
@@ -434,9 +436,16 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (K == 1) {
         argmax_f32<<<blocks_num, blocks_dim, 0, stream>>>(src0_d, dst_d, ne00, nrows, inv_temp, seed, output_logprob);
     } else {
+        // ggml_topk_ext() admits K in [1, 64]; the heap capacity is a template
+        // parameter, so an out-of-range K here is a build-graph/kernel mismatch.
+        GGML_ASSERT(K <= 64);
         // Shared memory: K * n_warps floats + K * n_warps ints + 2 * n_warps floats (softmax)
         const int n_warps = (int)(num_threads / WARP_SIZE);
         const size_t smem_size = K * n_warps * (sizeof(float) + sizeof(int32_t)) + 2 * n_warps * sizeof(float);
-        topk_f32<<<blocks_num, blocks_dim, smem_size, stream>>>(src0_d, dst_d, ne00, nrows, K, inv_temp, seed, output_logprob);
+        if (K <= 32) {
+            topk_f32<32><<<blocks_num, blocks_dim, smem_size, stream>>>(src0_d, dst_d, ne00, nrows, K, inv_temp, seed, output_logprob);
+        } else {
+            topk_f32<64><<<blocks_num, blocks_dim, smem_size, stream>>>(src0_d, dst_d, ne00, nrows, K, inv_temp, seed, output_logprob);
+        }
     }
 }
