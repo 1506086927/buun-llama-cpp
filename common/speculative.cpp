@@ -964,15 +964,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         n_embd_dec    = llama_model_n_embd(model_dft);
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
 
-        // read the trained block size from the dflash.block_size metadata key
+        // read the trained block size — fork drafter archs load it into hparams from
+        // the arch-prefixed %s.dflash.block_size key (the bare-key metadata lookup
+        // below misses those and silently keeps the default)
         block_size = 16;
-        {
+        if (int32_t bs = llama_model_dflash_block_size(model_dft); bs > 0) {
+            block_size = bs;
+        } else {
             char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
                 block_size = std::atoi(buf);
             }
         }
+        // fork drafters carry the mask token in %s.dflash.mask_token_id (hparams),
+        // not as a tokenizer-level mask token — a -1 here poisons every draft batch
+        // (llama_decode rejects the invalid token, so drafting silently never works)
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+        if (mask_token_id < 0) {
+            mask_token_id = (llama_token) llama_model_dflash_mask_token_id(model_dft);
+        }
 
         LOG_INF("%s: adding speculative implementation 'draft-dflash'\n", __func__);
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
