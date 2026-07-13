@@ -247,6 +247,24 @@ static __global__ void topk_f32(
         }
     }
 
+    // Warp reduction for online softmax (merge logit_max and sum_exp), same as
+    // argmax_f32. Must happen for every warp BEFORE the cross-warp merge: the
+    // warp leaders below publish their accumulators to shared memory, so those
+    // must already cover the whole warp, not just lane 0's column stripe.
+    if (output_logprob) {
+#pragma unroll
+        for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+            float other_max = __shfl_xor_sync(0xFFFFFFFFULL, logit_max, offset, WARP_SIZE);
+            float other_sum = __shfl_xor_sync(0xFFFFFFFFULL, sum_exp, offset, WARP_SIZE);
+            if (other_max > logit_max) {
+                sum_exp = sum_exp * expf(logit_max - other_max) + other_sum;
+                logit_max = other_max;
+            } else {
+                sum_exp = sum_exp + other_sum * expf(other_max - logit_max);
+            }
+        }
+    }
+
     // Cross-thread merge via shared memory
     // Strategy: iterative pairwise merge within warp, then across warps
     const int n_warps = blockDim.x / WARP_SIZE;
@@ -341,21 +359,8 @@ static __global__ void topk_f32(
                 }
             }
         }
-    } else {
-        // Single warp: reduce softmax within warp
-        if (output_logprob) {
-            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-                float other_max = __shfl_xor_sync(0xFFFFFFFFULL, logit_max, offset, WARP_SIZE);
-                float other_sum = __shfl_xor_sync(0xFFFFFFFFULL, sum_exp, offset, WARP_SIZE);
-                if (other_max > logit_max) {
-                    sum_exp = sum_exp * expf(logit_max - other_max) + other_sum;
-                    logit_max = other_max;
-                } else {
-                    sum_exp = sum_exp + other_sum * expf(other_max - logit_max);
-                }
-            }
-        }
     }
+    // (single-warp softmax reduction is covered by the unified warp reduction above)
 
     // Output: sort heap descending and write
     if ((n_warps == 1 && lane_id == 0) || (n_warps > 1 && warp_id == 0 && lane_id == 0)) {
