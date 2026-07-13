@@ -895,9 +895,16 @@ llama_kv_cache::llama_kv_cache(
     auto try_vmm_alloc = [&](ggml_context * c, ggml_backend_buffer_type_t bft) -> ggml_backend_buffer_t {
         const ggml_vbr_backend_iface * be = llama_vbr_backend_iface_for_buft(bft);
         if (be == nullptr) {
-            LLAMA_LOG_WARN("%s: VBR_VMM requested but the KV buffer type (%s) has no turbo/VBR backend support "
-                    "— falling back to static allocation\n", __func__, ggml_backend_buft_name(bft));
-            return nullptr;
+            // Falling back silently would be a trap: the fit pass priced this KV at the floor
+            // tier (1.25 bits/value) but a static fallback stays at the f16 entry tier — 12.8x
+            // the budgeted VRAM with no degrade possible, an OOM at depth on any fitted config.
+            // The meta (tensor-parallel) backend is the known case: it exports no VBR interface.
+            throw std::runtime_error(format(
+                    "dynamic VBR (-ctk vbr) requires per-device KV buffers with turbo/VBR backend "
+                    "support, but the KV buffer type is %s. Tensor-parallel KV (--split-mode "
+                    "tensor/row) is not supported with dynamic VBR — use the default layer split "
+                    "(-sm layer, one VBR pool per device) or a static KV type (f16/q8_0/turbo).",
+                    ggml_backend_buft_name(bft)));
         }
         int device = -1;
         for (int i = 0; i < be->get_device_count(); ++i) {
