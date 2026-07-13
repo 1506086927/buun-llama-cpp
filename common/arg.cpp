@@ -5131,7 +5131,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.speculative.types = { COMMON_SPECULATIVE_TYPE_DFLASH };
             params.speculative.p_min = 0.0f;
-            params.speculative.n_max = 7;
+            // n_max=12: EXP-37 re-tune (2026-07-13, Qwen3.6-27B-Q4_K_M + dflash-draft-3.6-q8_0,
+            // RTX 3090, code prompts): n_max=7 -> ~66 t/s, 12 -> 110-120 t/s, 15 -> 116-121 t/s
+            // (workload-dependent past 12). 12 is the robust middle; 7 left ~2x on the table.
+            params.speculative.n_max = 12;
             params.speculative.n_min = 0;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SPECULATIVE}));
