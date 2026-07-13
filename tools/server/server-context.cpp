@@ -1244,9 +1244,11 @@ private:
             return;
         }
 
-        // DFlash np=1: backup is 1 cell (~1.5 MB). The shrink/expand cycle costs ~27ms
-        // of CUDA graph re-capture per request, far outweighing the memory savings.
-        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH && n_parallel_user <= 2) {
+        // DFlash: backup cells are ~1.5 MB each, but the shrink/expand cycle costs
+        // ~100 ms of buffer realloc + CUDA-graph re-capture at the first draft of EVERY
+        // request (measured on a 3090: -np 4 lost ~12% end-to-end on a 101-token reply).
+        // The memory savings never outweigh that — keep the backup cells resident.
+        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
             return;
         }
 
@@ -1903,6 +1905,21 @@ private:
         // (run for slot 0 above) has created dflash_capture on the target context.
         if (dflash_slots_cap > 0) {
             llama_dflash_allocate_slots(ctx_tgt, dflash_slots_cap);
+        }
+
+        // DFlash + hybrid target: expand the recurrent state to its full backup-cell count
+        // NOW instead of at the first draft — the expand costs ~100 ms of buffer realloc +
+        // CUDA-graph re-capture, which otherwise lands on the first request's latency.
+        // (recurrent_shrink_for_prefill never shrinks DFlash, so this is a one-time cost.)
+        if (needs_reeval && can_spec &&
+            params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+            ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+            n_seq_max_full > n_parallel_user && !recurrent_expanded) {
+            auto * mem = llama_get_memory(ctx_tgt);
+            if (llama_memory_recurrent_expand(mem, n_seq_max_full)) {
+                recurrent_expanded = true;
+                SRV_INF("pre-expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
+            }
         }
 
         {
