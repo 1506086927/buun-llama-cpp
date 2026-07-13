@@ -168,8 +168,11 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
-    // monotone counter of in-place VBR tier flips — graph reuse fences on it
-    uint64_t vbr_tier_epoch() const { return vbr_tier_epoch_; }
+    // monotone counter of in-place VBR tier flips — graph reuse fences on it.
+    // A share-linked cache (mem_other) views the owner's tensors, so its graphs must
+    // fence on the OWNER's flips: delegate to the source cache (shared-KV drafters,
+    // e.g. the gemma4 MTP assistant, follow the target's VBR tier changes this way).
+    uint64_t vbr_tier_epoch() const { return other ? other->vbr_tier_epoch() : vbr_tier_epoch_; }
 
     // effective bits/value of this cache at the CURRENT tensor types (llama_memory_i)
     double kv_bpv() const override;

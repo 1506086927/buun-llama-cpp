@@ -237,6 +237,23 @@ llama_context::llama_context(
     cparams.vbr_growth_headroom_bytes = params.vbr_growth_headroom_bytes;
     cparams.vbr_budget_explicit = params.vbr_budget_explicit;
 
+    // A shared-KV drafter (gemma4 assistant / weightless DFlash/Eagle3) views the target's
+    // KV tensors — the target's VBR controller owns those, and the drafter's graphs follow
+    // the owner's tier flips via the delegated tier epoch (llama_kv_cache::vbr_tier_epoch).
+    // Running a second controller in the drafter would double-manage the same pool (and the
+    // kv-cache ctor rejects an armed VBR on a share-linked cache), so disarm it here.
+    if (cparams.ctx_other != nullptr &&
+            (cparams.vbr_dynamic || cparams.vbr_vram_budget_bytes > 0 || cparams.vbr_min_bits > 0.0)) {
+        LLAMA_LOG_INFO("%s: shared-KV drafter: VBR is managed by the target context — "
+                "disarming the drafter's own VBR controller (shared layers follow the "
+                "target's tier flips; the drafter's own layers stay at their static types)\n", __func__);
+        cparams.vbr_dynamic              = false;
+        cparams.vbr_min_bits             = 0.0;
+        cparams.vbr_vram_budget_bytes    = 0;
+        cparams.vbr_growth_headroom_bytes = 0;
+        cparams.vbr_budget_explicit      = false;
+    }
+
     // Dynamic VBR requires single-stream KV (the VMM pool + degrade controller are gated on
     // n_stream == 1). Force unified KV here — at context init, AFTER tools have applied their
     // post-parse n_parallel/n_seq_max mutations (perplexity, imatrix, batched-bench) — so the

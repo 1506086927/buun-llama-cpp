@@ -564,12 +564,17 @@ llama_kv_cache::llama_kv_cache(
     v_cells_impl(other ? other->v_cells_impl : kv_cells_make(unified ? 1 : n_seq_max, kv_size)),
     v_cells(*v_cells_impl) {
 
-    // dynamic VBR tier flips mutate tensors in place and bump only the owning cache's
-    // vbr_tier_epoch_ — a share-linked cache would keep reusing a stale-typed graph and
-    // the shared v_cells occupancy would confuse the watermark logic. Reject the combination
-    // until epoch propagation across share-linked caches is designed.
+    // A share-linked cache follows the OWNER's dynamic VBR: tier flips mutate the owner's
+    // tensors in place (which this cache's layer entries alias) and graph reuse fences on
+    // the delegated vbr_tier_epoch() (see llama-kv-cache.h). What a share-linked cache must
+    // NOT do is arm its own controller on top — two controllers would double-manage the
+    // same pool and the shared v_cells occupancy would confuse the second watermark.
+    // llama_context disarms drafter-side VBR at creation (ctx_other), so hitting this is an
+    // internal-API misuse, not a user configuration.
     if ((other || share) && (vbr_params_.dynamic || vbr_params_.budget_bytes)) {
-        throw std::runtime_error("dynamic VBR is not supported on a KV cache that shares layers with another cache (mem_other/share)");
+        throw std::runtime_error("internal: a share-linked KV cache (mem_other/share) must not arm "
+                "its own VBR controller — the owning cache's controller manages the shared tensors "
+                "(drafter contexts are disarmed automatically at context creation)");
     }
 
     // shared cells view the source cache's K/V tensors, so the cell count
