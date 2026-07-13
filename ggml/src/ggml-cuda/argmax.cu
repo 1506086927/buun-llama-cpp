@@ -278,12 +278,23 @@ static __global__ void topk_f32(
     float  * s_logit_max = (float *)(smem + 2 * K * n_warps * sizeof(float));
     float  * s_sum_exp   = s_logit_max + n_warps;
 
-    // Intra-warp merge: pair-reduce within warp using shuffle
-    // Each step: lane gets partner's min element, if it beats our min, replace and re-heapify
+    // Intra-warp merge: pair-reduce within warp using shuffle.
+    // The exchange must shuffle from a SNAPSHOT of the heap taken before the
+    // step: both lanes of a pair mutate their heaps while inserting, so
+    // shuffling the live heap sends a mid-merge mixture (elements bounce back,
+    // duplicate, and drop — wrong tail-of-top-K for K >= 8). With the snapshot
+    // both lanes merge each other's original sets and converge to the same
+    // top-K of the union, which keeps the butterfly reduction correct.
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        float   snap_val[MAXK];
+        int32_t snap_idx[MAXK];
         for (int i = 0; i < K; i++) {
-            float partner_val = __shfl_xor_sync(0xFFFFFFFFULL, heap_val[i], offset);
-            int partner_idx = __shfl_xor_sync(0xFFFFFFFFULL, heap_idx[i], offset);
+            snap_val[i] = heap_val[i];
+            snap_idx[i] = heap_idx[i];
+        }
+        for (int i = 0; i < K; i++) {
+            float partner_val = __shfl_xor_sync(0xFFFFFFFFULL, snap_val[i], offset);
+            int partner_idx = __shfl_xor_sync(0xFFFFFFFFULL, snap_idx[i], offset);
             if (partner_val > heap_val[0]) {
                 heap_val[0] = partner_val;
                 heap_idx[0] = partner_idx;
