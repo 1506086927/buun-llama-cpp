@@ -125,6 +125,19 @@ extern "C" void dflash_cross_ring_gpu_write(
     if (layer < 0 || layer >= ring->n_layers) return;
     if (n_tokens <= 0) return;
 
+    // The GPU ring holds only ring_size tokens (the cross-attention window). A prefill
+    // decode chunk can hand us far more (e.g. a >512-token -b batch), and only the last
+    // ring_size of them can survive in the ring. Writing the whole run overflows the
+    // destination allocation — cudaMemcpyAsync then fails with "invalid argument", and
+    // because that error is latched it surfaces later at an unrelated CUDA_CHECK. Keep
+    // only the most recent ring_size tokens, advancing ring_pos past the dropped ones.
+    if (n_tokens > ring->ring_size) {
+        const int skip = n_tokens - ring->ring_size;
+        host_data += (size_t)skip * n_embd;
+        ring_pos  += skip;
+        n_tokens   = ring->ring_size;
+    }
+
     // Ensure cudaStreamPerThread belongs to the ring's device regardless of
     // which GPU the caller (target model decode) last set as current.
     (void)cudaSetDevice(ring->device);
