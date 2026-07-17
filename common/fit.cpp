@@ -1133,7 +1133,7 @@ enum common_params_fit_status common_fit_params(
         // entry). A PINNED side (explicit q8_0/bf16 in a mixed config) keeps its real cost —
         // pricing it at the floor tier would over-advertise capacity for that half.
         auto movable = [](ggml_type t) {
-            return t == GGML_TYPE_F16 || ggml_is_turbo_kv_type(t);
+            return t == GGML_TYPE_F16 ;
         };
         if (movable(cparams->type_k)) {
             cparams->type_k = price_t;
@@ -1171,7 +1171,18 @@ enum common_params_fit_status common_fit_params(
         const ggml_type price_t  = common_vbr_floor_price_tier(cparams->vbr_min_bits);
         const double price_bpv = 8.0 * ggml_type_size(price_t) / ggml_blck_size(price_t);
         if (floor_bpv > price_bpv + 1e-9) {
-            uint32_t adjusted = (uint32_t) ((double) cparams->n_ctx * (price_bpv / floor_bpv));
+            // Only VBR-dynamic sides were priced at price_t (via movable()). Pinned
+            // sides kept their real cost. Compute the correct per-token KV ratio.
+            // movable() = (t == GGML_TYPE_F16) but that lambda isn't in scope here
+            auto is_vbr = [](ggml_type t) { return t == GGML_TYPE_F16; };
+            auto type_bpv = [](ggml_type t) { return 8.0 * ggml_type_size(t) / ggml_blck_size(t); };
+            double k_cost = is_vbr(type_k_entry) ? price_bpv : type_bpv(type_k_entry);
+            double v_cost = is_vbr(type_v_entry) ? price_bpv : type_bpv(type_v_entry);
+            double kv_at_price = k_cost + v_cost;
+            k_cost = is_vbr(type_k_entry) ? floor_bpv : type_bpv(type_k_entry);
+            v_cost = is_vbr(type_v_entry) ? floor_bpv : type_bpv(type_v_entry);
+            double kv_at_floor = k_cost + v_cost;
+            uint32_t adjusted = (uint32_t) ((double) cparams->n_ctx * (kv_at_price / kv_at_floor));
             adjusted = std::max<uint32_t>(256, adjusted - adjusted % 256);
             LOG_INF("%s: VBR dynamic: advertised n_ctx %" PRIu32 " -> %" PRIu32 " (literal floor %.4g "
                     "bits/value costs more than the %s pricing tier)\n",
