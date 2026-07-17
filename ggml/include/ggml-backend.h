@@ -402,8 +402,11 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
-    // meta buffer type / buffer / tensor introspection, for consumers that manage per-device memory
-    // behind a meta buffer (e.g. the VBR KV cache's per-device VMM pools):
+    // meta device / buffer type / buffer / tensor introspection, for consumers that manage per-device
+    // memory behind a meta buffer (e.g. the VBR KV cache's per-device VMM pools):
+    GGML_API bool                       ggml_backend_dev_is_meta           (ggml_backend_dev_t dev);
+    GGML_API size_t                     ggml_backend_meta_dev_n_devs       (ggml_backend_dev_t meta_dev);
+    GGML_API ggml_backend_dev_t         ggml_backend_meta_dev_simple_dev   (ggml_backend_dev_t meta_dev, size_t index);
     GGML_API bool                       ggml_backend_buft_is_meta          (ggml_backend_buffer_type_t buft);
     GGML_API bool                       ggml_backend_buffer_is_meta        (ggml_backend_buffer_t buf);
     GGML_API size_t                     ggml_backend_meta_buft_n_bufts     (ggml_backend_buffer_type_t meta_buft);

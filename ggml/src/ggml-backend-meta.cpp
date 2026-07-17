@@ -82,8 +82,6 @@ struct ggml_backend_meta_device_context {
     }
 };
 
-static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
-
 static const char * ggml_backend_meta_device_get_name(ggml_backend_dev_t dev) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
@@ -193,17 +191,17 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .event_synchronize    = */ nullptr,
 };
 
-static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
+bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
     return dev != nullptr && dev->iface.get_name == ggml_backend_meta_device_iface.get_name;
 }
 
-static size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev) {
+size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev) {
     GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
     return meta_dev_ctx->simple_devs.size();
 }
 
-static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index) {
+ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index) {
     GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
     GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
@@ -1607,7 +1605,12 @@ ggml_backend_buffer_t ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(
                     t->buffer = meta_buf_ctx->bufs[i].get();
                 }
             }
-            GGML_ASSERT(meta_buf_ctx->bufs[i]);
+            if (!meta_buf_ctx->bufs[i]) {
+                // simple-buffer allocation failed (e.g. device OOM) — fail like the non-meta
+                // allocator does so the caller can surface a load error instead of crashing
+                ggml_backend_buffer_free(meta_buf);
+                return nullptr;
+            }
         }
         meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
     }

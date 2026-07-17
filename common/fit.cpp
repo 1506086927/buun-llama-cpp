@@ -122,6 +122,23 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         size_t total;
         ggml_backend_dev_memory(dev, &free, &total);
 
+        // SPLIT_MODE_TENSOR: the meta device reports the SUM of its simple devices' memory, but
+        // the per-layer shard rotation spreads bytes evenly across them, so the aggregate is only
+        // usable up to n_devs x the tightest device (a co-tenant on one GPU binds all of them)
+        if (ggml_backend_dev_is_meta(dev)) {
+            const size_t n_simple = ggml_backend_meta_dev_n_devs(dev);
+            size_t min_free  = free;
+            size_t min_total = total;
+            for (size_t j = 0; j < n_simple; j++) {
+                size_t free_j, total_j;
+                ggml_backend_dev_memory(ggml_backend_meta_dev_simple_dev(dev, j), &free_j, &total_j);
+                min_free  = std::min(min_free,  free_j);
+                min_total = std::min(min_total, total_j);
+            }
+            free  = std::min(free,  n_simple * min_free);
+            total = std::min(total, n_simple * min_total);
+        }
+
         // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
         // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
         // not assign anything to a device with an unknown memory budget.
@@ -184,9 +201,10 @@ static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level) {
-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
-    }
+    // SPLIT_MODE_TENSOR runs through the single-device paths below: the model exposes exactly one
+    // meta device whose memory report is the balanced-equivalent aggregate of the real GPUs (see
+    // common_get_device_memory_data_impl) and whose margin is the sum of the per-device targets.
+    // Only the step-3+ layer redistribution is unavailable (guarded before step 3).
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
     const llama_model_params default_mparams = llama_model_default_params();
@@ -209,6 +227,20 @@ static void common_params_fit_impl(
     } else {
         for (size_t id = 0; id < nd; id++) {
             margins.push_back(margins_s[id]);
+        }
+    }
+
+    // SPLIT_MODE_TENSOR: the single meta device carries the SUM of the per-real-device margins,
+    // while the headroom handed to the VBR runtime stays a single-device figure — the controller
+    // applies it to each device's own free memory
+    int64_t margin_per_dev = margins[0];
+    if (nd == 1 && ggml_backend_dev_is_meta(devs[0])) {
+        const size_t n_simple = ggml_backend_meta_dev_n_devs(devs[0]);
+        margins[0]     = 0;
+        margin_per_dev = 0;
+        for (size_t j = 0; j < n_simple; j++) {
+            margins[0]    += margins_s[j];
+            margin_per_dev = std::max<int64_t>(margin_per_dev, margins_s[j]);
         }
     }
 
@@ -360,7 +392,7 @@ static void common_params_fit_impl(
         // plus the fit target as the runtime's growth headroom: startup arming and runtime
         // re-derivation then encode the SAME worst case, and raising -fitt hardens both
         cparams->vbr_vram_budget_bytes = budget;
-        cparams->vbr_growth_headroom_bytes = (uint64_t) margins[0];
+        cparams->vbr_growth_headroom_bytes = (uint64_t) margin_per_dev;
         LOG_INF("%s: VBR dynamic: KV VRAM budget %" PRIu64 " MiB (%s) — decode-time degrade controller armed\n",
                 __func__, std::max<uint64_t>(1, budget / MiB),
                 vbr_budget_explicit != 0 ? "explicit" : "auto, from remaining memory");
@@ -674,6 +706,12 @@ static void common_params_fit_impl(
         throw common_params_fit_exception("was unable to fit model into system memory by reducing context, abort");
     }
 
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        // every layer is sharded across every device — there is no layer redistribution or CPU
+        // overflow to fall back on, and tensor_split already belongs to the user
+        throw common_params_fit_exception("model does not fit at the minimum context size and layer "
+            "redistribution is not available under SPLIT_MODE_TENSOR, abort");
+    }
     if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
         throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
     }
@@ -1116,18 +1154,6 @@ enum common_params_fit_status common_fit_params(
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
-
-    // SPLIT_MODE_TENSOR: the fit pass is not implemented (per-device attribution runs through
-    // the meta backend). For dynamic VBR that is fine — the KV cache derives its auto budget at
-    // init from live per-device free memory and re-derives it every boundary — so skip the fit
-    // QUIETLY instead of surfacing a failure the user cannot act on. Non-VBR fits still take the
-    // failure path below (their n_gpu_layers/n_ctx fitting genuinely cannot run).
-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR && cparams->vbr_dynamic) {
-        LOG_INF("%s: SPLIT_MODE_TENSOR: params fit skipped — the VBR KV budget is derived at init "
-                "from live per-device free memory (set --vbr-vram for an explicit budget; pass -c "
-                "to size the context)\n", __func__);
-        return COMMON_PARAMS_FIT_STATUS_FAILURE;
-    }
 
     // Dynamic VBR: price the KV at the degrade FLOOR for the whole fit, not at the turbo8 entry
     // tier. The runtime controller caps mapped-physical KV at the budget and the layout sits at
