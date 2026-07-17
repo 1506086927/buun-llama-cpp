@@ -3541,6 +3541,129 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
             ggml_backend_buffer_free(sepbuf); ggml_free(wc); if (wbuf) ggml_backend_buffer_free(wbuf);
         }
 
+        // C) PROMOTE (grow, in-place DESCENDING tiles): the degrade cases above never exercise
+        //    rB > rA. Degrade the synthetic t8 to t1_tcq (validated direction), then walk the
+        //    promote ladder t1 -> t2 -> t3 -> t4 — every hop run twice, separate-dst vs in-place,
+        //    which must produce IDENTICAL bytes. K and V variants: separate codebooks, and the V
+        //    dequant carries the decode-alpha epilogue. Each hop's in-place result feeds the next,
+        //    so later hops double as the multi-hop chain from the live promote-burst repro.
+        for (int ivar = 0; ivar < 2; ++ivar) {
+            const char * nm = ivar ? "cache_v_l3" : "cache_k_l3";
+            const ggml_type ladder[4] = { GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO2_TCQ,
+                                          GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO4_0 };
+            const size_t r_max = ggml_row_size(ladder[3], ne0);
+
+            // t8 source re-encoded under this variant's codebook name
+            ggml_init_params ips = { 8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+            ggml_context * sc = ggml_init(ips);
+            ggml_tensor * s_f32 = ggml_new_tensor_2d(sc, GGML_TYPE_F32, ne0, N);
+            ggml_tensor * s_idx = ggml_new_tensor_1d(sc, GGML_TYPE_I32, N);
+            ggml_tensor * s_t8  = ggml_new_tensor_2d(sc, t8, ne0, N);
+            ggml_set_name(s_t8, nm);
+            ggml_backend_buffer_t sbuf = ggml_backend_alloc_ctx_tensors(sc, bk);
+            ggml_backend_tensor_set(s_f32, hp.data(), 0, ggml_nbytes(s_f32));
+            ggml_backend_tensor_set(s_idx, hi.data(), 0, ggml_nbytes(s_idx));
+            ggml_tensor * s_enc = ggml_set_rows(sc, s_t8, s_f32, s_idx);
+            ggml_cgraph * sg = ggml_new_graph(sc);
+            ggml_build_forward_expand(sg, s_enc);
+            ggml_backend_graph_compute(bk, sg);
+            ggml_backend_synchronize(bk);
+
+            // slab plays the VMM slot: sized for the largest tier so in-place grows stay in bounds
+            ggml_backend_buffer_t slabbuf = ggml_backend_buft_alloc_buffer(
+                    ggml_backend_get_default_buffer_type(bk), r_max * (size_t) N);
+            void * slab = ggml_backend_buffer_get_base(slabbuf);
+            const ggml_vbr_transcode_params tp_dn = {
+                s_t8, ladder[0], slab, slabbuf, N, /*is_v=*/ivar != 0, nullptr, 0, /*scrub_bytes=*/0,
+            };
+            be->kv_transcode(bk, &tp_dn);
+            ggml_backend_synchronize(bk);
+
+            // header contexts: transcode reads type/ne[0]/nb[1]/data/name of src only
+            ggml_init_params iph = { 32*ggml_tensor_overhead(), nullptr, true };
+            ggml_context * hc = ggml_init(iph);
+            auto alias = [&](ggml_type tt) {
+                ggml_tensor * x = ggml_new_tensor_2d(hc, tt, ne0, N);
+                x->data = slab; x->buffer = slabbuf;
+                ggml_set_name(x, nm);
+                return x;
+            };
+            for (int h = 0; h + 1 < 4; ++h) {
+                const ggml_type tto  = ladder[h + 1];
+                const size_t bytesTo = ggml_row_size(tto, ne0) * (size_t) N;
+
+                ggml_backend_buffer_t hsep = ggml_backend_buft_alloc_buffer(
+                        ggml_backend_get_default_buffer_type(bk), bytesTo);
+                const ggml_vbr_transcode_params tp_hs = {
+                    alias(ladder[h]), tto, ggml_backend_buffer_get_base(hsep), hsep,
+                    N, /*is_v=*/ivar != 0, nullptr, 0, /*scrub_bytes=*/0,
+                };
+                be->kv_transcode(bk, &tp_hs);
+                ggml_backend_synchronize(bk);
+
+                const ggml_vbr_transcode_params tp_hi = {
+                    alias(ladder[h]), tto, slab, slabbuf,   // dst == src->data -> reverse tiles
+                    N, /*is_v=*/ivar != 0, nullptr, 0, /*scrub_bytes=*/0,
+                };
+                be->kv_transcode(bk, &tp_hi);
+                ggml_backend_synchronize(bk);
+
+                std::vector<uint8_t> hb(bytesTo), ib(bytesTo);
+                { ggml_init_params ip4 = { 4*ggml_tensor_overhead(), nullptr, true }; ggml_context * tc = ggml_init(ip4);
+                  ggml_tensor * d1 = ggml_new_tensor_1d(tc, GGML_TYPE_I8, (int64_t) bytesTo);
+                  d1->data = ggml_backend_buffer_get_base(hsep); d1->buffer = hsep;
+                  ggml_backend_tensor_get(d1, hb.data(), 0, bytesTo);
+                  ggml_tensor * d2 = ggml_new_tensor_1d(tc, GGML_TYPE_I8, (int64_t) bytesTo);
+                  d2->data = slab; d2->buffer = slabbuf;
+                  ggml_backend_tensor_get(d2, ib.data(), 0, bytesTo); ggml_free(tc); }
+                size_t same = 0, first_bad = bytesTo;
+                for (size_t i = 0; i < bytesTo; ++i) {
+                    if (hb[i] == ib[i]) { same++; } else if (first_bad == bytesTo) { first_bad = i; }
+                }
+                fprintf(stderr, "VBR SELFTEST PROMOTE %s %s->%s in-place==separate: %.3f%% (%zu/%zu)%s first-diff byte %zd (row %lld)\n",
+                        nm, ggml_type_name(ladder[h]), ggml_type_name(tto),
+                        100.0*(double)same/(double)bytesTo, same, bytesTo,
+                        same == bytesTo ? "" : " byte-MISMATCH", same == bytesTo ? (ssize_t) -1 : (ssize_t) first_bad,
+                        same == bytesTo ? -1LL : (long long)(first_bad / ggml_row_size(tto, ne0)));
+                if (same != bytesTo) {
+                    // TCQ trellis blocks carry trailing don't-care bits the decode never reads, so a
+                    // byte diff is not yet corruption — adjudicate on DEQUANTIZED values instead
+                    const size_t fb = (size_t) N * ne0 * sizeof(uint16_t);
+                    ggml_backend_buffer_t f1 = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(bk), fb);
+                    ggml_backend_buffer_t f2 = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(bk), fb);
+                    ggml_tensor * asep = ggml_new_tensor_2d(hc, tto, ne0, N);
+                    asep->data = ggml_backend_buffer_get_base(hsep); asep->buffer = hsep;
+                    ggml_set_name(asep, nm);
+                    be->kv_stash_capture(bk, asep,      ggml_backend_buffer_get_base(f1), N, ivar != 0);
+                    be->kv_stash_capture(bk, alias(tto), ggml_backend_buffer_get_base(f2), N, ivar != 0);
+                    ggml_backend_synchronize(bk);
+                    std::vector<uint16_t> v1(fb/2), v2(fb/2);
+                    { ggml_init_params ip5 = { 4*ggml_tensor_overhead(), nullptr, true }; ggml_context * tc = ggml_init(ip5);
+                      ggml_tensor * d1 = ggml_new_tensor_1d(tc, GGML_TYPE_I8, (int64_t) fb);
+                      d1->data = ggml_backend_buffer_get_base(f1); d1->buffer = f1;
+                      ggml_backend_tensor_get(d1, v1.data(), 0, fb);
+                      ggml_tensor * d2 = ggml_new_tensor_1d(tc, GGML_TYPE_I8, (int64_t) fb);
+                      d2->data = ggml_backend_buffer_get_base(f2); d2->buffer = f2;
+                      ggml_backend_tensor_get(d2, v2.data(), 0, fb); ggml_free(tc); }
+                    size_t vbad = 0; int64_t first_row = -1;
+                    for (size_t i = 0; i < v1.size(); ++i) {
+                        if (v1[i] != v2[i]) { vbad++; if (first_row < 0) { first_row = (int64_t) (i / (size_t) ne0); } }
+                    }
+                    fprintf(stderr, "VBR SELFTEST PROMOTE %s %s->%s DEQUANT compare: %s (%zu/%zu f16 values differ, first row %lld)\n",
+                            nm, ggml_type_name(ladder[h]), ggml_type_name(tto),
+                            vbad == 0 ? "IDENTICAL (slack bits only)" : "VALUE MISMATCH",
+                            vbad, v1.size(), (long long) first_row);
+                    ggml_backend_buffer_free(f1); ggml_backend_buffer_free(f2);
+                }
+                // continue the chain from the in-place result (== separate when the hop passes)
+                ggml_backend_buffer_free(hsep);
+            }
+            ggml_free(hc);
+            ggml_backend_buffer_free(slabbuf);
+            ggml_free(sc);
+            if (sbuf) ggml_backend_buffer_free(sbuf);
+        }
+
         ggml_backend_buffer_free(dbuf);
         ggml_free(gctx);
         if (gbuf) ggml_backend_buffer_free(gbuf);
