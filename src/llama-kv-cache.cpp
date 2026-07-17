@@ -1073,25 +1073,25 @@ llama_kv_cache::llama_kv_cache(
             }
         }
         ggml_backend_buffer_t buf = nullptr;
+        bool is_vmm_buf = false;
         if (hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else if (vbr_vmm_wanted) {
-            // one VMM pool per KV buffer — under -sm layer each device's KV context gets its own
+            // one VMM pool per KV buffer — one per device shard under -sm tensor, else one per
+            // device KV context under -sm layer
             buf = try_vmm_alloc(ctx.get(), buft); // nullptr -> fall through to static allocation
+            // NOTE: under -sm tensor `buf` is the META buffer while the pools hold the per-device
+            // buffers — the flag must come from the allocation path, not a pool.buf match
+            is_vmm_buf = buf != nullptr;
         }
         if (buf == nullptr && !hparams.no_alloc) {
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
-        }
-
-        bool is_vmm_buf = false;
-        for (const auto & p : vbr_pools_) {
-            is_vmm_buf |= p.vmm != nullptr && p.buf == buf;
         }
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB%s\n", __func__, ggml_backend_buffer_name(buf),
@@ -1413,18 +1413,31 @@ void llama_kv_cache::clear(bool data) {
             }
         }
         for (auto & [_, buf] : ctxs_bufs) {
-            const vbr_pool * p = nullptr;
-            for (const auto & pp : vbr_pools_) {
-                if (pp.vmm != nullptr && pp.buf == buf.get()) {
-                    p = &pp;
-                    break;
+            // physical buffers behind this KV buffer: itself, or the per-device buffers
+            // underneath a meta buffer (-sm tensor)
+            std::vector<ggml_backend_buffer_t> phys;
+            if (ggml_backend_buffer_is_meta(buf.get())) {
+                const size_t n = ggml_backend_meta_buft_n_bufts(ggml_backend_buffer_get_type(buf.get()));
+                for (size_t i = 0; i < n; ++i) {
+                    phys.push_back(ggml_backend_meta_buffer_simple_buffer(buf.get(), i));
                 }
-            }
-            if (p != nullptr) {
-                // a full-buffer clear would memset unmapped VA; zero only the mapped pages
-                p->be->vmm_pool_clear(p->vmm);
             } else {
-                ggml_backend_buffer_clear(buf.get(), 0);
+                phys.push_back(buf.get());
+            }
+            for (ggml_backend_buffer_t pb : phys) {
+                const vbr_pool * p = nullptr;
+                for (const auto & pp : vbr_pools_) {
+                    if (pp.vmm != nullptr && pp.buf == pb) {
+                        p = &pp;
+                        break;
+                    }
+                }
+                if (p != nullptr) {
+                    // a full-buffer clear would memset unmapped VA; zero only the mapped pages
+                    p->be->vmm_pool_clear(p->vmm);
+                } else {
+                    ggml_backend_buffer_clear(pb, 0);
+                }
             }
         }
 
@@ -1756,11 +1769,34 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
         } else {
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
             size_t sz = ggml_backend_buffer_get_size(buf.get());
-            for (const auto & p : vbr_pools_) {
-                if (p.vmm != nullptr && p.buf == buf.get()) {
-                    // VMM pool: the buffer size is the VA reservation; report mapped-physical
-                    sz = p.be->vmm_pool_mapped(p.vmm);
-                    break;
+            if (ggml_backend_buffer_is_meta(buf.get())) {
+                // -sm tensor: the pools wrap the per-device buffers underneath the meta buffer;
+                // report the sum of mapped-physical bytes when they are VMM-backed
+                size_t sz_meta  = 0;
+                bool   any_vmm  = false;
+                const size_t n = ggml_backend_meta_buft_n_bufts(buft);
+                for (size_t i = 0; i < n; ++i) {
+                    ggml_backend_buffer_t pb = ggml_backend_meta_buffer_simple_buffer(buf.get(), i);
+                    size_t sz_i = pb != nullptr ? ggml_backend_buffer_get_size(pb) : 0;
+                    for (const auto & p : vbr_pools_) {
+                        if (p.vmm != nullptr && p.buf == pb) {
+                            sz_i    = p.be->vmm_pool_mapped(p.vmm);
+                            any_vmm = true;
+                            break;
+                        }
+                    }
+                    sz_meta += sz_i;
+                }
+                if (any_vmm) {
+                    sz = sz_meta;
+                }
+            } else {
+                for (const auto & p : vbr_pools_) {
+                    if (p.vmm != nullptr && p.buf == buf.get()) {
+                        // VMM pool: the buffer size is the VA reservation; report mapped-physical
+                        sz = p.be->vmm_pool_mapped(p.vmm);
+                        break;
+                    }
                 }
             }
             ret[buft] += sz;
