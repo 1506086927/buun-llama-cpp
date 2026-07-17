@@ -1216,29 +1216,29 @@ llama_kv_cache::llama_kv_cache(
             if (vbr_growth_headroom_ == 0) {
                 vbr_growth_headroom_ = 1024ull * 1024 * 1024;
             }
-            if (vbr_budget_bytes_ > 0) {
+            const bool budget_fit_armed = vbr_budget_bytes_ > 0;
+            if (budget_fit_armed) {
                 LLAMA_LOG_INFO("%s: VBR budget: %.2f MiB mapped-physical (degrade trigger armed)\n",
-                        __func__, vbr_budget_bytes_/1024.0/1024.0);
-            } else {
-                // dynamic mode reached us without a resolved budget (fit disabled, failed, or a
-                // garbage override): fall back to the floor-layout cost — the minimum budget that
-                // guarantees the advertised full context fits. VRAM above it goes unused in this
-                // path (conservative; the fit-armed budget is the one that spends all headroom
-                // on quality).
-                vbr_budget_bytes_ = vbr_floor_cost_bytes_;
-                LLAMA_LOG_INFO("%s: VBR budget: %.2f MiB mapped-physical (floor-layout cost of the "
-                        "full context; no auto budget was resolved — conservative fallback)\n",
                         __func__, vbr_budget_bytes_/1024.0/1024.0);
             }
             // split the global budget across the VMM pools proportional to each pool's VA-size
-            // share (single pool -> exact global budget); all mapped-bytes checks are per-pool
-            if (vbr_budget_bytes_ > 0) {
+            // share (single pool -> exact global budget); all mapped-bytes checks are per-pool.
+            // WITHOUT a fit-resolved budget (fit disabled, failed, or not implemented —
+            // SPLIT_MODE_TENSOR), derive each pool's budget HERE from live per-device free
+            // memory, the same formula the boundary re-derivation uses. The ctor runs before
+            // compute buffers allocate, so the number over-states reach; that optimism is
+            // bounded by vbr_budget_eff's live free-VRAM clamp on every decision and corrected
+            // by the periodic re-derivation. The re-derivation FLOOR (budget_base) is the pool's
+            // floor-layout share — the minimum that guarantees the advertised context — so the
+            // derived value can tighten back down under co-tenants, never below the guarantee.
+            {
                 size_t total_va = 0;
                 size_t n_vmm    = 0;
                 for (const auto & p : vbr_pools_) {
                     total_va += p.vmm != nullptr ? p.size : 0;
                     n_vmm    += p.vmm != nullptr;
                 }
+                size_t derived_total = 0;
                 for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
                     auto & p = vbr_pools_[pi];
                     if (p.vmm == nullptr || total_va == 0) {
@@ -1246,13 +1246,30 @@ llama_kv_cache::llama_kv_cache(
                     }
                     // exact for the single-pool (single-GPU) case; double is plenty for the
                     // multi-pool proportional split (checks are page-granular anyway)
-                    p.budget = n_vmm == 1 ? vbr_budget_bytes_
-                             : (size_t) ((double) vbr_budget_bytes_ * ((double) p.size / (double) total_va));
-                    p.budget_base = p.budget; // re-derivation floor: never below the armed value
-                    if (n_vmm > 1) {
-                        LLAMA_LOG_INFO("%s: VBR pool #%zu (device %d) budget: %.2f MiB\n",
-                                __func__, pi, p.device, p.budget/1024.0/1024.0);
+                    const double va_share = n_vmm == 1 ? 1.0 : (double) p.size / (double) total_va;
+                    if (budget_fit_armed) {
+                        p.budget = n_vmm == 1 ? vbr_budget_bytes_
+                                 : (size_t) ((double) vbr_budget_bytes_ * va_share);
+                        p.budget_base = p.budget; // re-derivation floor: never below the armed value
+                    } else {
+                        const size_t floor_share = n_vmm == 1 ? vbr_floor_cost_bytes_
+                                 : (size_t) ((double) vbr_floor_cost_bytes_ * va_share);
+                        p.budget      = std::max(vbr_pool_reach(p), floor_share);
+                        p.budget_base = floor_share;
+                        derived_total += p.budget;
                     }
+                    if (n_vmm > 1 || !budget_fit_armed) {
+                        LLAMA_LOG_INFO("%s: VBR pool #%zu (device %d) budget: %.2f MiB%s\n",
+                                __func__, pi, p.device, p.budget/1024.0/1024.0,
+                                budget_fit_armed ? "" : " (auto, from live free device memory)");
+                    }
+                }
+                if (!budget_fit_armed) {
+                    vbr_budget_bytes_ = std::max(derived_total, vbr_floor_cost_bytes_);
+                    LLAMA_LOG_INFO("%s: VBR budget: %.2f MiB mapped-physical (auto: live free device "
+                            "memory at init, floored at the %.2f MiB floor-layout cost; re-derived "
+                            "each boundary)\n", __func__, vbr_budget_bytes_/1024.0/1024.0,
+                            vbr_floor_cost_bytes_/1024.0/1024.0);
                 }
             }
             // f16 sink-stash: DEFAULT ON (128 rows) since the S6 long-decode gate (2026-07-03)
@@ -2553,30 +2570,33 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
 // sawtooth co-tenant's trough must not be captured as permanent), floored at the init-armed
 // value (never stingier than startup), and never touched at all for explicit budgets. Throttled
 // by the caller (see prepare()); vbr_boundary_count_ is advanced there, not here.
+size_t llama_kv_cache::vbr_pool_reach(const vbr_pool & p) const {
+    constexpr size_t quantum = 64ull * 1024 * 1024;
+    size_t free_b = 0, total_b = 0;
+    p.be->get_device_memory(p.device, &free_b, &total_b);
+    const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm);
+    const size_t reach_raw  = mapped_now + (free_b > vbr_growth_headroom_ ? free_b - vbr_growth_headroom_ : 0);
+    size_t reach = (size_t) ((double) reach_raw * vbr_params_.device_share);
+    return reach / quantum * quantum; // 64 MiB quanta = the flap/jitter hysteresis
+}
+
 void llama_kv_cache::vbr_rederive_budget() {
     // skip the FIRST boundary: cuBLAS workspaces and CUDA-graph pools allocate lazily during
     // the first graph_compute, so free measured before it overstates reality
     if (vbr_boundary_count_ == 0) {
         return;
     }
-    constexpr size_t quantum = 64ull * 1024 * 1024;
     for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
         auto & p = vbr_pools_[pi];
         if (p.vmm == nullptr) {
             continue;
         }
-        size_t free_b = 0, total_b = 0;
-        p.be->get_device_memory(p.device, &free_b, &total_b);
-        const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm);
-        const size_t reach_raw  = mapped_now + (free_b > vbr_growth_headroom_ ? free_b - vbr_growth_headroom_ : 0);
-        size_t reach = (size_t) ((double) reach_raw * vbr_params_.device_share);
-        reach = reach / quantum * quantum;      // 64 MiB quanta = the flap/jitter hysteresis
+        size_t reach = vbr_pool_reach(p);
         reach = std::max(reach, p.budget_base); // the armed/fallback value is the floor
         if (reach != p.budget) {
             LLAMA_LOG_INFO("%s: VBR pool #%zu (device %d) budget re-derived %.2f -> %.2f MiB "
-                    "(mapped %.2f, free %.2f, headroom %.2f, share %.2f)\n",
+                    "(headroom %.2f, share %.2f)\n",
                     __func__, pi, p.device, p.budget/1024.0/1024.0, reach/1024.0/1024.0,
-                    mapped_now/1024.0/1024.0, free_b/1024.0/1024.0,
                     vbr_growth_headroom_/1024.0/1024.0, vbr_params_.device_share);
             p.budget = reach;
         }

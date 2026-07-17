@@ -1117,6 +1117,18 @@ enum common_params_fit_status common_fit_params(
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
 
+    // SPLIT_MODE_TENSOR: the fit pass is not implemented (per-device attribution runs through
+    // the meta backend). For dynamic VBR that is fine — the KV cache derives its auto budget at
+    // init from live per-device free memory and re-derives it every boundary — so skip the fit
+    // QUIETLY instead of surfacing a failure the user cannot act on. Non-VBR fits still take the
+    // failure path below (their n_gpu_layers/n_ctx fitting genuinely cannot run).
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR && cparams->vbr_dynamic) {
+        LOG_INF("%s: SPLIT_MODE_TENSOR: params fit skipped — the VBR KV budget is derived at init "
+                "from live per-device free memory (set --vbr-vram for an explicit budget; pass -c "
+                "to size the context)\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+
     // Dynamic VBR: price the KV at the degrade FLOOR for the whole fit, not at the turbo8 entry
     // tier. The runtime controller caps mapped-physical KV at the budget and the layout sits at
     // the floor when the context is full — so floor cost is what capacity/fitting must assume.

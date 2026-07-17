@@ -352,6 +352,10 @@ private:
     uint64_t vbr_boundary_count_   = 0;
     size_t   vbr_growth_headroom_  = 0;
     bool     vbr_budget_explicit_  = false;
+    // what this pool's device can give it right now: device_share x (mapped + free - headroom),
+    // 64 MiB-quantized. Shared by the init-time auto-budget arm (fit-less modes, e.g.
+    // SPLIT_MODE_TENSOR) and the periodic re-derivation.
+    size_t   vbr_pool_reach(const vbr_pool & p) const;
     // Fast-path stability tracking: skip per-batch VBR bookkeeping when settled (avoids ~1ms/token)
     uint32_t vbr_last_used_        = 0;   // observed cell count last prepare() pass
     void     vbr_rederive_budget();
