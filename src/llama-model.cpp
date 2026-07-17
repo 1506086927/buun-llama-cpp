@@ -399,6 +399,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         uint32_t il;
         std::string prefix;
+        // NOTE: the per-layer rotation spreads shard bytes evenly across devices regardless of
+        // tensor_split; common/fit.cpp's SPLIT_MODE_TENSOR capacity math (n_devs x the tightest
+        // device) assumes exactly this placement policy
         size_t rotation;
         if (tensor_name.substr(0, 4) == "blk.") {
             const size_t length_prefix = tensor_name.find('.', 4);

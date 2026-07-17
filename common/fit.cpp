@@ -118,25 +118,26 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     for (size_t i = 0; i < nd; i++) {
         ggml_backend_dev_t dev = llama_model_get_device(model, i);
 
-        size_t free;
-        size_t total;
-        ggml_backend_dev_memory(dev, &free, &total);
-
-        // SPLIT_MODE_TENSOR: the meta device reports the SUM of its simple devices' memory, but
-        // the per-layer shard rotation spreads bytes evenly across them, so the aggregate is only
-        // usable up to n_devs x the tightest device (a co-tenant on one GPU binds all of them)
+        size_t free  = 0;
+        size_t total = 0;
         if (ggml_backend_dev_is_meta(dev)) {
+            // SPLIT_MODE_TENSOR: the meta device would report the SUM of its simple devices'
+            // memory, but the per-layer shard rotation (llama_meta_device_get_split_state)
+            // spreads bytes evenly across them, so the usable aggregate is n_devs x the
+            // tightest device (a co-tenant on one GPU binds all of them)
             const size_t n_simple = ggml_backend_meta_dev_n_devs(dev);
-            size_t min_free  = free;
-            size_t min_total = total;
+            size_t min_free  = std::numeric_limits<size_t>::max();
+            size_t min_total = std::numeric_limits<size_t>::max();
             for (size_t j = 0; j < n_simple; j++) {
                 size_t free_j, total_j;
                 ggml_backend_dev_memory(ggml_backend_meta_dev_simple_dev(dev, j), &free_j, &total_j);
                 min_free  = std::min(min_free,  free_j);
                 min_total = std::min(min_total, total_j);
             }
-            free  = std::min(free,  n_simple * min_free);
-            total = std::min(total, n_simple * min_total);
+            free  = n_simple * min_free;
+            total = n_simple * min_total;
+        } else {
+            ggml_backend_dev_memory(dev, &free, &total);
         }
 
         // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
@@ -220,27 +221,27 @@ static void common_params_fit_impl(
     const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
     const size_t nd = devs.size(); // number of devices
 
+    const bool sm_tensor = mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR; // nd == 1, a meta device wrapping the real GPUs
+
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
-    if (nd == 0) {
+    int64_t margin_per_dev = margins_s[0];
+    if (sm_tensor) {
+        // the single meta device carries the SUM of the per-real-device margins, while the
+        // headroom handed to the VBR runtime stays a single-device figure — the controller
+        // applies it to each device's own free memory
+        int64_t sum    = 0;
+        margin_per_dev = 0;
+        for (size_t j = 0; j < ggml_backend_meta_dev_n_devs(devs[0]); j++) {
+            sum           += margins_s[j];
+            margin_per_dev = std::max<int64_t>(margin_per_dev, margins_s[j]);
+        }
+        margins.push_back(sum);
+    } else if (nd == 0) {
         margins.push_back(margins_s[0]);
     } else {
         for (size_t id = 0; id < nd; id++) {
             margins.push_back(margins_s[id]);
-        }
-    }
-
-    // SPLIT_MODE_TENSOR: the single meta device carries the SUM of the per-real-device margins,
-    // while the headroom handed to the VBR runtime stays a single-device figure — the controller
-    // applies it to each device's own free memory
-    int64_t margin_per_dev = margins[0];
-    if (nd == 1 && ggml_backend_dev_is_meta(devs[0])) {
-        const size_t n_simple = ggml_backend_meta_dev_n_devs(devs[0]);
-        margins[0]     = 0;
-        margin_per_dev = 0;
-        for (size_t j = 0; j < n_simple; j++) {
-            margins[0]    += margins_s[j];
-            margin_per_dev = std::max<int64_t>(margin_per_dev, margins_s[j]);
         }
     }
 
@@ -706,7 +707,7 @@ static void common_params_fit_impl(
         throw common_params_fit_exception("was unable to fit model into system memory by reducing context, abort");
     }
 
-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+    if (sm_tensor) {
         // every layer is sharded across every device — there is no layer redistribution or CPU
         // overflow to fall back on, and tensor_split already belongs to the user
         throw common_params_fit_exception("model does not fit at the minimum context size and layer "
@@ -1154,6 +1155,15 @@ enum common_params_fit_status common_fit_params(
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+
+    // SPLIT_MODE_TENSOR with everything explicit (-c AND --vbr-vram): nothing left to size or
+    // arm (the estimators no-op on explicit values and there is no layer redistribution), so
+    // skip the dry model loads the fit would otherwise spend on a no-op
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR && cparams->vbr_dynamic &&
+            cparams->n_ctx != 0 && cparams->vbr_vram_budget_bytes != 0) {
+        LOG_INF("%s: SPLIT_MODE_TENSOR: -c and --vbr-vram both explicit — nothing to fit, skipping\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
 
     // Dynamic VBR: price the KV at the degrade FLOOR for the whole fit, not at the turbo8 entry
     // tier. The runtime controller caps mapped-physical KV at the budget and the layout sits at

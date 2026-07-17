@@ -1574,19 +1574,7 @@ ggml_backend_buffer_t ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(
         if (alloc != nullptr) {
             // caller-managed allocation: the callback places every non-view shard tensor
             // (data + buffer); views are finalized below
-            ggml_backend_buffer_t simple_buf = alloc(i, simple_buft, ctx, userdata);
-            if (simple_buf == nullptr) {
-                ggml_backend_buffer_free(meta_buf); // frees the already-installed simple buffers
-                return nullptr;
-            }
-            meta_buf_ctx->bufs[i].reset(simple_buf);
-            // finalize any views the callback left untouched (it only owes the non-view tensors);
-            // a callback that finalized its own views is fine — those are skipped by the null check
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                if (t->view_src != nullptr && t->buffer == nullptr) {
-                    ggml_backend_view_init(t);
-                }
-            }
+            meta_buf_ctx->bufs[i].reset(alloc(i, simple_buft, ctx, userdata));
         } else {
             // If a ggml_context only has zero-sized tensors, ggml_backend_alloc_ctx_tensors_from_buft returns NULL.
             // For those edge cases, allocate a dummy buffer instead.
@@ -1605,11 +1593,20 @@ ggml_backend_buffer_t ggml_backend_meta_alloc_ctx_tensors_from_buft_ext(
                     t->buffer = meta_buf_ctx->bufs[i].get();
                 }
             }
-            if (!meta_buf_ctx->bufs[i]) {
-                // simple-buffer allocation failed (e.g. device OOM) — fail like the non-meta
-                // allocator does so the caller can surface a load error instead of crashing
-                ggml_backend_buffer_free(meta_buf);
-                return nullptr;
+        }
+        if (!meta_buf_ctx->bufs[i]) {
+            // allocation failed (callback refusal or device OOM) — fail like the non-meta
+            // allocator does so the caller can surface a load error instead of crashing
+            ggml_backend_buffer_free(meta_buf); // frees the already-installed simple buffers
+            return nullptr;
+        }
+        if (alloc != nullptr) {
+            // finalize any views the callback left untouched (it only owes the non-view tensors);
+            // a callback that finalized its own views is fine — those are skipped by the null check
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->view_src != nullptr && t->buffer == nullptr) {
+                    ggml_backend_view_init(t);
+                }
             }
         }
         meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
