@@ -135,6 +135,11 @@ void ggml_backend_cuda_vmm_pool_free(ggml_vbr_vmm_pool * pool) {
         return;
     }
     ggml_cuda_set_device(pool->device);
+    // cuMemUnmap/cuMemAddressFree are host-immediate with no implicit device sync (unlike
+    // cudaFree): under -sm layer pipeline parallelism a prior ubatch's kernels can still be
+    // reading this VA when the fattn dequant scratch re-reserves mid-decode — settle the
+    // device before pulling the mapping out from under them.
+    CUDA_CHECK(cudaDeviceSynchronize());
     for (size_t c : pool->chunks) {
         CU_CHECK(cuMemUnmap((CUdeviceptr)((char *) pool->base + c), pool->gran));
     }
