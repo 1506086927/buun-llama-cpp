@@ -646,6 +646,10 @@ struct llama_model {
     size_t size() const; // file size
     size_t n_tensors() const;
     size_t n_devices() const;
+
+    // take ownership of an extra (context, buffer) pair, freed with the model
+    // (used for the drafter's gathered tok_embd/output copies under a tensor-sharded target)
+    void adopt_buffer(ggml_context_ptr ctx, ggml_backend_buffer_ptr buf);
     const float * tensor_split() const;
 
     uint32_t n_gpu_layers() const;

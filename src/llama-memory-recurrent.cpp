@@ -437,33 +437,48 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         return;
     }
 
-    // create one shared ggml context for all view pairs
+    // create one shared ggml context for all view pairs (meta caches need 2 views per shard)
     const uint32_t n_recur = hparams.n_layer();
     ggml_init_params params = {
-        /*.mem_size   =*/ size_t(4 * n_recur * ggml_tensor_overhead()),
+        /*.mem_size   =*/ size_t(64 * n_recur * ggml_tensor_overhead()),
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
     ggml_context * ctx = ggml_init(params);
 
+    // a cell copy stays within one tensor: on a plain buffer it is a single row copy. On a
+    // meta (tensor-split) buffer the cell row is sharded across devices, each shard with its
+    // own row stride — decompose into device-local row copies on the shard tensors (the meta
+    // buffer cannot serve ad-hoc views through get/set_tensor)
+    auto copy_row = [&](ggml_tensor * t) {
+        if (t->buffer != nullptr && ggml_backend_buffer_is_meta(t->buffer)) {
+            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(t->buffer);
+            for (size_t j = 0; j < n_bufs; ++j) {
+                ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(t, j);
+                if (st == nullptr || st->ne[0] == 0) {
+                    continue; // zero-width shard (rotation gave this device no slice)
+                }
+                ggml_tensor * src_v = ggml_view_1d(ctx, st, st->ne[0], i_src * st->nb[1]);
+                ggml_tensor * dst_v = ggml_view_1d(ctx, st, st->ne[0], i_dst * st->nb[1]);
+                src_v->buffer = st->buffer;
+                dst_v->buffer = st->buffer;
+                ggml_backend_tensor_copy(src_v, dst_v);
+            }
+            return;
+        }
+        ggml_tensor * src_v = ggml_view_1d(ctx, t, t->ne[0], i_src * t->nb[1]);
+        ggml_tensor * dst_v = ggml_view_1d(ctx, t, t->ne[0], i_dst * t->nb[1]);
+        src_v->buffer = t->buffer;
+        dst_v->buffer = t->buffer;
+        ggml_backend_tensor_copy(src_v, dst_v);
+    };
+
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
         if (r_l[il]) {
-            const uint32_t n_embd = hparams.n_embd_r();
-            size_t row_bytes = ggml_row_size(r_l[il]->type, n_embd);
-            ggml_tensor * src_v = ggml_view_1d(ctx, r_l[il], n_embd, i_src * row_bytes);
-            ggml_tensor * dst_v = ggml_view_1d(ctx, r_l[il], n_embd, i_dst * row_bytes);
-            src_v->buffer = r_l[il]->buffer;
-            dst_v->buffer = r_l[il]->buffer;
-            ggml_backend_tensor_copy(src_v, dst_v);
+            copy_row(r_l[il]);
         }
         if (s_l[il]) {
-            const uint32_t n_embd = hparams.n_embd_s();
-            size_t row_bytes = ggml_row_size(s_l[il]->type, n_embd);
-            ggml_tensor * src_v = ggml_view_1d(ctx, s_l[il], n_embd, i_src * row_bytes);
-            ggml_tensor * dst_v = ggml_view_1d(ctx, s_l[il], n_embd, i_dst * row_bytes);
-            src_v->buffer = s_l[il]->buffer;
-            dst_v->buffer = s_l[il]->buffer;
-            ggml_backend_tensor_copy(src_v, dst_v);
+            copy_row(s_l[il]);
         }
     }
 

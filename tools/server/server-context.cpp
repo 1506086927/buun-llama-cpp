@@ -1549,6 +1549,17 @@ private:
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
 
+            // The backup sequences double n_seq_max. Without unified KV each sequence gets its
+            // own n_ctx / n_seq_max stream, so the doubling silently HALVES every slot's usable
+            // context on top of the user's n_parallel division (-np 2 + MTP -> n_ctx/4 per
+            // slot). Unified KV shares one full-length cell pool across sequences instead —
+            // same auto-enable precedent as the single-slot case above.
+            if (!params_base.kv_unified) {
+                params_base.kv_unified = true;
+                SRV_INF("%s", "auto-enabled kv-unified: speculative decoding doubles n_seq_max, "
+                        "which would halve the per-slot context with per-sequence KV streams\n");
+            }
+
             // n_outputs_max was computed above (server_n_outputs_max) with the pre-doubling
             // n_parallel. The target context is created just below with the DOUBLED n_parallel,
             // so its n_seq_max grows accordingly and output_reserve(n_seq_max) needs the cap to
@@ -1615,6 +1626,15 @@ private:
             params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx_tgt) : params_spec.n_ctx;
             params_dft.n_batch      = params_dft.n_ctx;
             params_dft.devices      = params_spec.devices;
+
+            // SPLIT_MODE_TENSOR is target-only: drafter archs have no meta split rules, and the
+            // hidden-state feed runs through host buffers anyway — run the drafter as a normal
+            // (layer-split or pinned) model; pin with --spec-draft-device to keep it on one GPU
+            if (params_dft.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                params_dft.split_mode = LLAMA_SPLIT_MODE_LAYER;
+                SRV_INF("%s", "tensor-split target: draft model falls back to layer split "
+                        "(use --spec-draft-device to pin it to one GPU)\n");
+            }
             params_dft.model        = params_spec.mparams;
             params_dft.n_gpu_layers = params_spec.n_gpu_layers;
             params_dft.cache_type_k = params_spec.cache_type_k;
