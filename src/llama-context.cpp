@@ -599,22 +599,14 @@ void llama_context::sched_reserve() {
     if (cparams.auto_fgdn) {
         // Fused GDN kernels are only tested on NVIDIA CUDA. Disable on ROCm/MUSA/other.
         bool have_cuda_gpu = false;
-        for (auto & backend : backends) {
-            auto * dev = ggml_backend_get_device(backend.get());
-            // Accept integrated GPUs (IGPU) too: APUs like gfx1151 (Strix Halo) register as
-            // IGPU, not discrete GPU — the GPU-only check silently dropped them to the decomposed
-            // GDN path (~13% pp / ~6% tg slower on the qwen35/gemma linear-attn layers).
-            const int gdn_dt = dev ? (int) ggml_backend_dev_type(dev) : (int) GGML_BACKEND_DEVICE_TYPE_CPU;
-            if (dev && (gdn_dt == (int) GGML_BACKEND_DEVICE_TYPE_GPU || gdn_dt == (int) GGML_BACKEND_DEVICE_TYPE_IGPU)) {
-                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-                const char * reg_name = ggml_backend_reg_name(reg);
-                if (reg_name && (strncmp(reg_name, "CUDA", 4) == 0 || strncmp(reg_name, "ROCm", 4) == 0)) {
-                    // HIP builds register as "ROCm": the fused-GDN path compiles and runs there
-                    // (validated on RDNA3, buun-llama-cpp#69) — the CUDA-only name check was
-                    // silently dropping AMD to the decomposed ops (~9% generation speed)
-                    have_cuda_gpu = true;
-                }
-                break;
+        if (ggml_backend_t gpu_backend = find_gpu_backend()) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu_backend));
+            const char * reg_name = ggml_backend_reg_name(reg);
+            if (reg_name && (strncmp(reg_name, "CUDA", 4) == 0 || strncmp(reg_name, "ROCm", 4) == 0)) {
+                // HIP builds register as "ROCm": the fused-GDN path compiles and runs there
+                // (validated on RDNA3, buun-llama-cpp#69) — the CUDA-only name check was
+                // silently dropping AMD to the decomposed ops (~9% generation speed)
+                have_cuda_gpu = true;
             }
         }
 
@@ -1461,6 +1453,9 @@ void llama_context::set_tape_recording(bool enable) {
     }
 }
 
+static llama_memory_recurrent * get_recurrent_mem(llama_memory_t mem);
+static bool dflash_states_on_one_device(const llama_hparams & hparams, llama_memory_recurrent * mem_recurrent);
+
 void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     if (!dflash_capture) {
         return;
@@ -1493,6 +1488,17 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     ggml_backend_t gpu_backend = find_gpu_backend();
     if (!gpu_backend) {
         return; // no GPU, fall back to CPU tape via eval callback
+    }
+
+    // Once a GPU tape exists, the eval callback stops capturing k/v/gate/beta on the CPU —
+    // so only allocate it when replay can actually use it (states on one non-host device,
+    // see llama_dflash_tape_replay_available). Otherwise fall back to the CPU tape, which
+    // captures everything the CPU replay needs.
+    {
+        auto * mem_recurrent = get_recurrent_mem(memory.get());
+        if (!mem_recurrent || !dflash_states_on_one_device(model.hparams, mem_recurrent)) {
+            return;
+        }
     }
 
     const auto & hparams = model.hparams;
@@ -1621,13 +1627,7 @@ bool llama_context::tape_replay_available() {
         return false;
     }
 
-    auto * mem_recurrent = dynamic_cast<llama_memory_recurrent *>(memory.get());
-    if (!mem_recurrent) {
-        auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
-        if (mem_hybrid) {
-            mem_recurrent = mem_hybrid->get_mem_recr();
-        }
-    }
+    auto * mem_recurrent = get_recurrent_mem(memory.get());
     if (!mem_recurrent) {
         return false;
     }
@@ -1647,13 +1647,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         return;
     }
 
-    auto * mem_recurrent = dynamic_cast<llama_memory_recurrent *>(memory.get());
-    if (!mem_recurrent) {
-        auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
-        if (mem_hybrid) {
-            mem_recurrent = mem_hybrid->get_mem_recr();
-        }
-    }
+    auto * mem_recurrent = get_recurrent_mem(memory.get());
     if (!mem_recurrent) {
         LLAMA_LOG_WARN("%s: tape replay requires recurrent memory\n", __func__);
         return;
@@ -1692,13 +1686,14 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     // Also detect multi-device splits — if states span GPUs, fall back to CPU replay.
     if (!dflash_states_on_one_device(hparams, mem_recurrent)) {
         if (dflash_capture->active_tape()) {
-            // k/v/gate/beta were only captured into the GPU tape, which this path cannot
-            // read — the CPU replay below is a silent no-op for the GDN state and the
-            // rolled-back state loses the accepted tokens' updates. Callers must check
-            // tape_replay_available() and re-decode accepted tokens instead of taping.
+            // unreachable by construction: allocate_tape_gpu only creates the GPU tape when
+            // this same predicate holds, and states do not migrate afterwards. If it ever
+            // fires, k/v/gate/beta live only in the GPU tape — there is nothing for
+            // tape_replay_cpu to replay (see llama_dflash_tape_replay_available).
             LLAMA_LOG_WARN("%s: GPU tape active but states are host/multi-device — GDN replay skipped, recurrent state will be stale\n", __func__);
+        } else {
+            tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
         }
-        tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
         tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
         return;
     }

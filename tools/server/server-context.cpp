@@ -4598,12 +4598,9 @@ private:
         }
 
         // DFlash: enable tape recording if any slot has draft backup (needs tape replay for rollback);
-        // turned off in post_cycle() so recording stays active across ALL sub-batches
-        // Only when GPU tape replay is available. Otherwise — tensor-split meta target (no
-        // GPU-typed backend, capture reads head-sharded mid-GDN tensors the meta get_tensor
-        // chunk splicer cannot represent), layer split across GPUs, or partial offload —
-        // capture/replay degrades to CPU paths that are lossy or silently skip the GDN state,
-        // so rollback re-decodes the accepted tokens instead (partial-accept branch below).
+        // turned off in post_cycle() so recording stays active across ALL sub-batches.
+        // Only when GPU tape replay is available (see llama_dflash_tape_replay_available) —
+        // otherwise rollback re-decodes the accepted tokens (partial-accept branch below).
         dflash_tape_active = needs_reeval
             && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH
             && dflash_tape_ok

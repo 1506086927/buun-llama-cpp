@@ -2669,9 +2669,10 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
 
     // materialize contiguous copies on the drafter's own device instead of sharing pointers
     // (for meta buffers, get_tensor reassembles the canonical bytes across shards);
-    // schedulable tensors are still shared as-is
-    GGML_ASSERT(!dst->devices.empty());
-    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dst->devices[0].dev);
+    // schedulable tensors are still shared as-is. A device-less drafter gathers to host.
+    ggml_backend_buffer_type_t buft = dst->devices.empty()
+        ? ggml_backend_cpu_buffer_type()
+        : ggml_backend_dev_buffer_type(dst->devices[0].dev);
 
     ggml_init_params ip = { /*.mem_size =*/ 2*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
     ggml_context_ptr ctx_ptr { ggml_init(ip) };
