@@ -2056,6 +2056,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         /*.budget_explicit       =*/ cparams.vbr_budget_explicit,
         /*.growth_headroom_bytes =*/ cparams.vbr_growth_headroom_bytes,
         /*.device_share          =*/ 1.0,
+        /*.pin_k                 =*/ cparams.vbr_pin_k,
+        /*.pin_v                 =*/ cparams.vbr_pin_v,
     };
 
     switch (arch) {

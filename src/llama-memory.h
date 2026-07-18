@@ -44,6 +44,9 @@ struct llama_memory_vbr_params {
     // this cache's fraction of its device's spare VRAM (iSWA children share a device; the
     // parent splits by entry-tier footprint so the children never double-claim the same free)
     double   device_share = 1.0;
+    // mixed-config side pins, see llama.h vbr_pin_k
+    bool     pin_k = false;
+    bool     pin_v = false;
 };
 
 enum llama_memory_status {
@@ -139,6 +142,14 @@ struct llama_memory_i {
     // all zeros: "no controller, no pressure, nothing resident" — safe for policy consumers.
     virtual llama_memory_vbr_state_data memory_vbr_state(llama_seq_id /*seq_id*/, uint32_t /*n_tokens_extra*/) const {
         return {};
+    }
+
+    // per-token KV bits of the layout the --vbr-floor clamp lands on when walking the degrade
+    // order from the given entry types (GGML_TYPE_COUNT = each tensor's current type;
+    // floor_bpv <= 0 = bottom-tier default). 0 = no VBR-capable cache. The fit pass calls this
+    // on its dry-load context for floor-true capacity math (llama_vbr_floor_bits_per_token).
+    virtual double memory_vbr_floor_bits_per_token(ggml_type /*entry_k*/, ggml_type /*entry_v*/, double /*floor_bpv*/) {
+        return 0.0;
     }
 
     //

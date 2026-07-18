@@ -236,6 +236,8 @@ llama_context::llama_context(
     cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
     cparams.vbr_growth_headroom_bytes = params.vbr_growth_headroom_bytes;
     cparams.vbr_budget_explicit = params.vbr_budget_explicit;
+    cparams.vbr_pin_k = params.vbr_pin_k;
+    cparams.vbr_pin_v = params.vbr_pin_v;
 
     // A shared-KV drafter (gemma4 assistant / weightless DFlash/Eagle3) views the target's
     // KV tensors — the target's VBR controller owns those, and the drafter's graphs follow
@@ -252,6 +254,8 @@ llama_context::llama_context(
         cparams.vbr_vram_budget_bytes    = 0;
         cparams.vbr_growth_headroom_bytes = 0;
         cparams.vbr_budget_explicit      = false;
+        cparams.vbr_pin_k                = false;
+        cparams.vbr_pin_v                = false;
     }
 
     // Dynamic VBR requires single-stream KV (the VMM pool + degrade controller are gated on
@@ -5102,6 +5106,8 @@ llama_context_params llama_context_default_params() {
         /*.logits_all                  =*/ true,
         /*.vbr_dynamic                 =*/ false,
         /*.vbr_budget_explicit         =*/ false,
+        /*.vbr_pin_k                   =*/ false,
+        /*.vbr_pin_v                   =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.dflash_n_slots              =*/ 1,
@@ -5778,6 +5784,15 @@ struct llama_memory_vbr_state_data llama_memory_vbr_state(llama_memory_t mem, ll
     }
 
     return mem->memory_vbr_state(seq_id, n_tokens_extra);
+}
+
+double llama_vbr_floor_bits_per_token(struct llama_context * ctx, enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv) {
+    llama_memory_t mem = ctx ? llama_get_memory(ctx) : nullptr;
+    if (!mem) {
+        return 0.0;
+    }
+
+    return mem->memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv);
 }
 
 static llama_memory_recurrent * get_recurrent_mem(llama_memory_t mem) {
