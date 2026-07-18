@@ -398,6 +398,11 @@ extern "C" {
                           // backend exporting the ggml-vbr.h interface) [EXPERIMENTAL]
         bool vbr_budget_explicit; // vbr_vram_budget_bytes is a user-set HARD CAP: the runtime
                           // must never re-derive it from live free VRAM [EXPERIMENTAL]
+        bool vbr_pin_k;   // K side is PINNED at type_k: the degrade/promote ladder never touches
+                          // it; it still counts in the vbr_min_bits aggregate at its fixed
+                          // bits/value (set for an explicitly-typed side in a mixed config where
+                          // the other side selected dynamic VBR) [EXPERIMENTAL]
+        bool vbr_pin_v;   // same for the V side [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

@@ -2948,7 +2948,7 @@ void llama_kv_cache::vbr_floor_clamp_order() {
             sim[ikv*2 + side] = t->type;
             sum_bits += 8.0 * ggml_row_size(t->type, t->ne[0]);
             sum_vals += t->ne[0];
-            n_pinned += !vbr_type_is_movable(t->type);
+            n_pinned += !vbr_type_is_movable(t->type) || vbr_side_pinned(side != 0);
         }
     }
     if (sum_vals == 0) {
@@ -2967,7 +2967,8 @@ void llama_kv_cache::vbr_floor_clamp_order() {
         }
         const size_t slot = (size_t) it->second * 2 + (st.is_v ? 1 : 0);
         const ggml_tensor * t = st.is_v ? layers[it->second].v : layers[it->second].k;
-        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_type_is_movable(sim[slot])) {
+        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_type_is_movable(sim[slot]) ||
+                vbr_side_pinned(st.is_v != 0)) {
             continue; // absent or pinned (runtime skips these steps identically)
         }
         const ggml_type type_B = vbr_tier_type(st.tier);
@@ -3326,7 +3327,7 @@ bool llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
         if (t == nullptr || units.empty()) {
             continue;
         }
-        if (!vbr_type_is_movable(t->type)) {
+        if (!vbr_type_is_movable(t->type) || vbr_side_pinned(st.is_v != 0)) {
             continue; // PINNED unit (explicit non-vbr side): the ladder never touches it
         }
         const ggml_type type_B = vbr_tier_type(st.tier);
@@ -3780,7 +3781,8 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
         }
         const size_t slot = (size_t) it->second * 2 + (stp.is_v ? 1 : 0);
         const ggml_tensor * t = stp.is_v ? layers[it->second].v : layers[it->second].k;
-        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_type_is_movable(sim[slot])) {
+        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_type_is_movable(sim[slot]) ||
+                vbr_side_pinned(stp.is_v != 0)) {
             continue;
         }
         const ggml_type type_B = vbr_tier_type(stp.tier);

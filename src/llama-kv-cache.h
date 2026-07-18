@@ -387,6 +387,8 @@ private:
     // degrade/promote paths call this per decode boundary, so it must not allocate
     const std::vector<std::pair<vbr_pool *, vbr_extent *>> & vbr_units_of(size_t ikv, bool is_v) const;
     bool vbr_unit_pooled(size_t ikv, bool is_v) const;         // any VMM pool holds this unit
+    // side pinned via mixed config (-ctk turbo8 -ctv vbr): ladder never touches it
+    bool vbr_side_pinned(bool is_v) const { return is_v ? vbr_params_.pin_v : vbr_params_.pin_k; }
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
     bool     vbr_degrade_next(uint32_t wm_next);      // one step down the order; false = exhausted
                                                       // wm_next = projected watermark incl. the

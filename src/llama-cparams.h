@@ -55,6 +55,10 @@ struct llama_cparams {
     uint64_t vbr_vram_budget_bytes = 0;
     uint64_t vbr_growth_headroom_bytes = 0;
     bool vbr_budget_explicit = false;
+    // pinned sides: the degrade/promote ladder never touches them; they stay in the
+    // vbr_min_bits aggregate at their fixed bits/value
+    bool vbr_pin_k = false;
+    bool vbr_pin_v = false;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
