@@ -1549,6 +1549,17 @@ private:
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
 
+            // The backup sequences double n_seq_max. Without unified KV each sequence gets its
+            // own n_ctx / n_seq_max stream, so the doubling silently HALVES every slot's usable
+            // context on top of the user's n_parallel division (-np 2 + MTP -> n_ctx/4 per
+            // slot). Unified KV shares one full-length cell pool across sequences instead —
+            // same auto-enable precedent as the single-slot case above.
+            if (!params_base.kv_unified) {
+                params_base.kv_unified = true;
+                SRV_INF("%s", "auto-enabled kv-unified: speculative decoding doubles n_seq_max, "
+                        "which would halve the per-slot context with per-sequence KV streams\n");
+            }
+
             // n_outputs_max was computed above (server_n_outputs_max) with the pre-doubling
             // n_parallel. The target context is created just below with the DOUBLED n_parallel,
             // so its n_seq_max grows accordingly and output_reserve(n_seq_max) needs the cap to
@@ -1595,6 +1606,12 @@ private:
         needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
         is_diffusion = llama_model_is_diffusion(model_tgt);
 
+        dflash_tape_ok = llama_dflash_tape_replay_available(ctx_tgt);
+        if (needs_reeval && !dflash_tape_ok && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            SRV_INF("%s", "DFlash rollback: GPU tape replay unavailable (recurrent states on "
+                    "host or multiple devices) — partial accepts re-decode the accepted tokens\n");
+        }
+
         if (is_diffusion) {
             SRV_INF("%s", "diffusion model detected — enabling self-speculation\n");
         }
@@ -1615,6 +1632,15 @@ private:
             params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx_tgt) : params_spec.n_ctx;
             params_dft.n_batch      = params_dft.n_ctx;
             params_dft.devices      = params_spec.devices;
+
+            // SPLIT_MODE_TENSOR is target-only: drafter archs have no meta split rules, and the
+            // hidden-state feed runs through host buffers anyway — run the drafter as a normal
+            // (layer-split or pinned) model; pin with --spec-draft-device to keep it on one GPU
+            if (params_dft.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                params_dft.split_mode = LLAMA_SPLIT_MODE_LAYER;
+                SRV_INF("%s", "tensor-split target: draft model falls back to layer split "
+                        "(use --spec-draft-device to pin it to one GPU)\n");
+            }
             params_dft.model        = params_spec.mparams;
             params_dft.n_gpu_layers = params_spec.n_gpu_layers;
             params_dft.cache_type_k = params_spec.cache_type_k;
@@ -1925,6 +1951,8 @@ private:
 
         // Allocate DFlash per-slot tape + hidden buffers now that common_speculative_init
         // (run for slot 0 above) has created dflash_capture on the target context.
+        // Runs even when !dflash_tape_ok: the call also sizes the per-slot hidden-capture
+        // buffers, which every DFlash target needs (the unused tape itself is small).
         if (dflash_slots_cap > 0) {
             llama_dflash_allocate_slots(ctx_tgt, dflash_slots_cap);
         }
@@ -3576,6 +3604,9 @@ private:
 
     // DFlash tape recording armed for this cycle (turned off in post_cycle())
     bool dflash_tape_active = false;
+    // target can replay the tape losslessly on GPU after a partial accept; when false,
+    // no tape is recorded and rollback re-decodes the accepted tokens instead
+    bool dflash_tape_ok = false;
     // pure-TG batch → multi-seq ubatch allowed (force_split_seq restored in post_cycle())
     bool can_batch_multiseq = false;
 // #define DEBUG_TIMINGS
@@ -4567,9 +4598,12 @@ private:
         }
 
         // DFlash: enable tape recording if any slot has draft backup (needs tape replay for rollback);
-        // turned off in post_cycle() so recording stays active across ALL sub-batches
+        // turned off in post_cycle() so recording stays active across ALL sub-batches.
+        // Only when GPU tape replay is available (see llama_dflash_tape_replay_available) —
+        // otherwise rollback re-decodes the accepted tokens (partial-accept branch below).
         dflash_tape_active = needs_reeval
             && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH
+            && dflash_tape_ok
             && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.has_draft_backup; });
         if (dflash_tape_active) {
             llama_set_tape_recording(ctx_tgt, true);
@@ -5012,18 +5046,18 @@ private:
                 const llama_seq_id seq_backup = slot.seq_id_backup;
                 const bool all_accepted = (ids.size() == n_draft + 1);
 
-                if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                const bool is_dflash = params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH;
+                if (is_dflash) {
                     llama_dflash_set_active_slot(ctx_tgt, slot.id);
-                    if (all_accepted) {
-                        llama_clear_tree_parent_ids(ctx_tgt);
-                        auto * mem = llama_get_memory(ctx_tgt);
-                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                        llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
-                    } else {
-                        llama_clear_tree_parent_ids(ctx_tgt);
-                        llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_tokens_before_draft, (int) ids.size());
-                    }
+                    llama_clear_tree_parent_ids(ctx_tgt);
+                }
+
+                if (is_dflash && !all_accepted && dflash_tape_ok) {
+                    // lossless GPU tape replay of the accepted tokens' GDN state updates
+                    llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_tokens_before_draft, (int) ids.size());
                 } else {
+                    // no tape recorded (see dflash_tape_active) or non-DFlash drafter:
+                    // restore from backup and re-decode the accepted tokens (exact, replay-free)
                     auto * mem = llama_get_memory(ctx_tgt);
 
                     if (all_accepted) {

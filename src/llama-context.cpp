@@ -599,22 +599,14 @@ void llama_context::sched_reserve() {
     if (cparams.auto_fgdn) {
         // Fused GDN kernels are only tested on NVIDIA CUDA. Disable on ROCm/MUSA/other.
         bool have_cuda_gpu = false;
-        for (auto & backend : backends) {
-            auto * dev = ggml_backend_get_device(backend.get());
-            // Accept integrated GPUs (IGPU) too: APUs like gfx1151 (Strix Halo) register as
-            // IGPU, not discrete GPU — the GPU-only check silently dropped them to the decomposed
-            // GDN path (~13% pp / ~6% tg slower on the qwen35/gemma linear-attn layers).
-            const int gdn_dt = dev ? (int) ggml_backend_dev_type(dev) : (int) GGML_BACKEND_DEVICE_TYPE_CPU;
-            if (dev && (gdn_dt == (int) GGML_BACKEND_DEVICE_TYPE_GPU || gdn_dt == (int) GGML_BACKEND_DEVICE_TYPE_IGPU)) {
-                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-                const char * reg_name = ggml_backend_reg_name(reg);
-                if (reg_name && (strncmp(reg_name, "CUDA", 4) == 0 || strncmp(reg_name, "ROCm", 4) == 0)) {
-                    // HIP builds register as "ROCm": the fused-GDN path compiles and runs there
-                    // (validated on RDNA3, buun-llama-cpp#69) — the CUDA-only name check was
-                    // silently dropping AMD to the decomposed ops (~9% generation speed)
-                    have_cuda_gpu = true;
-                }
-                break;
+        if (ggml_backend_t gpu_backend = find_gpu_backend()) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu_backend));
+            const char * reg_name = ggml_backend_reg_name(reg);
+            if (reg_name && (strncmp(reg_name, "CUDA", 4) == 0 || strncmp(reg_name, "ROCm", 4) == 0)) {
+                // HIP builds register as "ROCm": the fused-GDN path compiles and runs there
+                // (validated on RDNA3, buun-llama-cpp#69) — the CUDA-only name check was
+                // silently dropping AMD to the decomposed ops (~9% generation speed)
+                have_cuda_gpu = true;
             }
         }
 
@@ -1461,6 +1453,9 @@ void llama_context::set_tape_recording(bool enable) {
     }
 }
 
+static llama_memory_recurrent * get_recurrent_mem(llama_memory_t mem);
+static bool dflash_states_on_one_device(const llama_hparams & hparams, llama_memory_recurrent * mem_recurrent);
+
 void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     if (!dflash_capture) {
         return;
@@ -1490,17 +1485,20 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
         return;
     }
 
-    // find GPU backend
-    ggml_backend_t gpu_backend = nullptr;
-    for (auto & backend : backends) {
-        auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) { // accept APU/IGPU (gfx1151 Strix Halo)
-            gpu_backend = backend.get();
-            break;
-        }
-    }
+    ggml_backend_t gpu_backend = find_gpu_backend();
     if (!gpu_backend) {
         return; // no GPU, fall back to CPU tape via eval callback
+    }
+
+    // Once a GPU tape exists, the eval callback stops capturing k/v/gate/beta on the CPU —
+    // so only allocate it when replay can actually use it (states on one non-host device,
+    // see llama_dflash_tape_replay_available). Otherwise fall back to the CPU tape, which
+    // captures everything the CPU replay needs.
+    {
+        auto * mem_recurrent = get_recurrent_mem(memory.get());
+        if (!mem_recurrent || !dflash_states_on_one_device(model.hparams, mem_recurrent)) {
+            return;
+        }
     }
 
     const auto & hparams = model.hparams;
@@ -1586,6 +1584,57 @@ void llama_context::set_active_dflash_slot(int slot_idx) {
     }
 }
 
+ggml_backend_t llama_context::find_gpu_backend() {
+    for (auto & backend : backends) {
+        auto * dev = ggml_backend_get_device(backend.get());
+        if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) { // accept APU/IGPU (gfx1151 Strix Halo)
+            return backend.get();
+        }
+    }
+    return nullptr;
+}
+
+// true iff every recurrent state buffer is resident on one non-host device — the
+// precondition for the GPU tape-replay graph (views into s_l, one compute backend)
+static bool dflash_states_on_one_device(const llama_hparams & hparams, llama_memory_recurrent * mem_recurrent) {
+    ggml_backend_dev_t first_dev = nullptr;
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        if (!hparams.is_recr(il)) {
+            continue;
+        }
+        ggml_tensor * s_tensor = mem_recurrent->s_l[il];
+        if (!s_tensor || !s_tensor->buffer) {
+            continue;
+        }
+        if (ggml_backend_buffer_is_host(s_tensor->buffer)) {
+            return false;
+        }
+        auto * buft = ggml_backend_buffer_get_type(s_tensor->buffer);
+        auto * dev  = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+        if (dev) {
+            if (!first_dev) {
+                first_dev = dev;
+            } else if (dev != first_dev) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool llama_context::tape_replay_available() {
+    if (!find_gpu_backend()) {
+        return false;
+    }
+
+    auto * mem_recurrent = get_recurrent_mem(memory.get());
+    if (!mem_recurrent) {
+        return false;
+    }
+
+    return dflash_states_on_one_device(model.hparams, mem_recurrent);
+}
+
 void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     if (!dflash_capture || n_accepted <= 0) {
         return;
@@ -1598,13 +1647,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         return;
     }
 
-    auto * mem_recurrent = dynamic_cast<llama_memory_recurrent *>(memory.get());
-    if (!mem_recurrent) {
-        auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
-        if (mem_hybrid) {
-            mem_recurrent = mem_hybrid->get_mem_recr();
-        }
-    }
+    auto * mem_recurrent = get_recurrent_mem(memory.get());
     if (!mem_recurrent) {
         LLAMA_LOG_WARN("%s: tape replay requires recurrent memory\n", __func__);
         return;
@@ -1630,14 +1673,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     const uint32_t n_embd_s = hparams.n_embd_s();
 
     // find a GPU backend for graph computation
-    ggml_backend_t gpu_backend = nullptr;
-    for (auto & backend : backends) {
-        auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) { // accept APU/IGPU (gfx1151 Strix Halo)
-            gpu_backend = backend.get();
-            break;
-        }
-    }
+    ggml_backend_t gpu_backend = find_gpu_backend();
 
     if (!gpu_backend) {
         tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
@@ -1648,33 +1684,18 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     // partial offload: if any recurrent layer's state lives on CPU, fall back to CPU replay
     // (GPU graph uses DeviceToDevice copies that crash when the state buffer is host memory)
     // Also detect multi-device splits — if states span GPUs, fall back to CPU replay.
-    {
-        ggml_backend_dev_t first_dev = nullptr;
-        bool has_host = false;
-        bool multi_device = false;
-        for (int li = 0; li < (int) rec_ids.size(); ++li) {
-            ggml_tensor * s_tensor = mem_recurrent->s_l[rec_ids[li]];
-            if (s_tensor && s_tensor->buffer && ggml_backend_buffer_is_host(s_tensor->buffer)) {
-                has_host = true;
-                break;
-            }
-            if (s_tensor && s_tensor->buffer) {
-                auto * buft = ggml_backend_buffer_get_type(s_tensor->buffer);
-                auto * dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
-                if (dev) {
-                    if (!first_dev) {
-                        first_dev = dev;
-                    } else if (dev != first_dev) {
-                        multi_device = true;
-                    }
-                }
-            }
-        }
-        if (has_host || multi_device) {
+    if (!dflash_states_on_one_device(hparams, mem_recurrent)) {
+        if (dflash_capture->active_tape()) {
+            // unreachable by construction: allocate_tape_gpu only creates the GPU tape when
+            // this same predicate holds, and states do not migrate afterwards. If it ever
+            // fires, k/v/gate/beta live only in the GPU tape — there is nothing for
+            // tape_replay_cpu to replay (see llama_dflash_tape_replay_available).
+            LLAMA_LOG_WARN("%s: GPU tape active but states are host/multi-device — GDN replay skipped, recurrent state will be stale\n", __func__);
+        } else {
             tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
-            tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
-            return;
         }
+        tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
+        return;
     }
 
     // GPU tape replay: build a ggml graph with GDN ops for all recurrent layers
@@ -2331,15 +2352,7 @@ void llama_context::tree_rollback(int commit_n, const int32_t * parents) {
 
     // Restore SSM state from f16 intermediates via GPU graph
     if (n_rec > 0) {
-        // Find GPU backend
-        ggml_backend_t gpu_backend = nullptr;
-        for (auto & backend : backends) {
-            auto * dev = ggml_backend_get_device(backend.get());
-            if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) { // accept APU/IGPU (gfx1151 Strix Halo)
-                gpu_backend = backend.get();
-                break;
-            }
-        }
+        ggml_backend_t gpu_backend = find_gpu_backend();
 
         size_t ctx_mem = ggml_tensor_overhead() * ((size_t)n_rec * 4 + 2) +
                          ggml_graph_overhead_custom(n_rec * 4, false);
@@ -5432,6 +5445,10 @@ void llama_dflash_set_active_slot(llama_context * ctx, int slot_idx) {
     ctx->set_active_dflash_slot(slot_idx);
 }
 
+bool llama_dflash_tape_replay_available(llama_context * ctx) {
+    return ctx->tape_replay_available();
+}
+
 void llama_tape_replay(llama_context * ctx, llama_seq_id seq_id, int n_accepted) {
     ctx->tape_replay(seq_id, n_accepted);
 }
@@ -5469,12 +5486,8 @@ struct dflash_cross_ring_handle {
 void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_size) {
     // find CUDA backend registry
     ggml_backend_reg_t cuda_reg = nullptr;
-    for (auto & backend : backends) {
-        auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) { // accept APU/IGPU (gfx1151 Strix Halo)
-            cuda_reg = ggml_backend_dev_backend_reg(dev);
-            break;
-        }
+    if (ggml_backend_t gpu_backend = find_gpu_backend()) {
+        cuda_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu_backend));
     }
     if (!cuda_reg) return nullptr;
 

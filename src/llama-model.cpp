@@ -399,6 +399,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         uint32_t il;
         std::string prefix;
+        // NOTE: the per-layer rotation spreads shard bytes evenly across devices regardless of
+        // tensor_split; common/fit.cpp's SPLIT_MODE_TENSOR capacity math (n_devs x the tightest
+        // device) assumes exactly this placement policy
         size_t rotation;
         if (tensor_name.substr(0, 4) == "blk.") {
             const size_t length_prefix = tensor_name.find('.', 4);
@@ -1686,6 +1689,12 @@ size_t llama_model::n_devices() const {
     return devices.size();
 }
 
+void llama_model::adopt_buffer(ggml_context_ptr ctx, ggml_backend_buffer_ptr buf) {
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.push_back(std::move(buf));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+}
+
 const float * llama_model::tensor_split() const {
     return params.tensor_split;
 }
@@ -2624,8 +2633,89 @@ float llama_model_rope_freq_scale_train(const llama_model * model) {
 }
 
 void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
-    dst->tok_embd = src->tok_embd;
-    dst->output   = src->output;
+    // a target tensor can be shared by pointer only if the drafter can schedule it: host
+    // buffers and buffers on one of the drafter's own devices. Meta (tensor-sharded)
+    // buffers and foreign devices (e.g. -sm layer target whose output.weight sits on the
+    // last GPU while the drafter is pinned elsewhere) need a materialized copy.
+    auto needs_copy = [dst](const ggml_tensor * t) {
+        if (t == nullptr || t->buffer == nullptr) {
+            return false;
+        }
+        if (ggml_backend_buffer_is_meta(t->buffer)) {
+            return true;
+        }
+        if (ggml_backend_buffer_is_host(t->buffer)) {
+            return false;
+        }
+        auto * buft = ggml_backend_buffer_get_type(t->buffer);
+        auto * dev  = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+        if (dev == nullptr) {
+            return false;
+        }
+        for (const auto & d : dst->devices) {
+            if (d.dev == dev) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const bool copy_embd = needs_copy(src->tok_embd);
+    const bool copy_out  = needs_copy(src->output);
+    if (!copy_embd && !copy_out) {
+        dst->tok_embd = src->tok_embd;
+        dst->output   = src->output;
+        return;
+    }
+
+    // materialize contiguous copies on the drafter's own device instead of sharing pointers
+    // (for meta buffers, get_tensor reassembles the canonical bytes across shards);
+    // schedulable tensors are still shared as-is. A device-less drafter gathers to host.
+    ggml_backend_buffer_type_t buft = dst->devices.empty()
+        ? ggml_backend_cpu_buffer_type()
+        : ggml_backend_dev_buffer_type(dst->devices[0].dev);
+
+    ggml_init_params ip = { /*.mem_size =*/ 2*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_context_ptr ctx_ptr { ggml_init(ip) };
+    ggml_context * ctx = ctx_ptr.get();
+
+    auto declare_copy = [&](const ggml_tensor * t) {
+        ggml_tensor * out = ggml_new_tensor(ctx, t->type, ggml_n_dims(t), t->ne);
+        ggml_set_name(out, t->name);
+        return out;
+    };
+    ggml_tensor * embd_cp = copy_embd ? declare_copy(src->tok_embd) : nullptr;
+    ggml_tensor * out_cp  = copy_out  ? declare_copy(src->output)   : nullptr;
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf == nullptr) {
+        GGML_ABORT("failed to allocate device-local tok_embd/output copies for the drafter "
+                   "(the target's tensors are not schedulable on the drafter device)");
+    }
+
+    auto gather = [&](const ggml_tensor * s, ggml_tensor * d) {
+        std::vector<uint8_t> host(ggml_nbytes(s));
+        ggml_backend_tensor_get(s, host.data(), 0, host.size());
+        ggml_backend_tensor_set(d, host.data(), 0, host.size());
+    };
+    if (embd_cp != nullptr) {
+        gather(src->tok_embd, embd_cp);
+    }
+    if (out_cp != nullptr) {
+        gather(src->output, out_cp);
+    }
+
+    dst->tok_embd = embd_cp != nullptr ? embd_cp : src->tok_embd;
+    dst->output   = out_cp  != nullptr ? out_cp  : src->output;
+
+    dst->adopt_buffer(std::move(ctx_ptr), ggml_backend_buffer_ptr(buf));
+
+    LLAMA_LOG_INFO("%s: target tensors not drafter-schedulable — gathered %s%s%s to %s (%.1f MiB)\n",
+            __func__,
+            embd_cp != nullptr ? "tok_embd" : "",
+            embd_cp != nullptr && out_cp != nullptr ? "+" : "",
+            out_cp  != nullptr ? "output" : "",
+            ggml_backend_buft_name(buft),
+            ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
 }
 
 int32_t llama_model_dflash_block_size(const llama_model * model) {
