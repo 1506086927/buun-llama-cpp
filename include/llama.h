@@ -1166,6 +1166,14 @@ extern "C" {
     // when multi-slot tape is in use. No-op for single-slot contexts.
     LLAMA_API void llama_dflash_set_active_slot(struct llama_context * ctx, int slot_idx);
 
+    // DFlash: true iff tape replay would run its lossless GPU path (same GDN kernel as
+    // the forward pass). Requires a GPU/IGPU-typed backend (tensor-split's meta backend
+    // is neither) and all recurrent states resident on a single non-host device. When
+    // false, callers should not record a tape: replay degrades to the CPU path, which
+    // cannot read the GPU tape and silently leaves rolled-back recurrent state stale —
+    // roll back by re-decoding the accepted tokens instead.
+    LLAMA_API bool llama_dflash_tape_replay_available(struct llama_context * ctx);
+
     // DFlash: replay tape data to reconstruct DeltaNet state after partial acceptance
     // Applies n_accepted tokens worth of state updates on CPU instead of full model re-eval
     // Must be called after restoring from backup (seq_cp) and before the next decode

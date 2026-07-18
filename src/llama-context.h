@@ -550,6 +550,11 @@ public:
     void allocate_tape_gpu(int n_slots, int max_tokens);
     void set_active_dflash_slot(int slot_idx);
 
+    // first GPU/IGPU-typed backend, or nullptr (tensor-split's meta backend is neither)
+    ggml_backend_t find_gpu_backend();
+
+    bool tape_replay_available();
+
     void tape_replay(llama_seq_id seq_id, int n_accepted);
     void tape_replay_sync();
     void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id = 0);

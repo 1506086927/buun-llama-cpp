@@ -1606,6 +1606,12 @@ private:
         needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
         is_diffusion = llama_model_is_diffusion(model_tgt);
 
+        dflash_tape_ok = llama_dflash_tape_replay_available(ctx_tgt);
+        if (needs_reeval && !dflash_tape_ok && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            SRV_INF("%s", "DFlash rollback: GPU tape replay unavailable (recurrent states on "
+                    "host or multiple devices) — partial accepts re-decode the accepted tokens\n");
+        }
+
         if (is_diffusion) {
             SRV_INF("%s", "diffusion model detected — enabling self-speculation\n");
         }
@@ -1945,6 +1951,8 @@ private:
 
         // Allocate DFlash per-slot tape + hidden buffers now that common_speculative_init
         // (run for slot 0 above) has created dflash_capture on the target context.
+        // Runs even when !dflash_tape_ok: the call also sizes the per-slot hidden-capture
+        // buffers, which every DFlash target needs (the unused tape itself is small).
         if (dflash_slots_cap > 0) {
             llama_dflash_allocate_slots(ctx_tgt, dflash_slots_cap);
         }
@@ -3596,6 +3604,9 @@ private:
 
     // DFlash tape recording armed for this cycle (turned off in post_cycle())
     bool dflash_tape_active = false;
+    // target can replay the tape losslessly on GPU after a partial accept; when false,
+    // no tape is recorded and rollback re-decodes the accepted tokens instead
+    bool dflash_tape_ok = false;
     // pure-TG batch → multi-seq ubatch allowed (force_split_seq restored in post_cycle())
     bool can_batch_multiseq = false;
 // #define DEBUG_TIMINGS
@@ -4588,13 +4599,14 @@ private:
 
         // DFlash: enable tape recording if any slot has draft backup (needs tape replay for rollback);
         // turned off in post_cycle() so recording stays active across ALL sub-batches
-        // Not under --split-mode tensor: the meta backend exposes no GPU-typed backend, so tape
-        // capture degrades to CPU eval-callback reads of head-sharded mid-GDN tensors, which the
-        // meta get_tensor chunk splicer cannot represent (asserts or garbage → corrupted replay
-        // state, worse with draft depth). TP rollback re-decodes accepted tokens instead.
+        // Only when GPU tape replay is available. Otherwise — tensor-split meta target (no
+        // GPU-typed backend, capture reads head-sharded mid-GDN tensors the meta get_tensor
+        // chunk splicer cannot represent), layer split across GPUs, or partial offload —
+        // capture/replay degrades to CPU paths that are lossy or silently skip the GDN state,
+        // so rollback re-decodes the accepted tokens instead (partial-accept branch below).
         dflash_tape_active = needs_reeval
             && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH
-            && params_base.split_mode != LLAMA_SPLIT_MODE_TENSOR
+            && dflash_tape_ok
             && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.has_draft_backup; });
         if (dflash_tape_active) {
             llama_set_tape_recording(ctx_tgt, true);
@@ -5037,37 +5049,18 @@ private:
                 const llama_seq_id seq_backup = slot.seq_id_backup;
                 const bool all_accepted = (ids.size() == n_draft + 1);
 
-                if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                const bool is_dflash = params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH;
+                if (is_dflash) {
                     llama_dflash_set_active_slot(ctx_tgt, slot.id);
-                    if (all_accepted) {
-                        llama_clear_tree_parent_ids(ctx_tgt);
-                        auto * mem = llama_get_memory(ctx_tgt);
-                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                        llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
-                    } else if (params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-                        // tensor-split target records no tape (see dflash_tape_active) — restore
-                        // from backup and re-decode the accepted tokens (exact, replay-free)
-                        llama_clear_tree_parent_ids(ctx_tgt);
-                        auto * mem = llama_get_memory(ctx_tgt);
-                        const int n_past_before = slot.n_tokens_before_draft;
-                        llama_memory_seq_rm(mem, slot.id, n_past_before, -1);
-                        llama_memory_seq_cp(mem, seq_backup, slot.id, -1, -1);
-                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                        const int n_reeval = slot.prompt.n_tokens() - n_past_before;
-                        if (n_reeval > 0) {
-                            llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
-                            const auto & toks = slot.prompt.tokens.get_text_tokens();
-                            for (int j = n_past_before; j < slot.prompt.n_tokens(); ++j) {
-                                common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
-                            }
-                            llama_decode(ctx_tgt, batch_reeval);
-                            llama_batch_free(batch_reeval);
-                        }
-                    } else {
-                        llama_clear_tree_parent_ids(ctx_tgt);
-                        llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_tokens_before_draft, (int) ids.size());
-                    }
+                    llama_clear_tree_parent_ids(ctx_tgt);
+                }
+
+                if (is_dflash && !all_accepted && dflash_tape_ok) {
+                    // lossless GPU tape replay of the accepted tokens' GDN state updates
+                    llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_tokens_before_draft, (int) ids.size());
                 } else {
+                    // no tape recorded (see dflash_tape_active) or non-DFlash drafter:
+                    // restore from backup and re-decode the accepted tokens (exact, replay-free)
                     auto * mem = llama_get_memory(ctx_tgt);
 
                     if (all_accepted) {
