@@ -29,6 +29,21 @@ extern "C" {
 // unmapped after tier degrades. Nothing ever relocates.
 struct ggml_vbr_vmm_pool;
 
+// #88: which sides the flash-attention f16 dequant scratch serves for a (K,V) type pair —
+// the SINGLE authoritative copy of the materialize condition, consumed by the fattn
+// prefill/decode paths AND by the KV cache's boundary scratch reserve/estimator. Turbo tiers
+// always materialize; q8_0/bf16 only next to a turbo partner (the mixed pair must become
+// (F16,F16)); f16 never does. Drift between the kernels and the reserve would re-open the
+// mid-decode abort this predicate exists to prevent — edit HERE only. (Decode additionally
+// dequants q8_0/bf16 at head dims > 256; that term stays local to fattn.cu, ANDed on top.)
+static inline void ggml_vbr_kv_dequant_sides(enum ggml_type tk, enum ggml_type tv,
+                                             bool * need_k, bool * need_v) {
+    const bool turbo_k = ggml_is_turbo_kv_type(tk);
+    const bool turbo_v = ggml_is_turbo_kv_type(tv);
+    *need_k = turbo_k || ((tk == GGML_TYPE_Q8_0 || tk == GGML_TYPE_BF16) && turbo_v);
+    *need_v = turbo_v || ((tv == GGML_TYPE_Q8_0 || tv == GGML_TYPE_BF16) && turbo_k);
+}
+
 // Dynamic VBR: transcode the first n_cells rows of a turbo KV tensor (src) to a lower turbo tier
 // (type_B), writing into dst (a region of the KV pool buffer; == src->data for the in-place
 // degrade). src->name must be the cache tensor name (cache_k_l<L> / cache_v_l<L>) so the encoder

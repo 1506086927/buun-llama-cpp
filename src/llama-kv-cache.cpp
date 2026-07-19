@@ -146,17 +146,6 @@ static std::vector<llama_vbr_dev> llama_vbr_backend_devs_for_buft(ggml_backend_b
     return ret;
 }
 
-// #88: which sides the fattn f16 dequant scratch serves for a (K,V) type pair — mirrors the
-// prefill/decode materialize conditions in ggml-cuda/fattn.cu (turbo tiers always; q8_0/bf16
-// only when paired with a turbo side, where the mixed pair is dequanted to (F16,F16)). F16
-// never materializes.
-static void llama_kv_scratch_sides(ggml_type tk, ggml_type tv, bool & need_k, bool & need_v) {
-    const bool turbo_k = ggml_is_turbo_kv_type(tk);
-    const bool turbo_v = ggml_is_turbo_kv_type(tv);
-    need_k = turbo_k || ((tk == GGML_TYPE_Q8_0 || tk == GGML_TYPE_BF16) && turbo_v);
-    need_v = turbo_v || ((tv == GGML_TYPE_Q8_0 || tv == GGML_TYPE_BF16) && turbo_k);
-}
-
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -1221,17 +1210,13 @@ llama_kv_cache::llama_kv_cache(
                         p.size = ggml_backend_buffer_get_size(inst->buffer);
                         // #88: even bookkeeping-only (static, non-VMM) pools need the backend
                         // vtable + device ordinal for the boundary-time dequant-scratch reserve.
-                        // nullptr on backends without turbo support — those pools' types can
-                        // never be turbo, and the reserve loop skips them.
-                        ggml_backend_buffer_type_t pbft = ggml_backend_buffer_get_type(inst->buffer);
-                        p.be = llama_vbr_backend_iface_for_buft(pbft);
-                        if (p.be != nullptr) {
-                            for (int j = 0; j < p.be->get_device_count(); ++j) {
-                                if (p.be->buffer_type(j) == pbft) {
-                                    p.device = j;
-                                    break;
-                                }
-                            }
+                        // inst is always a simple (non-meta) buffer here, so the resolver
+                        // returns 0 or 1 entries; empty (no turbo support) leaves be null and
+                        // the reserve loop skips the pool — its types can never be turbo anyway.
+                        const auto pdevs = llama_vbr_backend_devs_for_buft(ggml_backend_buffer_get_type(inst->buffer));
+                        if (!pdevs.empty()) {
+                            p.be     = pdevs[0].be;
+                            p.device = pdevs[0].device;
                         }
                         vbr_pools_.push_back(std::move(p));
                     }
@@ -1958,11 +1943,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // ensure_mapped so no later page map can be ripped by a stale queued unmap.
         vbr_flush_deferred_unmaps();
     }
+    // one ubatch token sum serves both the budget block and the scratch reserve below
+    uint32_t n_tokens = 0;
+    for (const auto & ub : ubatches) {
+        n_tokens += ub.n_tokens;
+    }
     if (vbr_vmm_active() && vbr_budget_bytes_ > 0) {
-        uint32_t n_tokens = 0;
-        for (const auto & ub : ubatches) {
-            n_tokens += ub.n_tokens;
-        }
         // sink-stash staleness: if any sink cell was freed since capture, every stash may hold
         // another request's rows — drop them all (they recapture at the next first degrade)
         if (vbr_stash_dirty_) {
@@ -2096,11 +2082,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     // every turbo-typed cache (bookkeeping pools exist even without the dynamic controller);
     // non-turbo caches have no pools and skip in O(1).
     if (!vbr_pools_.empty()) {
-        uint32_t n_tokens_scr = 0;
-        for (const auto & ub : ubatches) {
-            n_tokens_scr += ub.n_tokens;
-        }
-        if (!vbr_scratch_reserve(vbr_watermark_cells(n_tokens_scr))) {
+        if (!vbr_scratch_reserve(vbr_watermark_cells(n_tokens))) {
             LLAMA_LOG_ERROR("%s: f16 dequant scratch reserve failed (device memory exhausted) — "
                     "failing this batch recoverably\n", __func__);
             return {};
@@ -2708,25 +2690,29 @@ bool llama_kv_cache::vbr_scratch_reserve(uint32_t wm_cells) {
         if (p.be == nullptr || p.device < 0) {
             continue;
         }
-        size_t k_bytes = 0;
-        size_t v_bytes = 0;
-        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-            const ggml_tensor * tk = p.k[ikv].t;
-            const ggml_tensor * tv = p.v[ikv].t;
-            if (tk == nullptr && tv == nullptr) {
-                continue;
+        // active-side row maxima change only on a tier flip — memoize on the tier epoch so the
+        // per-boundary cost is two multiplies (static caches compute this exactly once)
+        if (p.scratch_rows_epoch != vbr_tier_epoch_) {
+            p.scratch_k_row = 0;
+            p.scratch_v_row = 0;
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                const ggml_tensor * tk = p.k[ikv].t;
+                const ggml_tensor * tv = p.v[ikv].t;
+                bool need_k = false;
+                bool need_v = false;
+                ggml_vbr_kv_dequant_sides(tk ? tk->type : GGML_TYPE_F16,
+                                          tv ? tv->type : GGML_TYPE_F16, &need_k, &need_v);
+                if (need_k && tk) {
+                    p.scratch_k_row = std::max(p.scratch_k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
+                }
+                if (need_v && tv) {
+                    p.scratch_v_row = std::max(p.scratch_v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
+                }
             }
-            bool need_k = false;
-            bool need_v = false;
-            llama_kv_scratch_sides(tk ? tk->type : GGML_TYPE_F16,
-                                   tv ? tv->type : GGML_TYPE_F16, need_k, need_v);
-            if (need_k && tk) {
-                k_bytes = std::max(k_bytes, ggml_row_size(GGML_TYPE_F16, tk->ne[0]) * wm_cells);
-            }
-            if (need_v && tv) {
-                v_bytes = std::max(v_bytes, ggml_row_size(GGML_TYPE_F16, tv->ne[0]) * wm_cells);
-            }
+            p.scratch_rows_epoch = vbr_tier_epoch_;
         }
+        const size_t k_bytes = p.scratch_k_row * wm_cells;
+        const size_t v_bytes = p.scratch_v_row * wm_cells;
         if (k_bytes == 0 && v_bytes == 0) {
             continue;
         }
@@ -3122,60 +3108,43 @@ double llama_kv_cache::memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggm
     if (layers.empty()) {
         return 0.0;
     }
+    // Project each side to its SETTLED (deep-fill) type, then ask the one authoritative
+    // materialize predicate (ggml-vbr.h): the only genuine difference between "settled active"
+    // and "currently active" is that an unpinned dynamic f16 side will leave f16 under pressure
+    // — represent it by any turbo tier and let the predicate own the pairing rules.
     const double floor_eff = vbr_resolve_floor_bpv(floor_bpv);
-    auto side_settles_active = [&](ggml_type t0, bool pinned) -> bool {
-        if (ggml_is_turbo_kv_type(t0)) {
-            return true; // dequant-active from token 0
-        }
+    auto settled_type = [&](ggml_type t0, bool pinned) -> ggml_type {
         if (t0 == GGML_TYPE_F16 && !pinned && vbr_params_.dynamic && floor_eff < 16.0 - 1e-9) {
-            return true; // degrades off f16 under pressure
+            return GGML_TYPE_TURBO8_0; // representative: degrades off f16 under pressure
         }
-        return false;
+        return t0;
     };
     const ggml_type ek = entry_k != GGML_TYPE_COUNT ? entry_k
                        : (layers[0].k ? layers[0].k->type : GGML_TYPE_F16);
     const ggml_type ev = entry_v != GGML_TYPE_COUNT ? entry_v
                        : (layers[0].v ? layers[0].v->type : GGML_TYPE_F16);
-    bool ak = side_settles_active(ek, vbr_params_.pin_k);
-    bool av = side_settles_active(ev, vbr_params_.pin_v);
-    // mixed q8_0/bf16 corner: those sides only materialize next to a turbo partner
-    ak = ak || ((ek == GGML_TYPE_Q8_0 || ek == GGML_TYPE_BF16) && av);
-    av = av || ((ev == GGML_TYPE_Q8_0 || ev == GGML_TYPE_BF16) && ak);
+    bool ak = false;
+    bool av = false;
+    ggml_vbr_kv_dequant_sides(settled_type(ek, vbr_params_.pin_k),
+                              settled_type(ev, vbr_params_.pin_v), &ak, &av);
     if (!ak && !av) {
         return 0.0;
     }
-    // per-device (per-pool) widest f16 row per active side; pools exist for every turbo-capable
-    // config. Dry no-pool contexts (fit probe before allocation) fall back to the canonical
-    // layer tensors as one device — the fit runs single-device dry loads.
-    double total = 0.0;
-    if (!vbr_pools_.empty()) {
-        for (const auto & p : vbr_pools_) {
-            size_t k_row = 0;
-            size_t v_row = 0;
-            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-                if (p.k[ikv].t != nullptr) {
-                    k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, p.k[ikv].t->ne[0]));
-                }
-                if (p.v[ikv].t != nullptr) {
-                    v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, p.v[ikv].t->ne[0]));
-                }
-            }
-            total += (ak ? (double) k_row : 0.0) + (av ? (double) v_row : 0.0);
+    // Widest f16 row per active side over the canonical layer tensors — a SINGLE-DEVICE basis:
+    // the only caller is the fit's no_alloc dry-load context, where pools are never built and
+    // the dry load is single-device. (A live multi-device caller would need per-pool scratch
+    // sums; deliberately not built for a dead path.)
+    size_t k_row = 0;
+    size_t v_row = 0;
+    for (const auto & L : layers) {
+        if (L.k != nullptr) {
+            k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, L.k->ne[0]));
         }
-    } else {
-        size_t k_row = 0;
-        size_t v_row = 0;
-        for (const auto & L : layers) {
-            if (L.k != nullptr) {
-                k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, L.k->ne[0]));
-            }
-            if (L.v != nullptr) {
-                v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, L.v->ne[0]));
-            }
+        if (L.v != nullptr) {
+            v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, L.v->ne[0]));
         }
-        total = (ak ? (double) k_row : 0.0) + (av ? (double) v_row : 0.0);
     }
-    return total;
+    return (ak ? (double) k_row : 0.0) + (av ? (double) v_row : 0.0);
 }
 
 // --vbr-floor (cparams min_bits; env VBR_MIN_BITS override, decimal bits/value): a LITERAL

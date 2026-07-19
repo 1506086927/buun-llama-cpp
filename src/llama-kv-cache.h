@@ -327,6 +327,11 @@ private:
         int      device      = -1;                // backend device ordinal backing the pool
         size_t   gran        = 0;                 // page granularity
         size_t   mapped_base = 0;                 // bytes mapped up front (rotation matrices)
+        // #88 scratch-reserve memo: widest f16 row per dequant-active side, valid while no tier
+        // flips (keyed on vbr_tier_epoch_; ~0 forces the first compute)
+        uint64_t scratch_rows_epoch = ~0ull;
+        size_t   scratch_k_row      = 0;
+        size_t   scratch_v_row      = 0;
         // per-device transcode side stream (lazy) + S5 overlap state: transcodes run async on
         // backend's stream; the next decode graph GPU-waits via the armed per-device fence
         // (be->fence_arm). Tail pages a transcode may still READ (rA extent >
