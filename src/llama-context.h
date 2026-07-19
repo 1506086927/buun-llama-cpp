@@ -68,6 +68,7 @@ struct dflash_tape_gpu_layer {
     ggml_tensor * v    = nullptr;  // [S_v, H_v, max_tokens]
     ggml_tensor * gate = nullptr;  // [1, H_v, max_tokens]
     ggml_tensor * beta = nullptr;  // [1, H_v, max_tokens]
+    ggml_tensor * qkv  = nullptr;  // [conv_channels, max_tokens] (conv rebuild staging; null = eval-callback capture)
 };
 
 struct dflash_tape_gpu {
@@ -120,6 +121,9 @@ struct dflash_capture_data {
     // byte-identical to the pre-multi-slot singleton.
     std::vector<std::unique_ptr<dflash_tape_gpu>> tapes;
     int active_tape_idx = 0;
+    // set when the meta-path shard-consistency check rejected the tape (unusual
+    // --tensor-split ratios) — capability then reports false instead of re-probing
+    bool tape_meta_failed = false;
 
     // Active ubatch for the in-flight process_ubatch() call. The eval callback
     // reads ubatch->n_seqs_unq / ubatch->seq_id to route hidden-state captures
@@ -171,8 +175,13 @@ struct dflash_capture_data {
 
     // async tape replay state (GDN launched, waiting for sync before conv rebuild)
     bool replay_pending = false;
-    ggml_backend_t replay_gpu_backend = nullptr;
+    ggml_backend_t replay_gpu_backend = nullptr;  // meta backend under --split-mode tensor (sync fans out)
     ggml_context * replay_graph_ctx = nullptr;
+
+    // per-device replay resources for the meta (tensor-split) path: one graph context and
+    // one intermediate buffer per simple device, freed/reused in tape_replay_sync
+    std::vector<ggml_context *> replay_meta_ctxs;
+    std::vector<ggml_backend_buffer_t> replay_meta_bufs;
     int replay_n_accepted = 0;
     int32_t replay_cell_idx = -1;
     llama_seq_id replay_seq_id = 0;
@@ -181,6 +190,12 @@ struct dflash_capture_data {
     ~dflash_capture_data() {
         if (replay_graph_ctx) {
             ggml_free(replay_graph_ctx);
+        }
+        for (auto * ctx : replay_meta_ctxs) {
+            ggml_free(ctx);
+        }
+        for (auto * buf : replay_meta_bufs) {
+            ggml_backend_buffer_free(buf);
         }
         if (replay_buf) {
             ggml_backend_buffer_free(replay_buf);
@@ -573,10 +588,13 @@ public:
     void set_tape_recording(bool enable);
     void allocate_tape_gpu(int max_tokens) { allocate_tape_gpu(1, max_tokens); }
     void allocate_tape_gpu(int n_slots, int max_tokens);
+    void tape_replay_meta(ggml_backend_t meta_backend, llama_memory_recurrent * mem_recurrent,
+                          int32_t cell_idx, int n_accepted, llama_seq_id seq_id);
     void set_active_dflash_slot(int slot_idx);
 
     // first GPU/IGPU-typed backend, or nullptr (tensor-split's meta backend is neither)
     ggml_backend_t find_gpu_backend();
+    ggml_backend_t find_meta_backend();
 
     bool tape_replay_available();
 
