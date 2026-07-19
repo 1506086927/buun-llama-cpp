@@ -79,6 +79,12 @@ struct dflash_tape_gpu {
     int max_tokens = 0;                         // allocated capacity
     int n_tokens = 0;                           // actual tokens recorded this pass
 
+    // qkv is graph-staged for this tape (single-seq staged decodes bypass the eval
+    // callback entirely) — the one predicate every staging consumer must agree on
+    bool qkv_staged() const {
+        return !layers.empty() && layers[0].qkv != nullptr;
+    }
+
     ~dflash_tape_gpu() {
         if (buf) ggml_backend_buffer_free(buf);
         if (ctx) ggml_free(ctx);
@@ -159,6 +165,20 @@ struct dflash_capture_data {
                    : nullptr;
     }
 
+    // true iff a staged decode fully covers every eval-callback ask (hiddens graph-staged,
+    // GPU tape k/v/g/b graph-copied, qkv graph-staged) — the callback can go dormant for
+    // this decode. Must mirror the ask-paths in dflash_eval_callback.
+    bool eval_callback_dormant() const {
+        if (!stage_active) {
+            return false;
+        }
+        if (!tape_enabled) {
+            return true;
+        }
+        dflash_tape_gpu * tg = active_tape();
+        return tg && tg->qkv_staged();
+    }
+
     std::vector<dflash_layer_hidden_buf> * slot_hiddens(int slot) const {
         if (!hiddens || slot < 0 || slot >= (int) hiddens->size()) {
             return nullptr;
@@ -182,10 +202,12 @@ struct dflash_capture_data {
     ggml_backend_t replay_gpu_backend = nullptr;  // meta backend under --split-mode tensor (sync fans out)
     ggml_context * replay_graph_ctx = nullptr;
 
-    // per-device replay resources for the meta (tensor-split) path: one graph context and
-    // one intermediate buffer per simple device, freed/reused in tape_replay_sync
+    // per-device replay resources for the meta (tensor-split) path: graph contexts are
+    // per-rollback (freed in tape_replay_sync); the intermediate buffers are persistent
+    // grow-only scratch per simple device (same scheme as replay_buf above)
     std::vector<ggml_context *> replay_meta_ctxs;
     std::vector<ggml_backend_buffer_t> replay_meta_bufs;
+    std::vector<size_t> replay_meta_buf_sizes;
     int replay_n_accepted = 0;
     int32_t replay_cell_idx = -1;
     llama_seq_id replay_seq_id = 0;

@@ -92,15 +92,13 @@ struct llama_cparams {
     int tape_gpu_n_seqs = 0;
 
     // DFlash GPU capture staging: graph-embedded copies of each captured layer's l_out
-    // into capture_stage[i] (one [n_embd, capture_stage_max_tokens] tensor per entry of
-    // dflash_capture_layers, same order). When capture_stage_active is set for the
-    // in-flight ubatch, the graph builder (llm_graph_context::cb) embeds the copies and
-    // the eval callback skips those layers entirely — no per-layer graph chop, no
-    // device→host round-trip. The decode loop toggles capture_stage_active per ubatch
-    // (single-seq, whole-batch-in-one-ubatch decodes only).
+    // into capture_stage[i] (one [n_embd, max_tokens] tensor per entry of
+    // dflash_capture_layers, same order; capacity = the tensor's ne[1]). Non-null iff
+    // staging covers the in-flight ubatch: the graph builder (llm_graph_context::cb)
+    // then embeds the copies and the eval callback skips those layers entirely — no
+    // per-layer graph chop, no device→host round-trip. The decode loop toggles this
+    // per ubatch (single-seq, whole-batch-in-one-ubatch decodes only).
     ggml_tensor ** capture_stage = nullptr;
-    int capture_stage_max_tokens = 0;
-    bool capture_stage_active = false;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;

@@ -2643,6 +2643,8 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     // true when D2D staged writes have bypassed the host ring since the last
     // sync_cpu_ring_from_gpu() (checkpoint save rebuilds the host mirror lazily)
     bool cpu_ring_stale = false;
+    int staged_since_sync = 0;      // D2D-written tokens not yet mirrored to the host ring
+    std::vector<float> sync_tmp;    // scratch for sync_cpu_ring_from_gpu (avoid per-call alloc)
 
     // Adaptive draft length tracking
     int n_low_accept = 0;
@@ -3201,50 +3203,47 @@ private:
     }
 
     void ring_write(int n_tokens, int src_offset = 0) {
-        int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
-        // GPU-staged capture: the data never touched the host — D2D it into the ring.
-        // Staging is only enabled when the GPU ring + D2D proc exist (see ctor), and a
-        // staged decode is always single-ubatch, so all layers share one token count.
-        {
-            const void * dev_ptr = nullptr;
-            int staged = llama_dflash_capture_stage_get(ctx_tgt, 0, &dev_ptr);
-            if (staged > 0) {
+        const void * dev_ptr = nullptr;
+        const int staged = llama_dflash_capture_stage_get(ctx_tgt, 0, &dev_ptr);
+        if (staged > 0) {
+            // GPU-staged capture: the data never touched the host — D2D it into the ring.
+            // Staging is only enabled when the GPU ring + D2D proc exist (see ctor), and a
+            // staged decode is always single-ubatch, so all layers share one token count.
+            const int to_write = std::min(n_tokens, staged - src_offset);
+            if (to_write > 0) {
                 llama_synchronize(ctx_tgt); // staging is written by the decode graph
-                const int to_write = std::min(n_tokens, staged - src_offset);
-                for (int layer = 0; layer < n_target_layers && to_write > 0; ++layer) {
-                    if (llama_dflash_capture_stage_get(ctx_tgt, layer, &dev_ptr) < staged) {
-                        continue;
-                    }
-                    int gpu_pos = ring_write_pos % ctx_window;
+                const int gpu_pos = ring_write_pos % ctx_window;
+                const size_t src_off_bytes = (size_t) src_offset * n_embd * sizeof(float);
+                for (int layer = 0; layer < n_target_layers; ++layer) {
+                    llama_dflash_capture_stage_get(ctx_tgt, layer, &dev_ptr);
                     llama_dflash_cross_ring_gpu_write_d2d(gpu_ring_handle, layer, gpu_pos,
-                        (const uint8_t *)dev_ptr + (size_t)src_offset * n_embd * sizeof(float),
-                        to_write, n_embd);
+                        (const uint8_t *)dev_ptr + src_off_bytes, to_write, n_embd);
                 }
                 cpu_ring_stale = true; // host mirror rebuilt lazily at checkpoint save
-                ring_write_pos = (ring_write_pos + n_tokens) % RING_SIZE;
-                ring_filled = std::min(ring_filled + n_tokens, RING_SIZE);
-                return;
+                staged_since_sync += to_write;
             }
-        }
-        for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
-            float * data = llama_get_layer_hidden(ctx_tgt, layer);
-            int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
-            int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
-            if (!data || ntok <= 0) continue;
+        } else {
+            const int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
+            for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
+                float * data = llama_get_layer_hidden(ctx_tgt, layer);
+                int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
+                int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
+                if (!data || ntok <= 0) continue;
 
-            int to_write = std::min(n_tokens, (int)ntok - src_offset);
-            for (int t = 0; t < to_write; ++t) {
-                int slot = (ring_write_pos + t) % RING_SIZE;
-                memcpy(ring_buf[layer].data() + (size_t)slot * embd,
-                       data + (size_t)(src_offset + t) * embd,
-                       embd * sizeof(float));
-            }
+                int to_write = std::min(n_tokens, (int)ntok - src_offset);
+                for (int t = 0; t < to_write; ++t) {
+                    int slot = (ring_write_pos + t) % RING_SIZE;
+                    memcpy(ring_buf[layer].data() + (size_t)slot * embd,
+                           data + (size_t)(src_offset + t) * embd,
+                           embd * sizeof(float));
+                }
 
-            // GPU ring upload (capture buffer is contiguous, write fn handles wrap)
-            if (gpu_ring_handle && to_write > 0) {
-                int gpu_pos = ring_write_pos % ctx_window;
-                llama_dflash_cross_ring_gpu_write(gpu_ring_handle, layer, gpu_pos,
-                    data + (size_t)src_offset * embd, to_write, embd);
+                // GPU ring upload (capture buffer is contiguous, write fn handles wrap)
+                if (gpu_ring_handle && to_write > 0) {
+                    int gpu_pos = ring_write_pos % ctx_window;
+                    llama_dflash_cross_ring_gpu_write(gpu_ring_handle, layer, gpu_pos,
+                        data + (size_t)src_offset * embd, to_write, embd);
+                }
             }
         }
         ring_write_pos = (ring_write_pos + n_tokens) % RING_SIZE;
@@ -3258,21 +3257,29 @@ private:
         if (!cpu_ring_stale || !gpu_ring_handle) {
             return;
         }
-        int entries = std::min(ring_filled, ctx_window);
-        std::vector<float> tmp((size_t)entries * n_embd);
+        // only the tokens D2D-written since the last sync are stale on the host —
+        // older window entries kept their host copies (delta read, not full window)
+        const int entries = std::min({ring_filled, ctx_window, staged_since_sync});
+        if (entries <= 0) {
+            cpu_ring_stale = false;
+            staged_since_sync = 0;
+            return;
+        }
+        sync_tmp.resize((size_t)entries * n_embd);
+        const int gpu_pos = ((ring_write_pos - entries) % ctx_window + ctx_window) % ctx_window;
         for (int l = 0; l < n_target_layers; ++l) {
-            int gpu_pos = ((ring_write_pos - entries) % ctx_window + ctx_window) % ctx_window;
-            if (!llama_dflash_cross_ring_gpu_read(gpu_ring_handle, l, gpu_pos, tmp.data(), entries, n_embd)) {
+            if (!llama_dflash_cross_ring_gpu_read(gpu_ring_handle, l, gpu_pos, sync_tmp.data(), entries, n_embd)) {
                 return; // proc unavailable — leave stale host data rather than corrupt it
             }
             for (int t = 0; t < entries; ++t) {
                 int cpu_slot = (ring_write_pos - entries + t + RING_SIZE) % RING_SIZE;
                 memcpy(ring_buf[l].data() + (size_t)cpu_slot * n_embd,
-                       tmp.data() + (size_t)t * n_embd,
+                       sync_tmp.data() + (size_t)t * n_embd,
                        n_embd * sizeof(float));
             }
         }
         cpu_ring_stale = false;
+        staged_since_sync = 0;
     }
 
     // called after initial prefill — grab all hidden states

@@ -363,10 +363,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const std::regex pattern_s_cache         ("cache_s_l\\d*");
     // DFlash GDN rollback tape (llama_context::allocate_tape_gpu): shards must line up
     // with the GDN input tensors the graph-embedded copies slice from — k plain per-head,
-    // v/gate/beta in qwen35's k-group-interleaved v-head order, qkv in conv channel layout
-    const std::regex pattern_tape_k          ("dflash_tape_k_l\\d+");
-    const std::regex pattern_tape_vgb        ("dflash_tape_(v|g|b)_l\\d+");
-    const std::regex pattern_tape_qkv        ("dflash_tape_qkv_l\\d+");
+    // v/gate/beta in qwen35's k-group-interleaved v-head order, qkv in conv channel layout.
+    // static: this callback runs per tensor on every split-state cache rebuild — don't
+    // recompile the NFAs each call
+    static const std::regex pattern_tape_k   ("dflash_tape_k_l\\d+");
+    static const std::regex pattern_tape_vgb ("dflash_tape_(v|g|b)_l\\d+");
+    static const std::regex pattern_tape_qkv ("dflash_tape_qkv_l\\d+");
     const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
@@ -415,13 +417,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             prefix = tensor_name.substr(0, length_prefix + 1);
             il = std::stoull(tensor_name.substr(4, length_prefix));
             rotation = get_il_eff(il) % ud->n_devices;
-        } else if (tensor_name.substr(0, 6) == "cache_") {
-            const size_t layer_index_start = tensor_name.find("_l", 6);
-            GGML_ASSERT(layer_index_start != std::string::npos);
-            il = std::stoull(tensor_name.substr(layer_index_start + 2));
-            prefix = "blk." + std::to_string(il) + ".";
-            rotation = get_il_eff(il) % ud->n_devices;
-        } else if (tensor_name.substr(0, 12) == "dflash_tape_") {
+        } else if (tensor_name.substr(0, 6) == "cache_" || tensor_name.substr(0, 12) == "dflash_tape_") {
             const size_t layer_index_start = tensor_name.rfind("_l");
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
