@@ -3268,6 +3268,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    // Staged DFlash decodes answer every eval-callback ask with "no" (hiddens are
+    // graph-staged, GPU tape k/v/g/b are graph-copied, qkv is graph-staged). A set
+    // sched callback still forces chunked execution with a full backend synchronize
+    // per chunk (ggml-backend.cpp compute_splits), so install a null callback for
+    // fully-covered decodes and restore it otherwise. Set on both reuse and rebuild
+    // paths — the sched retains the previous value across calls.
+    if (cparams.cb_eval == dflash_eval_callback && dflash_capture) {
+        bool cb_dormant = false;
+        if (dflash_capture->stage_active) {
+            const auto * tg = dflash_capture->active_tape();
+            const bool qkv_staged = tg && !tg->layers.empty() && tg->layers[0].qkv != nullptr;
+            cb_dormant = !dflash_capture->tape_enabled || qkv_staged;
+        }
+        ggml_backend_sched_set_eval_callback(sched.get(),
+                cb_dormant ? nullptr : cparams.cb_eval,
+                cb_dormant ? nullptr : cparams.cb_eval_user_data);
+    }
+
     // set the input data for the input tensors
     {
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
