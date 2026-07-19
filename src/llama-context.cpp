@@ -1653,8 +1653,8 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     size_t total_size = 0;
 
     for (int slot = 0; slot < n_slots; ++slot) {
-        // allocate ggml context for this slot's tensor descriptors
-        size_t ctx_mem = ggml_tensor_overhead() * (n_rec * 4 + 2);
+        // allocate ggml context for this slot's tensor descriptors (k/v/gate/beta + qkv staging)
+        size_t ctx_mem = ggml_tensor_overhead() * (n_rec * 5 + 2);
         struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
         struct ggml_context * tape_ctx = ggml_init(ctx_params);
 
