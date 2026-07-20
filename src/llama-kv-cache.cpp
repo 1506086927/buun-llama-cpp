@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-vram-demand.h"
 #include "llama-vram-ledger.h"
 
 #include <algorithm>
@@ -1066,6 +1067,16 @@ llama_kv_cache::llama_kv_cache(
             p.device      = device;
             p.gran        = gran;
             p.mapped_base = be->vmm_pool_mapped(pool);
+            // co-tenancy: resolve the PCI bus id eagerly — p.backend stays null until the
+            // first degrade wave arms the side stream, far too late for marker publication
+            p.busid = "-";
+            if (ggml_backend_dev_t bdev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b))) {
+                ggml_backend_dev_props bprops;
+                ggml_backend_dev_get_props(bdev, &bprops);
+                if (bprops.device_id != nullptr) {
+                    p.busid = bprops.device_id;
+                }
+            }
             vbr_pools_.push_back(std::move(p));
             LLAMA_LOG_INFO("%s: VBR VMM pool #%zu: %.2f MiB VA reserved (device %d, %zu KiB pages), %.2f MiB mapped up front\n",
                     __func__, vbr_pools_.size() - 1, va_size/1024.0/1024.0, device, gran/1024,
@@ -1139,6 +1150,25 @@ llama_kv_cache::llama_kv_cache(
         }
         if (buf == nullptr && !hparams.no_alloc) {
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            if (buf == nullptr) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    // co-tenancy: third load-phase alloc site (weights and compute reserve
+                    // are the others) — a resident donor may free room within patience; the
+                    // ask lands as the claim's one allowed est_partial upward revision
+                    size_t need = 0;
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr;
+                         t = ggml_get_next_tensor(ctx.get(), t)) {
+                        need += ggml_backend_buft_get_alloc_size(buft, t);
+                    }
+                    while (buf == nullptr && llama_vram_demand_hold(dev, need)) {
+                        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+                    }
+                    if (buf != nullptr) {
+                        llama_vram_demand_alloc_landed(dev, ggml_backend_buffer_get_size(buf));
+                    }
+                }
+            }
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -1291,6 +1321,9 @@ llama_kv_cache::llama_kv_cache(
                     t8_band_end_++;
                 }
             }
+            LLAMA_LOG_INFO("%s: co-tenancy: f16->t8 band = %zu of %zu order steps%s\n",
+                    __func__, t8_band_end_, vbr_degrade_order_.size(),
+                    t8_band_end_ == 0 ? " (demand shedding disabled)" : "");
             vbr_floor_clamp_order();
             vbr_budget_bytes_    = (size_t) vbr_params_.budget_bytes;
             vbr_budget_explicit_ = vbr_params_.budget_explicit;
@@ -4189,6 +4222,13 @@ size_t llama_kv_cache::vbr_shed_available(int device) const {
         }
         shed_avail_epoch_ = vbr_tier_epoch_;
         shed_avail_wm_    = wm_key;
+        size_t dbg_total = 0;
+        for (const size_t s : shed_avail_pool_) {
+            dbg_total += s;
+        }
+        LLAMA_LOG_DEBUG("%s: recompute: band [%zu, %zu) wm %u -> %.1f MiB offerable\n",
+                __func__, vbr_degrade_cursor_, std::min(vbr_degrade_limit_, t8_band_end_),
+                wm_key, dbg_total/1048576.0);
     }
     size_t total = 0;
     for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
@@ -4202,18 +4242,10 @@ size_t llama_kv_cache::vbr_shed_available(int device) const {
 // ---- co-tenancy donor side (P2) ----
 
 const std::string & llama_kv_cache::vbr_pool_busid(vbr_pool & p) const {
-    if (p.busid.empty() && p.backend != nullptr) {
-        ggml_backend_dev_t dev = ggml_backend_get_device(p.backend);
-        if (dev != nullptr) {
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev, &props);
-            if (props.device_id != nullptr) {
-                p.busid = props.device_id;
-            }
-        }
-        if (p.busid.empty()) {
-            p.busid = "-"; // resolved-and-absent sentinel: never retry, never publish
-        }
+    // resolved eagerly at pool arming; "-" = resolved-and-absent (never publish). The
+    // empty case only exists for pools armed before that code ran (defensive).
+    if (p.busid.empty()) {
+        p.busid = "-";
     }
     return p.busid;
 }

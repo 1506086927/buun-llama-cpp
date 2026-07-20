@@ -4441,11 +4441,12 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
         GGML_ASSERT(!sizes);
-        // co-tenancy: during context INIT only, a resident donor may free room within the
-        // ledger's bounded patience. The ask is nominal (est_partial — the sched spans
-        // devices and its sizes are internal); runtime re-reserves keep the fast-fail wall.
+        // co-tenancy: before the FIRST real decode (i.e. any init-time reserve — several
+        // run during context setup), a resident donor may free room within the ledger's
+        // bounded patience. The ask is nominal (est_partial — the sched spans devices and
+        // its sizes are internal); post-first-decode re-reserves keep the fast-fail wall.
         bool held = false;
-        if (!reserve_held_once_ && !model.devices.empty() && !model.devices[0].is_meta) {
+        if (!has_evaluated_once && !model.devices.empty() && !model.devices[0].is_meta) {
             constexpr size_t NOMINAL_COMPUTE_ASK = 256ull*1024*1024;
             while (!held && llama_vram_demand_hold(model.devices[0].dev, NOMINAL_COMPUTE_ASK)) {
                 held = ggml_backend_sched_reserve(sched.get(), gf);
@@ -4456,7 +4457,6 @@ ggml_cgraph * llama_context::graph_reserve(
             return nullptr;
         }
     }
-    reserve_held_once_ = true;
 
     return gf;
 }

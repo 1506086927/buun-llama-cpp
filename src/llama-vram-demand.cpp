@@ -35,6 +35,12 @@ struct demander {
     // process-wide plan hints (device_id/busid -> bytes), set before load
     std::map<std::string, uint64_t> plan;
 
+    // a concluded attempt failed for good (insufficiency / expiry / lost tie-break):
+    // every later alloc failure in the SAME load fails fast — patience windows must not
+    // stack across the loader's (and the fit's) many buffer allocations. Cleared when a
+    // load concludes (satisfied or abandoned), so the next load gets a fresh attempt.
+    bool terminal_failed = false;
+
     // live attempt
     bool     attempt_open  = false;
     bool     committed     = false; // probe -> demand happened
@@ -166,6 +172,9 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
     if (busid.empty()) {
         return false; // CPU/unidentified device: nothing to negotiate
     }
+    if (d.terminal_failed) {
+        return false; // this load already negotiated and lost — fail fast
+    }
 
     // ---- attempt open (ABSENT -> PROBE) ----
     if (!d.attempt_open) {
@@ -249,6 +258,7 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
                 if (it != d.claim_progress.end() && c.bytes_now > it->second) {
                     LLAMA_LOG_WARN("vram-demand: earlier claimant pid %d is progressing — yielding\n", c.pid);
                     unlink_all(d, "lost tie-break");
+                    d.terminal_failed = true;
                     return false;
                 }
                 d.claim_progress[key] = c.bytes_now;
@@ -313,6 +323,7 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
                 }
                 if (!sufficient) {
                     unlink_all(d, "insufficient");
+                    d.terminal_failed = true;
                     return false;
                 }
                 publish_claims(d, LLAMA_VRAM_CLAIM_DEMAND);
@@ -346,6 +357,7 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
             }
         }
         unlink_all(d, "patience expired");
+        d.terminal_failed = true;
         return false;
     }
 
@@ -365,6 +377,7 @@ backoff:
 
 void llama_vram_demand_satisfied() {
     auto & d = dm();
+    d.terminal_failed = false; // load concluded — the next load negotiates fresh
     if (!d.attempt_open || !d.committed) {
         // an attempt that never committed (or never opened) has nothing to hold onto
         unlink_all(d, "load done without demand");
@@ -378,6 +391,7 @@ void llama_vram_demand_satisfied() {
 
 void llama_vram_demand_abandon() {
     unlink_all(dm(), "abandoned");
+    dm().terminal_failed = false; // load concluded — the next load negotiates fresh
 }
 
 void llama_vram_demand_complete() {
