@@ -66,6 +66,9 @@ public:
         return mem_attn->memory_vbr_state(seq_id, n_tokens_extra);
     }
 
+    // recurrent state has no deferred maintenance; the attn cache breathes
+    void breathe() override { mem_attn->breathe(); }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

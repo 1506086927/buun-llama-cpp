@@ -2104,6 +2104,13 @@ private:
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
+        queue_tasks.on_idle([this]() {
+            // quiet moment on the decode thread: flush deferred VBR maintenance.
+            // target-only is deliberate: draft/MTP KV types are parsed with
+            // allow_vbr=false, so those contexts can never have anything to breathe
+            SRV_TRC("%s", "idle tick: memory breathe\n");
+            llama_memory_breathe(llama_get_memory(ctx_tgt));
+        });
 
         metrics.init();
 

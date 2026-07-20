@@ -748,6 +748,10 @@ extern "C" {
             llama_memory_t mem,
                       bool data);
 
+    // Run deferred memory maintenance at a quiet moment. Must be called from the thread
+    // that calls llama_decode. No-op for memory types with nothing to do.
+    LLAMA_API void llama_memory_breathe(llama_memory_t mem);
+
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence

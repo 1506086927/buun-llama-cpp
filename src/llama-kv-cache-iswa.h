@@ -86,6 +86,11 @@ public:
         return kv_base->memory_vbr_scratch_bytes_per_token(entry_k, entry_v, floor_bpv);
     }
 
+    // per-child forwarding is for POOL maintenance only (both children can hold deferred
+    // VBR unmaps); the P2 tick's ledger scan/demand servicing happens at the parent level,
+    // never per child
+    void breathe() override { kv_base->breathe(); kv_swa->breathe(); }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

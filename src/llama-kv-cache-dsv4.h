@@ -102,6 +102,10 @@ public:
 
     bool get_can_shift() const override;
 
+    // no VBR params are threaded to the children today, so this is a no-op — kept for
+    // coverage symmetry should that ever change
+    void breathe() override { kv_raw->breathe(); kv_csa->breathe(); kv_hca->breathe(); kv_lid->breathe(); }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

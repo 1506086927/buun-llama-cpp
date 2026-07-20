@@ -143,6 +143,8 @@ public:
 
     bool get_can_shift() const override;
 
+    void breathe() override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -388,7 +390,7 @@ private:
     void     vbr_shrink_watermark();                  // occupancy dropped: release phantom tail pages
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();
-    void     vbr_flush_deferred_unmaps();
+    size_t   vbr_flush_deferred_unmaps(); // returns the number of entries flushed
     bool     vbr_scratch_reserve(uint32_t wm_cells);  // #88: boundary-time f16 dequant scratch grow
     char *   vbr_stash_ensure(vbr_pool & p);          // lazy per-pool sink-stash buffer; returns base
     void     vbr_load_degrade_order();                // baked table, VBR_DEGRADE_ORDER=<file>, or generic fallback

@@ -2799,11 +2799,24 @@ size_t llama_kv_cache::vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_c
     return total;
 }
 
+// idle-time maintenance, decode-thread only (llama_memory_breathe). P1 scope: release VBR
+// pages queued for unmap so a quiet server returns memory without waiting for its next
+// decode boundary; the full co-tenancy tick body lands here later. (P2 note: the ledger
+// scan/demand parts of that body are serviced at the parent/context level for composite
+// caches — only per-pool maintenance belongs down here.)
+void llama_kv_cache::breathe() {
+    const size_t flushed = vbr_flush_deferred_unmaps();
+    if (flushed > 0) {
+        LLAMA_LOG_DEBUG("%s: flushed %zu deferred VBR unmaps at idle\n", __func__, flushed);
+    }
+}
+
 // S5: unmap tail pages queued by the previous degrade wave. Safe only after the wave's transcodes
 // finished (they READ the old tier-A extent, which reaches into these pages) — one side-stream
 // sync per pool makes that certain; by the next decode boundary the wave is long done, so this is
 // ~free.
-void llama_kv_cache::vbr_flush_deferred_unmaps() {
+size_t llama_kv_cache::vbr_flush_deferred_unmaps() {
+    size_t flushed = 0;
     for (auto & p : vbr_pools_) {
         if (p.unmap_deferred.empty()) {
             continue;
@@ -2813,8 +2826,10 @@ void llama_kv_cache::vbr_flush_deferred_unmaps() {
         for (const auto & [off, len] : p.unmap_deferred) {
             p.be->vmm_pool_unmap(p.vmm, off, len);
         }
+        flushed += p.unmap_deferred.size();
         p.unmap_deferred.clear();
     }
+    return flushed;
 }
 
 // Generic degrade-rank curves for models WITHOUT a baked order (matrix v3, 2026-07-05).

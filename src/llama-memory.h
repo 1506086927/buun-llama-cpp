@@ -160,6 +160,9 @@ struct llama_memory_i {
         return 0.0;
     }
 
+    // deferred maintenance at a quiet moment (llama.h: llama_memory_breathe)
+    virtual void breathe() {}
+
     //
     // ops
     //

@@ -6146,6 +6146,14 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
     mem->clear(data);
 }
 
+void llama_memory_breathe(llama_memory_t mem) {
+    if (!mem) {
+        return;
+    }
+
+    mem->breathe();
+}
+
 bool llama_memory_seq_rm(
         llama_memory_t mem,
           llama_seq_id seq_id,
