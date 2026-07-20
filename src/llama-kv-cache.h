@@ -183,6 +183,12 @@ public:
     // totals for cross-cache aggregation (iSWA weights its children by stored values)
     void   kv_bpv_accum(double & bits, double & vals) const;
 
+    // co-tenancy: bytes a demand-driven shed could free on `device` — max shed over the
+    // remaining f16->t8 band, net of the projected dequant-scratch growth it would cost.
+    // 0 when the band is spent/absent, the order is a custom override, or no VMM pool
+    // lives on the device. Memoized; safe to call between boundaries (marker writes).
+    size_t vbr_shed_available(int device) const;
+
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
     double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
 
@@ -364,6 +370,14 @@ private:
     // --vbr-floor (env VBR_MIN_BITS): first order step the aggregate bits/value floor forbids;
     // the cursor never advances past it (default = order size, i.e. unclamped)
     size_t vbr_degrade_limit_ = (size_t) -1;
+    // co-tenancy: end of the leading f16->t8 band of the order (demand sheds stop here);
+    // 0 = no band (custom VBR_DEGRADE_ORDER carries no band guarantee -> demand shed off)
+    size_t t8_band_end_ = 0;
+    // vbr_shed_available memo: per-pool freed-bytes projection, keyed on (tier epoch,
+    // watermark padded to the 256-cell quantum) — budget is deliberately NOT an input
+    mutable uint64_t            shed_avail_epoch_ = ~0ull;
+    mutable uint32_t            shed_avail_wm_    = 0;
+    mutable std::vector<size_t> shed_avail_pool_;
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)

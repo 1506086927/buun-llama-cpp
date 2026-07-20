@@ -1279,6 +1279,17 @@ llama_kv_cache::llama_kv_cache(
         // experiment overrides.
         if (vbr_vmm_active()) {
             vbr_load_degrade_order();
+            // co-tenancy band cap: demand-driven sheds may only spend the leading f16->t8
+            // band of the price order — the one cheap AND domain-reversible rung (sub-t8
+            // sheds imprint irreversible re-encode error into existing tokens). A custom
+            // VBR_DEGRADE_ORDER carries no band guarantee, so it disables demand shedding.
+            t8_band_end_ = 0;
+            if (getenv("VBR_DEGRADE_ORDER") == nullptr) {
+                while (t8_band_end_ < vbr_degrade_order_.size() &&
+                       vbr_degrade_order_[t8_band_end_].tier == VBR_TIER_T8) {
+                    t8_band_end_++;
+                }
+            }
             vbr_floor_clamp_order();
             vbr_budget_bytes_    = (size_t) vbr_params_.budget_bytes;
             vbr_budget_explicit_ = vbr_params_.budget_explicit;
@@ -4007,6 +4018,106 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     st.bpv_if_degraded = sum_vals > 0 ? sum_bits / (double) sum_vals : 0.0;
 
     return st;
+}
+
+// co-tenancy: the marker-published donation offer. Walks the REMAINING f16->t8 band
+// [cursor, min(limit, t8_band_end_)) with the same skip rules as vbr_degrade_next and sums,
+// per pool, the page-padded bytes the full band would free at the current watermark — then
+// subtracts the projected GROWTH of the #88 f16 dequant scratch those sheds would cost.
+// The scratch projection uses the max-row shape of vbr_scratch_reserve (the widest
+// dequant-active row per side), NOT a per-(layer,side) sum — summing would overstate the
+// cost by ~n_layers and zero every offer. The budget is deliberately not an input: an offer
+// says what shedding COULD free, the grant math decides what it does free.
+size_t llama_kv_cache::vbr_shed_available(int device) const {
+    if (!vbr_vmm_active() || t8_band_end_ == 0) {
+        return 0;
+    }
+    uint32_t wm_max = 0;
+    for (const auto & p : vbr_pools_) {
+        if (p.vmm != nullptr) {
+            wm_max = std::max(wm_max, p.wm_cells);
+        }
+    }
+    const uint32_t wm_key = GGML_PAD(wm_max, 256);
+    if (shed_avail_epoch_ != vbr_tier_epoch_ || shed_avail_wm_ != wm_key) {
+        shed_avail_pool_.assign(vbr_pools_.size(), 0);
+
+        std::vector<ggml_type> sim(layers.size() * 2, GGML_TYPE_COUNT);
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            for (int side = 0; side < 2; ++side) {
+                const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
+                if (t != nullptr && vbr_unit_pooled(ikv, side != 0)) {
+                    sim[ikv*2 + side] = t->type;
+                }
+            }
+        }
+        std::vector<int64_t> freed(vbr_pools_.size(), 0);
+        for (size_t i = vbr_degrade_cursor_; i < std::min(vbr_degrade_limit_, t8_band_end_); ++i) {
+            const auto & stp = vbr_degrade_order_[i];
+            const auto it = map_layer_ids.find(stp.il);
+            if (it == map_layer_ids.end()) {
+                continue;
+            }
+            const size_t slot = (size_t) it->second * 2 + (stp.is_v ? 1 : 0);
+            const ggml_tensor * t = stp.is_v ? layers[it->second].v : layers[it->second].k;
+            if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_unit_movable(sim[slot], stp.is_v != 0)) {
+                continue;
+            }
+            const ggml_type type_B = vbr_tier_type(stp.tier);
+            if (sim[slot] == type_B ||
+                ggml_row_size(type_B, t->ne[0]) >= ggml_row_size(sim[slot], t->ne[0])) {
+                continue;
+            }
+            for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+                const auto & p = vbr_pools_[pi];
+                if (p.vmm == nullptr) {
+                    continue;
+                }
+                const vbr_extent & e = stp.is_v ? p.v[it->second] : p.k[it->second];
+                if (e.t == nullptr) {
+                    continue;
+                }
+                freed[pi] += (int64_t) GGML_PAD(ggml_row_size(sim[slot], e.t->ne[0]) * p.wm_cells, p.gran)
+                           - (int64_t) GGML_PAD(ggml_row_size(type_B,    e.t->ne[0]) * p.wm_cells, p.gran);
+            }
+            sim[slot] = type_B;
+        }
+        for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+            const auto & p = vbr_pools_[pi];
+            if (p.vmm == nullptr) {
+                continue;
+            }
+            // scratch growth: widest dequant-active f16 row per side, before vs after the sim
+            size_t cur_k = 0, cur_v = 0, end_k = 0, end_v = 0;
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                const ggml_tensor * tk = p.k[ikv].t;
+                const ggml_tensor * tv = p.v[ikv].t;
+                bool need_k = false, need_v = false;
+                ggml_vbr_kv_dequant_sides(tk ? tk->type : GGML_TYPE_F16,
+                                          tv ? tv->type : GGML_TYPE_F16, &need_k, &need_v);
+                if (need_k && tk) { cur_k = std::max(cur_k, ggml_row_size(GGML_TYPE_F16, tk->ne[0])); }
+                if (need_v && tv) { cur_v = std::max(cur_v, ggml_row_size(GGML_TYPE_F16, tv->ne[0])); }
+                const ggml_type sk = sim[ikv*2 + 0] != GGML_TYPE_COUNT ? sim[ikv*2 + 0] : (tk ? tk->type : GGML_TYPE_F16);
+                const ggml_type sv = sim[ikv*2 + 1] != GGML_TYPE_COUNT ? sim[ikv*2 + 1] : (tv ? tv->type : GGML_TYPE_F16);
+                ggml_vbr_kv_dequant_sides(sk, sv, &need_k, &need_v);
+                if (need_k && tk) { end_k = std::max(end_k, ggml_row_size(GGML_TYPE_F16, tk->ne[0])); }
+                if (need_v && tv) { end_v = std::max(end_v, ggml_row_size(GGML_TYPE_F16, tv->ne[0])); }
+            }
+            const int64_t scratch_proj =
+                (int64_t) ((end_k > cur_k ? end_k - cur_k : 0) +
+                           (end_v > cur_v ? end_v - cur_v : 0)) * (int64_t) p.wm_cells;
+            shed_avail_pool_[pi] = (size_t) std::max<int64_t>(0, freed[pi] - scratch_proj);
+        }
+        shed_avail_epoch_ = vbr_tier_epoch_;
+        shed_avail_wm_    = wm_key;
+    }
+    size_t total = 0;
+    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+        if (vbr_pools_[pi].vmm != nullptr && vbr_pools_[pi].device == device) {
+            total += shed_avail_pool_[pi];
+        }
+    }
+    return total;
 }
 
 bool llama_kv_cache::get_can_shift() const {
