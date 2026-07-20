@@ -89,6 +89,41 @@ void llama_vram_claim_withdraw_all();
 // mismatch) — GC authority is any scanner. Own files are skipped. Returns count in out.
 int llama_vram_ledger_scan(std::vector<llama_vram_peer_claim> & out);
 
+// ---- presence markers: ggml-vram-resident-<busid>-<pid> ----
+// Written by every fork process holding device memory. shed_available/grant_pending are
+// the donor-protocol fields. Marker heartbeat freshness measures RESPONSIVENESS (a deaf
+// resident cannot act), so beats ride the owner's SCAN cadence — llama_vram_marker_beat
+// is the scan-event hook (internally rate-limited to one per BEAT), never a thread.
+
+struct llama_vram_marker_fields {
+    uint32_t vbr;            // 1 = dynamic-VBR resident (potential donor)
+    uint32_t serviced;       // 1 = runs an idle tick (llama-server); 0 = boundary-scans only
+    uint64_t shed_available; // bytes the f16->t8 band could free on this device (0 = no offer)
+    uint64_t grant_pending;  // granted-but-not-yet-flushed bytes on this device
+};
+
+// one validated peer marker as read by a scan
+struct llama_vram_peer_marker {
+    std::string busid;
+    int32_t     pid;
+    uint64_t    starttime;
+    uint64_t    created_ts_ns; // fixed at the marker's FIRST write (donor-rank input)
+    llama_vram_marker_fields fields;
+    uint64_t    hb_counter;
+};
+
+// rename-write the marker (field change — bumps dir mtime; the first write fixes
+// created_ts for the marker's lifetime). Returns false when unarmed or on I/O failure.
+bool llama_vram_marker_publish(const std::string & busid, const llama_vram_marker_fields & fields);
+// in-place heartbeat, called from the owner's scan events; no-op if never published or
+// if beaten less than BEAT ago
+void llama_vram_marker_beat(const std::string & busid);
+bool llama_vram_marker_withdraw(const std::string & busid);
+void llama_vram_marker_withdraw_all();
+
+// scan peer markers (own skipped; dead-owner GC; SCAN_CAP applies)
+int llama_vram_ledger_scan_markers(std::vector<llama_vram_peer_marker> & out);
+
 // ledger directory mtime (ns, 0 when unavailable) — the ~1µs per-boundary pre-check:
 // rename-writes bump it, in-place beats do not
 uint64_t llama_vram_ledger_dir_mtime_ns();

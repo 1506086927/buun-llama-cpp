@@ -34,6 +34,12 @@ static constexpr size_t   VRLG_SLOT_OFF  = 64;
 
 static constexpr const char * VRLG_CLAIM_PREFIX = "ggml-vram-claim-";
 
+// presence markers share the 88-byte layout and slot offsets; their body is:
+//   16 u32 vbr  20 u32 serviced  24 i32 pid  28 u32 reserved
+//   32 u64 starttime  40 u64 created_ts_ns  48 u64 shed_available  56 u64 grant_pending
+static constexpr uint32_t     VRLM_MAGIC         = 0x4D4C5256; // "VRLM"
+static constexpr const char * VRLM_MARKER_PREFIX = "ggml-vram-resident-";
+
 #ifdef __linux__
 
 static void vrlg_put_u32(uint8_t * buf, size_t off, uint32_t v) { memcpy(buf + off, &v, 4); }
@@ -442,6 +448,225 @@ uint64_t llama_vram_ledger_dir_mtime_ns() {
     return (uint64_t) st.st_mtim.tv_sec*1000000000ull + (uint64_t) st.st_mtim.tv_nsec;
 }
 
+// ---- presence markers ----
+// no writer thread: publish is a rename (field change), beats are caller-driven in-place
+// pwrites on the owner's scan cadence with a one-per-BEAT internal rate limit
+
+struct vrlm_marker_entry {
+    std::string path;
+    int         fd = -1;
+    uint32_t    hb_seq        = 0;
+    uint64_t    created_ts_ns = 0; // fixed at first publish, survives republishes
+    uint64_t    last_beat_ns  = 0;
+};
+
+// markers are only touched from the owner's decode/tick thread — no lock needed beyond
+// the map's own lifetime (static storage, destroyed at exit after unlinking)
+struct vrlm_state {
+    std::unordered_map<std::string, vrlm_marker_entry> markers; // key: busid
+
+    ~vrlm_state() {
+        for (auto & [busid, e] : markers) {
+            if (e.fd >= 0) {
+                close(e.fd);
+            }
+            unlink(e.path.c_str());
+        }
+    }
+};
+
+static vrlm_state & vrlm() {
+    static vrlm_state s;
+    return s;
+}
+
+bool llama_vram_marker_publish(const std::string & busid, const llama_vram_marker_fields & fields) {
+    if (!llama_vram_ledger_armed()) {
+        return false;
+    }
+    auto & s = vrlm();
+    const auto prev = s.markers.find(busid);
+    const uint32_t hb_seq        = prev != s.markers.end() ? prev->second.hb_seq        : 0;
+    const uint64_t created_ts_ns = prev != s.markers.end() ? prev->second.created_ts_ns
+                                                           : llama_vram_ledger_now_ns();
+
+    uint8_t buf[VRLG_FILE_SIZE] = {0};
+    vrlg_put_u32(buf,  0, VRLM_MAGIC);
+    vrlg_put_u32(buf,  4, VRLG_VERSION);
+    vrlg_put_u32(buf, 16, fields.vbr);
+    vrlg_put_u32(buf, 20, fields.serviced);
+    vrlg_put_u32(buf, 24, (uint32_t) getpid());
+    vrlg_put_u64(buf, 32, llama_vram_ledger_self_starttime());
+    vrlg_put_u64(buf, 40, created_ts_ns);
+    vrlg_put_u64(buf, 48, fields.shed_available);
+    vrlg_put_u64(buf, 56, fields.grant_pending);
+    vrlg_put_u32(buf,  8, llama_crc32(buf + VRLG_BODY_OFF, VRLG_SLOT_OFF - VRLG_BODY_OFF));
+    vrlg_put_u32(buf, VRLG_SLOT_OFF + 0, hb_seq);
+    vrlg_put_u64(buf, VRLG_SLOT_OFF + 8, hb_seq/2);
+
+    std::string tmp = vrlg_dir() + "/.marker-tmp-XXXXXX";
+    int tmp_fd = mkstemp(tmp.data());
+    if (tmp_fd < 0) {
+        return false;
+    }
+    bool ok = write(tmp_fd, buf, sizeof(buf)) == (ssize_t) sizeof(buf);
+    close(tmp_fd);
+    std::string path = vrlg_dir() + "/" + VRLM_MARKER_PREFIX + busid + "-" + std::to_string(getpid());
+    if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
+        unlink(tmp.c_str());
+        return false;
+    }
+    int fd = open(path.c_str(), O_WRONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        unlink(path.c_str());
+        return false;
+    }
+    auto & e = s.markers[busid];
+    if (e.fd >= 0) {
+        close(e.fd);
+    }
+    e.path          = path;
+    e.fd            = fd;
+    e.hb_seq        = hb_seq;
+    e.created_ts_ns = created_ts_ns;
+    return true;
+}
+
+void llama_vram_marker_beat(const std::string & busid) {
+    auto & s = vrlm();
+    auto it = s.markers.find(busid);
+    if (it == s.markers.end() || it->second.fd < 0) {
+        return;
+    }
+    auto & e = it->second;
+    const uint64_t now = llama_vram_ledger_now_ns();
+    if (now - e.last_beat_ns < (uint64_t) LLAMA_VRAM_LEDGER_BEAT_MS * 1000000ull) {
+        return;
+    }
+    e.last_beat_ns = now;
+    uint8_t slot[VRLG_FILE_SIZE - VRLG_SLOT_OFF];
+    e.hb_seq += 1;
+    vrlg_put_u32(slot, 0, e.hb_seq);
+    pwrite(e.fd, slot, 4, VRLG_SLOT_OFF);
+    e.hb_seq += 1;
+    vrlg_put_u32(slot, 4, 0);
+    vrlg_put_u64(slot, 8, e.hb_seq/2);
+    vrlg_put_u64(slot, 16, 0);
+    pwrite(e.fd, slot + 4, sizeof(slot) - 4, VRLG_SLOT_OFF + 4);
+    vrlg_put_u32(slot, 0, e.hb_seq);
+    pwrite(e.fd, slot, 4, VRLG_SLOT_OFF);
+}
+
+bool llama_vram_marker_withdraw(const std::string & busid) {
+    auto & s = vrlm();
+    auto it = s.markers.find(busid);
+    if (it == s.markers.end()) {
+        return false;
+    }
+    if (it->second.fd >= 0) {
+        close(it->second.fd);
+    }
+    unlink(it->second.path.c_str());
+    s.markers.erase(it);
+    return true;
+}
+
+void llama_vram_marker_withdraw_all() {
+    auto & s = vrlm();
+    for (auto & [busid, e] : s.markers) {
+        if (e.fd >= 0) {
+            close(e.fd);
+        }
+        unlink(e.path.c_str());
+    }
+    s.markers.clear();
+}
+
+int llama_vram_ledger_scan_markers(std::vector<llama_vram_peer_marker> & out) {
+    out.clear();
+    if (!llama_vram_ledger_armed()) {
+        return 0;
+    }
+    DIR * d = opendir(vrlg_dir().c_str());
+    if (d == nullptr) {
+        return 0;
+    }
+    static bool warned_cap = false;
+    int seen = 0;
+    const size_t prefix_len = strlen(VRLM_MARKER_PREFIX);
+    for (struct dirent * de = readdir(d); de != nullptr; de = readdir(d)) {
+        if (strncmp(de->d_name, VRLM_MARKER_PREFIX, prefix_len) != 0) {
+            continue;
+        }
+        if (++seen > LLAMA_VRAM_LEDGER_SCAN_CAP) {
+            if (!warned_cap) {
+                LLAMA_LOG_WARN("%s: more than %d marker files, ignoring the excess\n",
+                        __func__, (int) LLAMA_VRAM_LEDGER_SCAN_CAP);
+                warned_cap = true;
+            }
+            break;
+        }
+        const char * name = de->d_name + prefix_len;
+        const char * dash = strrchr(name, '-');
+        if (dash == nullptr || dash == name) {
+            continue;
+        }
+        int32_t pid = (int32_t) atoi(dash + 1);
+        if (pid <= 0 || pid == getpid()) {
+            continue;
+        }
+        std::string path = vrlg_dir() + "/" + de->d_name;
+
+        uint8_t buf[VRLG_FILE_SIZE];
+        int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+        if (fd < 0) {
+            continue;
+        }
+        bool stable = false;
+        for (int attempt = 0; attempt < 3 && !stable; ++attempt) {
+            if (pread(fd, buf, sizeof(buf), 0) != (ssize_t) sizeof(buf)) {
+                break;
+            }
+            uint32_t seq1 = vrlg_get_u32(buf, VRLG_SLOT_OFF);
+            if (seq1 % 2 != 0) {
+                continue;
+            }
+            uint8_t slot2[4];
+            if (pread(fd, slot2, 4, VRLG_SLOT_OFF) != 4 || vrlg_get_u32(slot2, 0) != seq1) {
+                continue;
+            }
+            stable = true;
+        }
+        close(fd);
+        if (!stable ||
+            vrlg_get_u32(buf, 0) != VRLM_MAGIC ||
+            vrlg_get_u32(buf, 4) != VRLG_VERSION ||
+            vrlg_get_u32(buf, 8) != llama_crc32(buf + VRLG_BODY_OFF, VRLG_SLOT_OFF - VRLG_BODY_OFF) ||
+            (int32_t) vrlg_get_u32(buf, 24) != pid ||
+            vrlg_get_u32(buf, 16) > 1 || vrlg_get_u32(buf, 20) > 1) {
+            continue;
+        }
+        uint64_t starttime = vrlg_get_u64(buf, 32);
+        if (!llama_vram_ledger_pid_alive(pid, starttime)) {
+            unlink(path.c_str()); // GC authority: any scanner
+            continue;
+        }
+        llama_vram_peer_marker pm;
+        pm.busid         = std::string(name, dash - name);
+        pm.pid           = pid;
+        pm.starttime     = starttime;
+        pm.created_ts_ns = vrlg_get_u64(buf, 40);
+        pm.fields.vbr            = vrlg_get_u32(buf, 16);
+        pm.fields.serviced       = vrlg_get_u32(buf, 20);
+        pm.fields.shed_available = vrlg_get_u64(buf, 48);
+        pm.fields.grant_pending  = vrlg_get_u64(buf, 56);
+        pm.hb_counter    = vrlg_get_u64(buf, VRLG_SLOT_OFF + 8);
+        out.push_back(std::move(pm));
+    }
+    closedir(d);
+    return (int) out.size();
+}
+
 #else // !__linux__ — substrate disabled: armed() = false, every caller takes the clean-fail path
 
 bool llama_vram_ledger_armed() { return false; }
@@ -464,5 +689,12 @@ void llama_vram_claim_withdraw_all() {}
 int llama_vram_ledger_scan(std::vector<llama_vram_peer_claim> & out) { out.clear(); return 0; }
 
 uint64_t llama_vram_ledger_dir_mtime_ns() { return 0; }
+
+bool llama_vram_marker_publish(const std::string &, const llama_vram_marker_fields &) { return false; }
+void llama_vram_marker_beat(const std::string &) {}
+bool llama_vram_marker_withdraw(const std::string &) { return false; }
+void llama_vram_marker_withdraw_all() {}
+
+int llama_vram_ledger_scan_markers(std::vector<llama_vram_peer_marker> & out) { out.clear(); return 0; }
 
 #endif
