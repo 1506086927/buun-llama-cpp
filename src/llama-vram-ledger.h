@@ -70,6 +70,7 @@ const std::string & llama_vram_ledger_dir();
 
 // self/peer identity (starttime = /proc/<pid>/stat f22; liveness pairs pid with it so a
 // recycled pid never impersonates a dead claimant)
+int32_t  llama_vram_ledger_self_pid(); // tie-break input; 0 when unarmed
 uint64_t llama_vram_ledger_self_starttime();
 uint64_t llama_vram_ledger_now_ns(); // CLOCK_BOOTTIME (advances across suspend, unlike
                                      // ggml_time's CLOCK_MONOTONIC) — created_ts domain

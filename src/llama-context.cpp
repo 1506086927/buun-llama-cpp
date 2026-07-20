@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
+#include "llama-vram-demand.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
@@ -4090,6 +4091,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // co-tenancy claim-complete: first successful decode that produced real outputs —
+    // intermediate prefill chunks run n_outputs == 0 and do not count. Unlinking the
+    // satisfied claim is the donors' lift signal (disappearance with live pid).
+    if (n_outputs > 0 && llama_vram_demand_pending_complete()) {
+        llama_vram_demand_complete();
+    }
+
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
@@ -4432,9 +4440,22 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
         GGML_ASSERT(!sizes);
-        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
-        return nullptr;
+        // co-tenancy: during context INIT only, a resident donor may free room within the
+        // ledger's bounded patience. The ask is nominal (est_partial — the sched spans
+        // devices and its sizes are internal); runtime re-reserves keep the fast-fail wall.
+        bool held = false;
+        if (!reserve_held_once_ && !model.devices.empty() && !model.devices[0].is_meta) {
+            constexpr size_t NOMINAL_COMPUTE_ASK = 256ull*1024*1024;
+            while (!held && llama_vram_demand_hold(model.devices[0].dev, NOMINAL_COMPUTE_ASK)) {
+                held = ggml_backend_sched_reserve(sched.get(), gf);
+            }
+        }
+        if (!held) {
+            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+            return nullptr;
+        }
     }
+    reserve_held_once_ = true;
 
     return gf;
 }
@@ -5640,12 +5661,17 @@ llama_context * llama_init_from_model(
 
     try {
         auto * ctx = new llama_context(*model, params);
+        // co-tenancy: every planned alloc landed — a held demand (if any) flips to
+        // phase=satisfied; the claim lives until the first real decode (claim-complete)
+        llama_vram_demand_satisfied();
         return ctx;
     } catch (const llama_exception & err) {
         // expected during memory fitting (e.g. Gemma4Assistant/EAGLE3 ctx_other not yet set) — warn, don't error
         LLAMA_LOG_WARN("%s: failed to initialize the context: %s\n", __func__, err.what());
+        llama_vram_demand_abandon();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
+        llama_vram_demand_abandon();
     }
 
     return nullptr;
@@ -6152,6 +6178,10 @@ void llama_memory_breathe(llama_memory_t mem) {
     }
 
     mem->breathe();
+}
+
+void llama_vram_plan_hint(const char * device_id, uint64_t bytes) {
+    llama_vram_plan_hint_set(device_id, bytes);
 }
 
 bool llama_memory_seq_rm(

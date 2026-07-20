@@ -13,6 +13,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-vram-demand.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -1613,6 +1614,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
             } else {
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                if (buf == nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    // co-tenancy: a resident VBR donor may free room — hold within the
+                    // ledger's bounded patience and retry (no ledger/donors = short clean wait)
+                    size_t need = 0;
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                        need += ggml_backend_buft_get_alloc_size(buft, t);
+                    }
+                    while (buf == nullptr && llama_vram_demand_hold(dev, need)) {
+                        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+                    }
+                }
+                if (buf != nullptr) {
+                    llama_vram_demand_alloc_landed(dev, ggml_backend_buffer_get_size(buf));
+                }
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));

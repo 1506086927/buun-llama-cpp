@@ -572,6 +572,9 @@ private:
 
     bool has_evaluated_once    = false;
     bool warned_logits_all     = false;
+    // co-tenancy: first graph_reserve completed — later reserve failures never hold in
+    // the ledger's loader patience (the runtime fast-fail wall stays intact)
+    bool reserve_held_once_    = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

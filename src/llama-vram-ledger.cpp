@@ -265,6 +265,10 @@ const std::string & llama_vram_ledger_dir() {
     return vrlg_dir();
 }
 
+int32_t llama_vram_ledger_self_pid() {
+    return (int32_t) getpid();
+}
+
 uint64_t llama_vram_ledger_self_starttime() {
     static const uint64_t st = vrlg_pid_starttime(getpid());
     return st;
@@ -676,6 +680,7 @@ const std::string & llama_vram_ledger_dir() {
     return empty;
 }
 
+int32_t  llama_vram_ledger_self_pid()       { return 0; }
 uint64_t llama_vram_ledger_self_starttime() { return 0; }
 uint64_t llama_vram_ledger_now_ns()         { return 0; }
 

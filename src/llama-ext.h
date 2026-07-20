@@ -109,6 +109,12 @@ LLAMA_API double llama_vbr_floor_bits_per_token(struct llama_context * ctx,
 LLAMA_API double llama_vbr_scratch_bytes_per_token(struct llama_context * ctx,
         enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv);
 
+// co-tenancy plan hint: total bytes this process still intends to allocate on the device
+// (PCI bus id per ggml_backend_dev_props.device_id). Set by the fit pass before load so a
+// held demand can publish an honest joint cross-device estimate instead of drip-feeding
+// per-failure asks (est_partial).
+LLAMA_API void llama_vram_plan_hint(const char * device_id, uint64_t bytes);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
