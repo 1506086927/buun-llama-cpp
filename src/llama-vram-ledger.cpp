@@ -456,6 +456,16 @@ uint64_t llama_vram_ledger_dir_mtime_ns() {
 // no writer thread: publish is a rename (field change), beats are caller-driven in-place
 // pwrites on the owner's scan cadence with a one-per-BEAT internal rate limit
 
+static bool g_vrlm_serviced = false;
+
+void llama_vram_marker_set_serviced(bool serviced) {
+    g_vrlm_serviced = serviced;
+}
+
+bool llama_vram_marker_serviced_flag() {
+    return g_vrlm_serviced;
+}
+
 struct vrlm_marker_entry {
     std::string path;
     int         fd = -1;
@@ -701,5 +711,9 @@ bool llama_vram_marker_withdraw(const std::string &) { return false; }
 void llama_vram_marker_withdraw_all() {}
 
 int llama_vram_ledger_scan_markers(std::vector<llama_vram_peer_marker> & out) { out.clear(); return 0; }
+
+static bool g_vrlm_serviced_stub = false;
+void llama_vram_marker_set_serviced(bool serviced) { g_vrlm_serviced_stub = serviced; }
+bool llama_vram_marker_serviced_flag() { return g_vrlm_serviced_stub; }
 
 #endif

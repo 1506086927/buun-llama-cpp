@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // llama_vram_mark_serviced (fork ext API; fit.cpp precedent)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -2111,6 +2112,9 @@ private:
             SRV_TRC("%s", "idle tick: memory breathe\n");
             llama_memory_breathe(llama_get_memory(ctx_tgt));
         });
+        // co-tenancy: this host runs an idle tick, so its presence markers advertise
+        // serviced:1 — the signal that lets a co-loading peer upgrade its patience window
+        llama_vram_mark_serviced();
 
         metrics.init();
 

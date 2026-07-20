@@ -7,6 +7,7 @@
 
 #include "ggml-vbr.h" // backend interface for turbo KV / dynamic VBR (resolved at init, never linked)
 
+#include <map>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -340,6 +341,10 @@ private:
         uint64_t scratch_rows_epoch = ~0ull;
         size_t   scratch_k_row      = 0;
         size_t   scratch_v_row      = 0;
+        // co-tenancy (P2): PCI bus id (resolved once from the backend device; empty = none)
+        // and the summed unamortized grant decrement vbr_budget_eff subtracts
+        std::string busid;
+        mutable size_t grant_decrement = 0;
         // per-device transcode side stream (lazy) + S5 overlap state: transcodes run async on
         // backend's stream; the next decode graph GPU-waits via the armed per-device fence
         // (be->fence_arm). Tail pages a transcode may still READ (rA extent >
@@ -378,6 +383,44 @@ private:
     mutable uint64_t            shed_avail_epoch_ = ~0ull;
     mutable uint32_t            shed_avail_wm_    = 0;
     mutable std::vector<size_t> shed_avail_pool_;
+
+    // ---- co-tenancy donor state (P2) ----
+    // grant rows: private in-memory liabilities recording a demand-shed's decrement,
+    // keyed (pid, starttime, ver) with the demanded device's busid; one row per pool the
+    // wave freed bytes in. Collateral rows (lockstep frees on non-demanded devices) carry
+    // the full decrement until the lift event (delta_i = 0 — this also keeps the promote
+    // cursor frozen so a promote cannot undo a lockstep shed).
+    struct vbr_grant_row {
+        std::string busid;      // device the demand named (claim file key)
+        int32_t     pid;
+        uint64_t    starttime;
+        uint64_t    ver;
+        size_t      pool_idx;
+        uint64_t    bytes;
+        uint64_t    bytes_now_at_grant;
+        bool        collateral;
+    };
+    std::vector<vbr_grant_row> vbr_grants_;
+    // reader-side heartbeat aging for claim stall-lift (key "busid-pid")
+    struct vbr_hb_obs { uint64_t counter = 0; uint64_t change_ns = 0; };
+    std::map<std::string, vbr_hb_obs> vbr_claim_obs_;
+    // ledger scan pacing: dir-mtime pre-check baseline + last full-scan clock
+    uint64_t vbr_ledger_mtime_  = 0;
+    uint64_t vbr_last_scan_ns_  = 0;
+    bool     vbr_ledger_force_  = false; // pre-check hit: run the full controller path
+    // last published marker fields per busid (republish = rename only on change)
+    std::map<std::string, std::pair<uint64_t, uint64_t>> vbr_marker_pub_; // {shed_avail, grant_pending}
+    // our marker's created_ts (donor-rank input; 0 until first publish) and the per-device
+    // granted-but-not-yet-flushed bytes (set at shed commit, cleared at the first scan
+    // event after that wave's deferred unmaps flush)
+    uint64_t vbr_marker_created_ts_ = 0;
+    std::map<std::string, uint64_t> vbr_grant_pending_;
+
+    void   vbr_ledger_precheck();                 // every boundary, outside the stable gate
+    void   vbr_ledger_scan_service(uint32_t wm_next); // full scan + grant upkeep + demand service
+    void   vbr_apply_grant_decrements();          // recompute per-pool sums, bust memos
+    size_t vbr_total_grant_decrement() const;     // promote freeze gate
+    const std::string & vbr_pool_busid(vbr_pool & p) const;
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)

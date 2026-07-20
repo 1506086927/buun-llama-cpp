@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
 #include "llama-vram-demand.h"
+#include "llama-vram-ledger.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
@@ -6182,6 +6183,10 @@ void llama_memory_breathe(llama_memory_t mem) {
 
 void llama_vram_plan_hint(const char * device_id, uint64_t bytes) {
     llama_vram_plan_hint_set(device_id, bytes);
+}
+
+void llama_vram_mark_serviced(void) {
+    llama_vram_marker_set_serviced(true);
 }
 
 bool llama_memory_seq_rm(

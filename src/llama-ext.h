@@ -115,6 +115,10 @@ LLAMA_API double llama_vbr_scratch_bytes_per_token(struct llama_context * ctx,
 // per-failure asks (est_partial).
 LLAMA_API void llama_vram_plan_hint(const char * device_id, uint64_t bytes);
 
+// co-tenancy: declare this process serviced (runs an idle tick — llama-server). Presence
+// markers then advertise serviced:1, the qualifying signal for a co-loader's LONG patience.
+LLAMA_API void llama_vram_mark_serviced(void);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

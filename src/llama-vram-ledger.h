@@ -125,6 +125,12 @@ void llama_vram_marker_withdraw_all();
 // scan peer markers (own skipped; dead-owner GC; SCAN_CAP applies)
 int llama_vram_ledger_scan_markers(std::vector<llama_vram_peer_marker> & out);
 
+// process-wide serviced flag: set once by a host that runs an idle tick (llama-server);
+// consumed by marker publication. Default false (cli/perplexity/bench are deaf at the
+// prompt and must not upgrade a demander's patience window).
+void llama_vram_marker_set_serviced(bool serviced);
+bool llama_vram_marker_serviced_flag();
+
 // ledger directory mtime (ns, 0 when unavailable) — the ~1µs per-boundary pre-check:
 // rename-writes bump it, in-place beats do not
 uint64_t llama_vram_ledger_dir_mtime_ns();

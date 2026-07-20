@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-vram-ledger.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1971,9 +1972,13 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // Stable when: budget fully explored, quiet for N boundaries, occupancy hasn't meaningfully moved.
         static const uint32_t VBR_STABLE_QUICK = 10; // quiet-boundary threshold for fast path
         static const int32_t  VBR_USED_DELTA   = 512; // occupancy delta below which we're stable
+        // co-tenancy: the ledger pre-check runs EVERY boundary, outside the stable gate —
+        // a peer's rename (new claim, offer change) forces the full controller path
+        vbr_ledger_precheck();
         bool vbr_stable = (vbr_degrade_cursor_ >= std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) &&
                            vbr_quiet_boundaries_ >= VBR_STABLE_QUICK &&
-                           std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA);
+                           std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA &&
+                           !vbr_ledger_force_);
 
         // predicted watermark for THIS boundary; both paths eagerly map to it once, after the if/else.
         uint32_t wm_next = 0;
@@ -2012,7 +2017,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // compounds per hop — so waves spread out and a clamp-driven degrade vetoes the
             // immediate bounce-back. Boundary counting keeps the cooldown deterministic.
             vbr_quiet_boundaries_++;
-            if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4) {
+            // co-tenancy: promotes freeze while any unamortized grant remains — a promote
+            // would climb back into bytes a demander is still claiming
+            if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4 &&
+                vbr_total_grant_decrement() == 0) {
                 vbr_promote_next(wm_next);
             }
             // budget trigger: degrade while ANY pool exceeds its share. A step only shrinks the pool
@@ -2044,6 +2052,14 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                 LLAMA_LOG_DEBUG("%s: VBR pool #%zu (device %d): projected %.2f / budget %.2f MiB (mapped %.2f) at %u cells\n",
                         __func__, pi, p.device, vbr_vmm_projected_bytes(p, wm_next)/1024.0/1024.0,
                         p.budget/1024.0/1024.0, p.be->vmm_pool_mapped(p.vmm)/1024.0/1024.0, wm_next);
+            }
+            // co-tenancy: full ledger pass on a pre-check hit, or unconditionally every 8th
+            // boundary once ≥1s has passed since the last full scan (bounds the miss window
+            // when our own rename baseline-swallowed a peer's concurrent rename)
+            if (vbr_ledger_force_ ||
+                (vbr_boundary_count_ % 8 == 0 &&
+                 llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull)) {
+                vbr_ledger_scan_service(wm_next);
             }
             // S5: the wave's transcodes/scrubs are queued on each pool's side stream — arm that
             // device's fence so the next graph_compute GPU-waits on them; the host proceeds straight
@@ -2620,6 +2636,17 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
     if (cap < budget_eff) {
         budget_eff = cap;
     }
+    // co-tenancy (mapped-anchored invariant): subtract this pool's unamortized grant
+    // decrements, then floor at mapped — the floor binds precisely in the shed->flush
+    // window so no consumer (including our own degrade loop) ever sees a budget below
+    // what is physically mapped. budget_eff = max(mapped, min(budget, live_cap) - Σdecr).
+    budget_eff = budget_eff > p.grant_decrement ? budget_eff - p.grant_decrement : 0;
+    if (budget_eff < mapped_now) {
+        budget_eff = mapped_now;
+    }
+#ifndef NDEBUG
+    GGML_ASSERT(budget_eff >= mapped_now);
+#endif
     p.budget_eff_stamp = vbr_boundary_count_;
     p.budget_eff_cache = budget_eff;
     return budget_eff;
@@ -4118,6 +4145,322 @@ size_t llama_kv_cache::vbr_shed_available(int device) const {
         }
     }
     return total;
+}
+
+// ---- co-tenancy donor side (P2) ----
+
+const std::string & llama_kv_cache::vbr_pool_busid(vbr_pool & p) const {
+    if (p.busid.empty() && p.backend != nullptr) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(p.backend);
+        if (dev != nullptr) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            if (props.device_id != nullptr) {
+                p.busid = props.device_id;
+            }
+        }
+        if (p.busid.empty()) {
+            p.busid = "-"; // resolved-and-absent sentinel: never retry, never publish
+        }
+    }
+    return p.busid;
+}
+
+size_t llama_kv_cache::vbr_total_grant_decrement() const {
+    size_t total = 0;
+    for (const auto & p : vbr_pools_) {
+        total += p.grant_decrement;
+    }
+    return total;
+}
+
+// recompute each pool's decrement sum from the grant rows and bust the budget memos —
+// called only on grant mutation / amortization change (scan events), never per boundary
+void llama_kv_cache::vbr_apply_grant_decrements() {
+    for (auto & p : vbr_pools_) {
+        p.grant_decrement = 0;
+    }
+    for (const auto & g : vbr_grants_) {
+        if (g.pool_idx < vbr_pools_.size()) {
+            vbr_pools_[g.pool_idx].grant_decrement += g.bytes; // amortization already folded in
+        }
+    }
+    for (auto & p : vbr_pools_) {
+        p.budget_eff_stamp = ~0ull;
+    }
+}
+
+// dir-mtime pre-check, every boundary OUTSIDE the stable gate (~1µs stat): a rename in the
+// ledger (new claim, phase flip, peer offer) forces the full controller path this boundary
+void llama_kv_cache::vbr_ledger_precheck() {
+    if (!vbr_vmm_active() || !llama_vram_ledger_armed()) {
+        return;
+    }
+    const uint64_t mtime = llama_vram_ledger_dir_mtime_ns();
+    if (mtime != vbr_ledger_mtime_) {
+        // adopt immediately: our own upcoming renames re-stat and re-adopt after writing
+        vbr_ledger_mtime_ = mtime;
+        vbr_ledger_force_ = true;
+    }
+}
+
+// full ledger pass: grant upkeep (lift / amortize), demand service (rank-0 shed sizing →
+// decrement + capped waves), marker publish/beat. Runs inside the !vbr_stable branch after
+// the pool's own degrade loop and before the existing fence-arm (a demand wave queued here
+// is fenced by that same loop).
+void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
+    // explicit budgets still run the pass — they publish markers (shed_available = 0,
+    // demand service skipped) so the demander's presence census stays complete
+    if (!vbr_vmm_active() || !llama_vram_ledger_armed()) {
+        return;
+    }
+    vbr_ledger_force_ = false;
+    vbr_last_scan_ns_ = llama_vram_ledger_now_ns();
+
+    std::vector<llama_vram_peer_claim> claims;
+    llama_vram_ledger_scan(claims);
+    std::vector<llama_vram_peer_marker> peers;
+    llama_vram_ledger_scan_markers(peers);
+    const uint64_t now = vbr_last_scan_ns_;
+
+    // ---- grant upkeep: lift on claim-disappearance-with-live-pid / pid-death /
+    // heartbeat-stall; amortize surviving demanded-device rows by the claim's bytes_now ----
+    bool grants_changed = false;
+    for (auto it = vbr_grants_.begin(); it != vbr_grants_.end(); ) {
+        auto & g = *it;
+        const llama_vram_peer_claim * claim = nullptr;
+        bool any_claim_of_owner = false;
+        for (const auto & c : claims) {
+            if (c.pid == g.pid && c.starttime == g.starttime && c.fields.ver == g.ver) {
+                any_claim_of_owner = true;
+                if (c.busid == g.busid) {
+                    claim = &c;
+                }
+            }
+        }
+        bool lift = false;
+        if (!llama_vram_ledger_pid_alive(g.pid, g.starttime)) {
+            lift = true; // trivial lift on death
+        } else if (!any_claim_of_owner) {
+            lift = true; // claim-complete or runtime CLEAR: disappearance with live pid
+        } else if (claim != nullptr) {
+            // heartbeat-stall (flat 3·BEAT rule): the ≤BEAT writer thread makes cadence
+            // decode-independent, so a stalled beat means a wedged demander
+            auto & o = vbr_claim_obs_[g.busid + "-" + std::to_string(g.pid)];
+            if (o.change_ns == 0 || o.counter != claim->hb_counter) {
+                o.counter   = claim->hb_counter;
+                o.change_ns = now;
+            } else if (now - o.change_ns > (uint64_t) LLAMA_VRAM_LEDGER_HB_STALL_MS * 1000000ull) {
+                lift = true;
+            }
+            if (!lift && !g.collateral) {
+                // clamped amortization: the demander's landed bytes release the decrement
+                const uint64_t delta = claim->bytes_now > g.bytes_now_at_grant
+                                       ? claim->bytes_now - g.bytes_now_at_grant : 0;
+                const uint64_t decr  = delta < g.bytes ? g.bytes - delta : 0;
+                if (decr != g.bytes) {
+                    g.bytes = decr; // bytes now carries the LIVE decrement
+                    g.bytes_now_at_grant = claim->bytes_now;
+                    grants_changed = true;
+                    if (g.bytes == 0) {
+                        lift = true;
+                    }
+                }
+            }
+        }
+        // collateral rows: delta_i = 0 — decrement holds in full until the lift event
+        if (lift) {
+            it = vbr_grants_.erase(it);
+            grants_changed = true;
+        } else {
+            ++it;
+        }
+    }
+
+    // ---- demand service: rank-0 shed sizing ----
+    // one band per donor per session-generation is enforced by the band cursor itself
+    // (monotone: once spent, shed_available stays 0 until vbr_full_reset)
+    for (const auto & c : claims) {
+        if (c.fields.phase != LLAMA_VRAM_CLAIM_DEMAND) {
+            continue;
+        }
+        // already granted to this (pid, starttime, ver) on this device? one decision, one shed
+        bool granted = false;
+        for (const auto & g : vbr_grants_) {
+            if (g.pid == c.pid && g.starttime == c.starttime && g.ver == c.fields.ver &&
+                g.busid == c.busid && !g.collateral) {
+                granted = true;
+                break;
+            }
+        }
+        if (granted || vbr_budget_explicit_) {
+            continue;
+        }
+        // does the demand name one of our devices, and do we have an offer there?
+        vbr_pool * demanded_pool = nullptr;
+        for (auto & p : vbr_pools_) {
+            if (p.vmm != nullptr && vbr_pool_busid(p) == c.busid) {
+                demanded_pool = &p;
+                break;
+            }
+        }
+        if (demanded_pool == nullptr) {
+            continue;
+        }
+        const size_t our_offer = vbr_shed_available(demanded_pool->device);
+        if (our_offer == 0) {
+            continue;
+        }
+        // rank-0 among FRESH offering markers on the demanded device (created_ts, pid) —
+        // our created_ts is the marker's first-publish time; peers' come from the scan
+        const auto our_pub = vbr_marker_pub_.find(c.busid);
+        bool rank0 = true;
+        for (const auto & m : peers) {
+            if (m.busid != c.busid || m.fields.shed_available == 0) {
+                continue;
+            }
+            // freshness for donor selection instantiates with LONG/2
+            auto & o = vbr_claim_obs_["m-" + m.busid + "-" + std::to_string(m.pid)];
+            if (o.change_ns == 0 || o.counter != m.hb_counter) {
+                o.counter   = m.hb_counter;
+                o.change_ns = now;
+            }
+            if (now - o.change_ns >= (uint64_t) LLAMA_VRAM_LEDGER_LONG_MS/2 * 1000000ull) {
+                continue; // stale offer — not a competitor
+            }
+            // peers' created_ts vs ours: ours is unknowable from our own map (publish
+            // stamps it internally) — use pid as the deterministic total order fallback
+            // when created_ts ties are possible; the ledger's created_ts is authoritative
+            if (m.created_ts_ns < vbr_marker_created_ts_ ||
+                (m.created_ts_ns == vbr_marker_created_ts_ && m.pid < llama_vram_ledger_self_pid())) {
+                rank0 = false;
+                break;
+            }
+        }
+        GGML_UNUSED(our_pub);
+        if (!rank0) {
+            continue;
+        }
+        // shortfall = est − (free − headroom) − Σ peers' grant_pending (bridges shed→flush)
+        size_t free_b = 0, total_b = 0;
+        demanded_pool->be->get_device_memory(demanded_pool->device, &free_b, &total_b);
+        static const size_t headroom = [] {
+            const char * e = getenv("VBR_VRAM_HEADROOM_MIB");
+            return (size_t) (e ? strtoull(e, nullptr, 10) : 192) * 1024 * 1024;
+        }();
+        uint64_t peers_pending = 0;
+        for (const auto & m : peers) {
+            if (m.busid == c.busid) {
+                peers_pending += m.fields.grant_pending;
+            }
+        }
+        const uint64_t covered = (free_b > headroom ? free_b - headroom : 0) + peers_pending;
+        if (c.fields.bytes_total_remaining_est <= covered) {
+            continue; // shortfall ≤ 0: free (or peers' in-flight sheds) already cover it
+        }
+        const uint64_t shortfall = c.fields.bytes_total_remaining_est - covered;
+        const uint64_t target    = std::min<uint64_t>(our_offer, shortfall);
+
+        // decrement-driven shed: record per-pool projections, apply the decrement to the
+        // demanded pool, run band-capped waves NOW (we are after the pool's own degrade
+        // loop; the existing fence-arm right after covers these waves too)
+        std::vector<size_t> proj_before(vbr_pools_.size(), 0);
+        for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+            if (vbr_pools_[pi].vmm != nullptr) {
+                proj_before[pi] = vbr_vmm_projected_bytes(vbr_pools_[pi], wm_next);
+            }
+        }
+        const size_t band_limit = std::min(vbr_degrade_limit_, t8_band_end_);
+        size_t freed_demanded = 0;
+        while (freed_demanded < target && vbr_degrade_cursor_ < band_limit) {
+            if (!vbr_degrade_next(wm_next)) {
+                break;
+            }
+            vbr_quiet_boundaries_ = 0;
+            freed_demanded = proj_before[demanded_pool - vbr_pools_.data()]
+                           - vbr_vmm_projected_bytes(*demanded_pool, wm_next);
+        }
+        // grant rows per affected pool (collateral on non-demanded devices), grant_pending
+        // on each affected device's marker
+        for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+            auto & p = vbr_pools_[pi];
+            if (p.vmm == nullptr) {
+                continue;
+            }
+            const size_t proj_now = vbr_vmm_projected_bytes(p, wm_next);
+            if (proj_now >= proj_before[pi]) {
+                continue;
+            }
+            const uint64_t freed = proj_before[pi] - proj_now;
+            vbr_grant_row g;
+            g.busid              = c.busid;
+            g.pid                = c.pid;
+            g.starttime          = c.starttime;
+            g.ver                = c.fields.ver;
+            g.pool_idx           = pi;
+            g.bytes              = freed;
+            g.bytes_now_at_grant = c.bytes_now;
+            g.collateral         = vbr_pool_busid(p) != c.busid;
+            vbr_grants_.push_back(std::move(g));
+            grants_changed = true;
+            vbr_grant_pending_[vbr_pool_busid(p)] += freed;
+            LLAMA_LOG_INFO("%s: co-tenancy shed for pid %d on %s: %.1f MiB freed from pool #%zu%s\n",
+                    __func__, c.pid, c.busid.c_str(), freed/1048576.0, pi,
+                    g.collateral ? " (collateral)" : "");
+        }
+    }
+
+    if (grants_changed) {
+        vbr_apply_grant_decrements();
+    }
+
+    // ---- grant_pending clear: first scan event after the wave's deferred unmaps flushed ----
+    for (auto & [busid, pending] : vbr_grant_pending_) {
+        if (pending == 0) {
+            continue;
+        }
+        bool flushed = true;
+        for (auto & p : vbr_pools_) {
+            if (p.vmm != nullptr && vbr_pool_busid(p) == busid && !p.unmap_deferred.empty()) {
+                flushed = false;
+                break;
+            }
+        }
+        if (flushed) {
+            pending = 0;
+        }
+    }
+
+    // ---- marker publish / beat (write discipline: rename only on field change) ----
+    for (auto & p : vbr_pools_) {
+        if (p.vmm == nullptr) {
+            continue;
+        }
+        const std::string & busid = vbr_pool_busid(p);
+        if (busid == "-") {
+            continue;
+        }
+        const uint64_t offer   = vbr_budget_explicit_ ? 0 : (uint64_t) vbr_shed_available(p.device);
+        const uint64_t pending = vbr_grant_pending_[busid];
+        auto pub = vbr_marker_pub_.find(busid);
+        if (pub == vbr_marker_pub_.end() || pub->second.first != offer || pub->second.second != pending) {
+            llama_vram_marker_fields f = {};
+            f.vbr            = 1;
+            f.serviced       = llama_vram_marker_serviced_flag() ? 1u : 0u;
+            f.shed_available = offer;
+            f.grant_pending  = pending;
+            if (llama_vram_marker_publish(busid, f)) {
+                vbr_marker_pub_[busid] = { offer, pending };
+                if (vbr_marker_created_ts_ == 0) {
+                    vbr_marker_created_ts_ = now;
+                }
+                // our own rename: re-adopt the dir mtime so we don't trip our own pre-check
+                vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns();
+            }
+        } else {
+            llama_vram_marker_beat(busid);
+        }
+    }
 }
 
 bool llama_kv_cache::get_can_shift() const {
