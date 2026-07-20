@@ -2837,16 +2837,68 @@ size_t llama_kv_cache::vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_c
     return total;
 }
 
-// idle-time maintenance, decode-thread only (llama_memory_breathe). P1 scope: release VBR
-// pages queued for unmap so a quiet server returns memory without waiting for its next
-// decode boundary; the full co-tenancy tick body lands here later. (P2 note: the ledger
-// scan/demand parts of that body are serviced at the parent/context level for composite
-// caches — only per-pool maintenance belongs down here.)
+// idle-time maintenance, decode-thread only (llama_memory_breathe). The co-tenancy tick:
+// an idle resident runs no decode boundaries, so without this it is deaf to demands and
+// its deferred unmaps never flush. Order is normative (design v3.8): flush FIRST (the
+// grant math and mapped-floor argument assume freed physical lands before any budget
+// evaluation), then stash-clear, budget rederive (throttled to every 8th tick, mirroring
+// the boundary throttle), full-reset-if-empty, watermark shrink, ledger scan + demand
+// service, promote step, fence-arm (MANDATORY — the next decode graph races the wave
+// otherwise), boundary count++ (budget memo + promote pacing depend on it).
 void llama_kv_cache::breathe() {
     const size_t flushed = vbr_flush_deferred_unmaps();
     if (flushed > 0) {
         LLAMA_LOG_DEBUG("%s: flushed %zu deferred VBR unmaps at idle\n", __func__, flushed);
     }
+    if (!vbr_vmm_active() || vbr_budget_bytes_ == 0) {
+        return;
+    }
+    if (vbr_stash_dirty_) {
+        for (auto & p : vbr_pools_) {
+            for (size_t j = 0; j < layers.size(); ++j) {
+                p.k[j].stash_valid = 0;
+                p.v[j].stash_valid = 0;
+            }
+        }
+        vbr_stash_dirty_ = false;
+    }
+    if (!vbr_budget_explicit_ && vbr_boundary_count_ % 8 == 0) {
+        vbr_rederive_budget();
+    }
+    uint32_t used_now = 0;
+    for (uint32_t st = 0; st < n_stream; ++st) {
+        used_now += v_cells[st].get_used();
+    }
+    if (vbr_degrade_cursor_ > 0 && used_now == 0) {
+        vbr_full_reset();
+    }
+    const uint32_t wm_next = vbr_watermark_cells(0);
+    vbr_shrink_watermark();
+    vbr_ledger_precheck();
+    if (vbr_ledger_force_ ||
+        llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull) {
+        vbr_ledger_scan_service(wm_next); // demand waves run band-capped inside
+    }
+    // no spontaneous degrade pressure at idle: budget_eff floors at mapped and nothing
+    // grows here, so the general over-budget loop cannot fire — only demand decrements
+    // (band-capped, in the scan) shed. Promotes get their idle chance under the same
+    // gates as the boundary path.
+    vbr_quiet_boundaries_++;
+    static const bool vbr_promote_on = [] {
+        const char * e = getenv("VBR_PROMOTE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4 &&
+        vbr_total_grant_decrement() == 0) {
+        vbr_promote_next(wm_next);
+    }
+    for (auto & p : vbr_pools_) {
+        if (p.wave_pending) {
+            p.be->fence_arm(p.backend);
+            p.wave_pending = false;
+        }
+    }
+    vbr_boundary_count_++;
 }
 
 // S5: unmap tail pages queued by the previous degrade wave. Safe only after the wave's transcodes
