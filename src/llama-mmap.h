@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 #include <cstdio>
+#include <utility>
 
 struct llama_file;
 struct llama_mmap;
@@ -61,8 +62,11 @@ private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 
-    void * host_reg_addr = nullptr;
-    void (*host_unreg_fn)(void *) = nullptr;
+    struct host_reg {
+        void * addr;
+        void (*unreg_fn)(void *);
+    };
+    std::vector<host_reg> host_regs;
 };
 
 struct llama_mlock {

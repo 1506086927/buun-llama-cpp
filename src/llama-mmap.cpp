@@ -621,8 +621,10 @@ llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : p
 
 llama_mmap::~llama_mmap() {
     // unpin before the pages are unmapped by the impl destructor
-    if (host_reg_addr && host_unreg_fn) {
-        host_unreg_fn(host_reg_addr);
+    for (auto & reg : host_regs) {
+        if (reg.addr && reg.unreg_fn) {
+            reg.unreg_fn(reg.addr);
+        }
     }
 }
 
@@ -633,7 +635,7 @@ void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragme
 
 size_t llama_mmap::register_host(size_t first, size_t last, bool (*reg_fn)(void *, size_t), void (*unreg_fn)(void *)) {
 #ifdef _POSIX_MAPPED_FILES
-    if (host_reg_addr || !reg_fn || !unreg_fn || last <= first) {
+    if (!reg_fn || !unreg_fn || last <= first) {
         return 0;
     }
 
@@ -643,12 +645,19 @@ size_t llama_mmap::register_host(size_t first, size_t last, bool (*reg_fn)(void 
     last  = (last + page_size - 1) & ~(page_size - 1);
 
     void * reg_addr = (uint8_t *) pimpl->addr + first;
+    
+    // Avoid double registration with the same unreg_fn (usually implies same backend)
+    for (const auto & reg : host_regs) {
+        if (reg.addr == reg_addr && reg.unreg_fn == unreg_fn) {
+            return last - first; // Already registered
+        }
+    }
+
     if (!reg_fn(reg_addr, last - first)) {
         return 0;
     }
 
-    host_reg_addr  = reg_addr;
-    host_unreg_fn  = unreg_fn;
+    host_regs.push_back({reg_addr, unreg_fn});
     return last - first;
 #else
     GGML_UNUSED(first);

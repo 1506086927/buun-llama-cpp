@@ -43,6 +43,122 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// context checkpoints exist only in process memory and are not part of the
+// llama_state_seq file format. persist them in a sidecar so that action=restore
+// in a fresh process can roll back mid-prompt (e.g. after BPE re-tokenization)
+// instead of forcing a full prompt re-processing.
+static bool checkpoints_save_sidecar(const std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath) {
+    FILE * f = fopen(filepath.c_str(), "wb");
+    if (f == nullptr) {
+        return false;
+    }
+
+    bool ok = true;
+
+    const uint32_t magic   = 0x4C434B50; // "PKCL"
+    const uint32_t version = 2;          // v2 includes ring_data + data_spec
+    const uint32_t count   = (uint32_t) checkpoints.size();
+
+    ok = ok && fwrite(&magic,   sizeof(magic),   1, f) == 1;
+    ok = ok && fwrite(&version, sizeof(version), 1, f) == 1;
+    ok = ok && fwrite(&count,   sizeof(count),   1, f) == 1;
+
+    for (const auto & cur : checkpoints) {
+        const int64_t  n_tokens = cur.n_tokens;
+        const int32_t  pos_min  = cur.pos_min;
+        const int32_t  pos_max  = cur.pos_max;
+
+        const uint64_t n_tgt = (uint64_t) cur.data_tgt.size();
+        const uint64_t n_dft = (uint64_t) cur.data_dft.size();
+        const uint64_t n_rng = (uint64_t) cur.ring_data.size();
+        const uint64_t n_spc = (uint64_t) cur.data_spec.size();
+
+        ok = ok && fwrite(&n_tokens, sizeof(n_tokens), 1, f) == 1;
+        ok = ok && fwrite(&pos_min,  sizeof(pos_min),  1, f) == 1;
+        ok = ok && fwrite(&pos_max,  sizeof(pos_max),  1, f) == 1;
+        ok = ok && fwrite(&n_tgt,    sizeof(n_tgt),    1, f) == 1;
+        ok = ok && fwrite(&n_dft,    sizeof(n_dft),    1, f) == 1;
+        ok = ok && fwrite(&n_rng,    sizeof(n_rng),    1, f) == 1;
+        ok = ok && fwrite(&n_spc,    sizeof(n_spc),    1, f) == 1;
+
+        ok = ok && (n_tgt == 0 || fwrite(cur.data_tgt.data(),  1, n_tgt, f) == n_tgt);
+        ok = ok && (n_dft == 0 || fwrite(cur.data_dft.data(),  1, n_dft, f) == n_dft);
+        ok = ok && (n_rng == 0 || fwrite(cur.ring_data.data(), 1, n_rng, f) == n_rng);
+        ok = ok && (n_spc == 0 || fwrite(cur.data_spec.data(), 1, n_spc, f) == n_spc);
+    }
+
+    fclose(f);
+    return ok;
+}
+
+static bool checkpoints_load_sidecar(std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath, uint32_t max_checkpoints) {
+    FILE * f = fopen(filepath.c_str(), "rb");
+    if (f == nullptr) {
+        return false;
+    }
+
+    uint32_t magic = 0, version = 0, count = 0;
+
+    bool ok = fread(&magic,   sizeof(magic),   1, f) == 1 &&
+              fread(&version, sizeof(version), 1, f) == 1 &&
+              fread(&count,   sizeof(count),   1, f) == 1 &&
+              magic == 0x4C434B50 &&
+              (version == 1 || version == 2) &&
+              count <= max_checkpoints;
+
+    std::list<common_prompt_checkpoint> loaded;
+
+    for (uint32_t i = 0; ok && i < count; ++i) {
+        auto & cur = loaded.emplace_back();
+
+        uint64_t n_tgt = 0, n_dft = 0;
+
+        ok = ok && fread(&cur.n_tokens, sizeof(cur.n_tokens), 1, f) == 1;
+        ok = ok && fread(&cur.pos_min,  sizeof(cur.pos_min),  1, f) == 1;
+        ok = ok && fread(&cur.pos_max,  sizeof(cur.pos_max),  1, f) == 1;
+        ok = ok && fread(&n_tgt,        sizeof(n_tgt),        1, f) == 1;
+        ok = ok && fread(&n_dft,        sizeof(n_dft),        1, f) == 1;
+
+        // refuse absurd blob sizes (16 GiB per blob)
+        ok = ok && n_tgt <= (1ull << 34) && n_dft <= (1ull << 34);
+
+        if (!ok) break;
+
+        cur.data_tgt.resize(n_tgt);
+        cur.data_dft.resize(n_dft);
+
+        ok = ok && (n_tgt == 0 || fread(cur.data_tgt.data(), 1, n_tgt, f) == n_tgt);
+        ok = ok && (n_dft == 0 || fread(cur.data_dft.data(), 1, n_dft, f) == n_dft);
+
+        if (version >= 2) {
+            uint64_t n_rng = 0, n_spc = 0;
+
+            ok = ok && fread(&n_rng, sizeof(n_rng), 1, f) == 1;
+            ok = ok && fread(&n_spc, sizeof(n_spc), 1, f) == 1;
+
+            // sanity: refuse absurd sizes
+            ok = ok && n_rng <= (1ull << 34) && n_spc <= (1ull << 34);
+
+            if (ok) {
+                cur.ring_data.resize(n_rng);
+                cur.data_spec.resize(n_spc);
+
+                ok = ok && (n_rng == 0 || fread(cur.ring_data.data(), 1, n_rng, f) == n_rng);
+                ok = ok && (n_spc == 0 || fread(cur.data_spec.data(), 1, n_spc, f) == n_spc);
+            }
+        }
+    }
+
+    fclose(f);
+
+    if (!ok) {
+        return false;
+    }
+
+    checkpoints = std::move(loaded);
+    return true;
+}
+
 // The dynamic VBR runtime controller flips KV tensor types in place as the context fills; state
 // save/restore, context checkpoints and cache reuse all assume a fixed cache layout and would
 // restore/reuse bytes under the wrong tier. Gate them off whenever the controller can arm.
@@ -2898,15 +3014,6 @@ private:
         queue_results.send(std::move(res));
     }
 
-    // if multimodal is enabled, send an error and return false
-    bool check_no_mtmd(const int id_task) {
-        if (mctx) {
-            send_error(id_task, "This feature is not supported by multimodal", ERROR_TYPE_NOT_SUPPORTED);
-            return false;
-        }
-        return true;
-    }
-
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
@@ -3169,122 +3276,6 @@ private:
         return true;
     }
 
-    // context checkpoints exist only in process memory and are not part of the
-    // llama_state_seq file format. persist them in a sidecar so that action=restore
-    // in a fresh process can roll back mid-prompt (e.g. after BPE re-tokenization)
-    // instead of forcing a full prompt re-processing.
-    static bool checkpoints_save_sidecar(const std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath) {
-        FILE * f = fopen(filepath.c_str(), "wb");
-        if (f == nullptr) {
-            return false;
-        }
-
-        bool ok = true;
-
-        const uint32_t magic   = 0x4C434B50; // "PKCL"
-        const uint32_t version = 2;          // v2 includes ring_data + data_spec
-        const uint32_t count   = (uint32_t) checkpoints.size();
-
-        ok = ok && fwrite(&magic,   sizeof(magic),   1, f) == 1;
-        ok = ok && fwrite(&version, sizeof(version), 1, f) == 1;
-        ok = ok && fwrite(&count,   sizeof(count),   1, f) == 1;
-
-        for (const auto & cur : checkpoints) {
-            const int64_t  n_tokens = cur.n_tokens;
-            const int32_t  pos_min  = cur.pos_min;
-            const int32_t  pos_max  = cur.pos_max;
-
-            const uint64_t n_tgt = (uint64_t) cur.data_tgt.size();
-            const uint64_t n_dft = (uint64_t) cur.data_dft.size();
-            const uint64_t n_rng = (uint64_t) cur.ring_data.size();
-            const uint64_t n_spc = (uint64_t) cur.data_spec.size();
-
-            ok = ok && fwrite(&n_tokens, sizeof(n_tokens), 1, f) == 1;
-            ok = ok && fwrite(&pos_min,  sizeof(pos_min),  1, f) == 1;
-            ok = ok && fwrite(&pos_max,  sizeof(pos_max),  1, f) == 1;
-            ok = ok && fwrite(&n_tgt,    sizeof(n_tgt),    1, f) == 1;
-            ok = ok && fwrite(&n_dft,    sizeof(n_dft),    1, f) == 1;
-            ok = ok && fwrite(&n_rng,    sizeof(n_rng),    1, f) == 1;
-            ok = ok && fwrite(&n_spc,    sizeof(n_spc),    1, f) == 1;
-
-            ok = ok && (n_tgt == 0 || fwrite(cur.data_tgt.data(),  1, n_tgt, f) == n_tgt);
-            ok = ok && (n_dft == 0 || fwrite(cur.data_dft.data(),  1, n_dft, f) == n_dft);
-            ok = ok && (n_rng == 0 || fwrite(cur.ring_data.data(), 1, n_rng, f) == n_rng);
-            ok = ok && (n_spc == 0 || fwrite(cur.data_spec.data(), 1, n_spc, f) == n_spc);
-        }
-
-        fclose(f);
-        return ok;
-    }
-
-    static bool checkpoints_load_sidecar(std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath) {
-        FILE * f = fopen(filepath.c_str(), "rb");
-        if (f == nullptr) {
-            return false;
-        }
-
-        uint32_t magic = 0, version = 0, count = 0;
-
-        bool ok = fread(&magic,   sizeof(magic),   1, f) == 1 &&
-                  fread(&version, sizeof(version), 1, f) == 1 &&
-                  fread(&count,   sizeof(count),   1, f) == 1 &&
-                  magic == 0x4C434B50 &&
-                  (version == 1 || version == 2) &&
-                  count <= 1024;
-
-        std::list<common_prompt_checkpoint> loaded;
-
-        for (uint32_t i = 0; ok && i < count; ++i) {
-            auto & cur = loaded.emplace_back();
-
-            uint64_t n_tgt = 0, n_dft = 0;
-
-            ok = ok && fread(&cur.n_tokens, sizeof(cur.n_tokens), 1, f) == 1;
-            ok = ok && fread(&cur.pos_min,  sizeof(cur.pos_min),  1, f) == 1;
-            ok = ok && fread(&cur.pos_max,  sizeof(cur.pos_max),  1, f) == 1;
-            ok = ok && fread(&n_tgt,        sizeof(n_tgt),        1, f) == 1;
-            ok = ok && fread(&n_dft,        sizeof(n_dft),        1, f) == 1;
-
-            // refuse absurd blob sizes (16 GiB per blob)
-            ok = ok && n_tgt <= (1ull << 34) && n_dft <= (1ull << 34);
-
-            if (!ok) break;
-
-            cur.data_tgt.resize(n_tgt);
-            cur.data_dft.resize(n_dft);
-
-            ok = ok && (n_tgt == 0 || fread(cur.data_tgt.data(), 1, n_tgt, f) == n_tgt);
-            ok = ok && (n_dft == 0 || fread(cur.data_dft.data(), 1, n_dft, f) == n_dft);
-
-            if (version >= 2) {
-                uint64_t n_rng = 0, n_spc = 0;
-
-                ok = ok && fread(&n_rng, sizeof(n_rng), 1, f) == 1;
-                ok = ok && fread(&n_spc, sizeof(n_spc), 1, f) == 1;
-
-                // sanity: refuse absurd sizes
-                ok = ok && n_rng <= (1ull << 34) && n_spc <= (1ull << 34);
-
-                if (ok) {
-                    cur.ring_data.resize(n_rng);
-                    cur.data_spec.resize(n_spc);
-
-                    ok = ok && (n_rng == 0 || fread(cur.ring_data.data(), 1, n_rng, f) == n_rng);
-                    ok = ok && (n_spc == 0 || fread(cur.data_spec.data(), 1, n_spc, f) == n_spc);
-                }
-            }
-        }
-
-        fclose(f);
-
-        if (!ok) {
-            return false;
-        }
-
-        checkpoints = std::move(loaded);
-        return true;
-    }
-
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -3537,6 +3528,11 @@ private:
                     const auto tokens = slot->prompt.tokens.get_text_tokens();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
+                    if (nwrite == 0) {
+                        send_error(task, "Failed to save slot state to file", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
                     // persist context checkpoints alongside the state file so that a
                     // restore in a fresh process can roll back mid-prompt instead of
                     // forcing a full re-prefill.
@@ -3546,6 +3542,9 @@ private:
                         } else {
                             SLT_WRN(*slot, "failed to write checkpoint sidecar %s\n", (filepath + ".ckpt").c_str());
                         }
+                    } else {
+                        std::error_code ec;
+                        std::filesystem::remove(filepath + ".ckpt", ec);
                     }
 
                     const int64_t t_end = ggml_time_us();
@@ -3599,7 +3598,7 @@ private:
                     // if no sidecar exists (state saved by an older build), fall back to
                     // synthesizing a tip checkpoint from the just-restored state.
                     if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
-                        if (!checkpoints_load_sidecar(slot->prompt.checkpoints, filepath + ".ckpt")) {
+                        if (!checkpoints_load_sidecar(slot->prompt.checkpoints, filepath + ".ckpt", params_base.n_ctx_checkpoints)) {
                             const llama_pos p_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
                             const llama_pos p_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
                             if (p_min >= 0 && p_max >= p_min) {

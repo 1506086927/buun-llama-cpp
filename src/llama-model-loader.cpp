@@ -1675,15 +1675,6 @@ bool llama_model_loader::load_all_data(
     if (size_done >= size_data) {
         // unmap offloaded tensors and metadata
         if (use_mmap) {
-            // pin the pages backing the weights kept in system memory for faster H2D copies
-            bool (*reg_fn)(void *, size_t) = nullptr;
-            void (*unreg_fn)(void *) = nullptr;
-            for (size_t i = 0; i < ggml_backend_dev_count() && !reg_fn; i++) {
-                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_dev_get(i));
-                reg_fn   = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
-                unreg_fn = (void (*)(void *))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
-            }
-
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
@@ -1692,7 +1683,19 @@ bool llama_model_loader::load_all_data(
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
                 if (mmap_used.second > mmap_used.first) {
-                    size_t n_registered = mapping->register_host(mmap_used.first, mmap_used.second, reg_fn, unreg_fn);
+                    size_t n_registered = 0;
+                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+                        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                        if (!reg) continue;
+                        auto reg_fn   = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+                        auto unreg_fn = (void (*)(void *))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+                        if (reg_fn && unreg_fn) {
+                            size_t res = mapping->register_host(mmap_used.first, mmap_used.second, reg_fn, unreg_fn);
+                            if (res > n_registered) n_registered = res;
+                        }
+                    }
                     if (n_registered > 0) {
                         LLAMA_LOG_INFO("%s: pinned %.2f MiB of mapped model memory for faster H2D transfers\n",
                                 __func__, n_registered / 1024.0 / 1024.0);
