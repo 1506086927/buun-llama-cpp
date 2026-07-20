@@ -3268,6 +3268,15 @@ private:
                             }
                             const int64_t cells_available = (int64_t) slot->n_ctx - cells_committed;
                             if (cells_available < (int64_t) task.n_tokens()) {
+                                // never-fits: reject instead of deferring forever (silent hang)
+                                if (task.n_tokens() > slot->n_ctx) {
+                                    send_error(task.id,
+                                               string_format(
+                                                   "request (%d tokens) exceeds the total context size (%d tokens), try increasing it",
+                                                   task.n_tokens(), slot->n_ctx),
+                                               ERROR_TYPE_EXCEED_CONTEXT_SIZE, task.n_tokens(), slot->n_ctx);
+                                    break; // drop the task
+                                }
                                 SRV_DBG("defer task %d: needs %d tokens but only %" PRId64 " cells available (%" PRId64 " committed by active slots)\n",
                                         id_task, task.n_tokens(), cells_available, cells_committed);
                                 queue_tasks.defer(std::move(task));
