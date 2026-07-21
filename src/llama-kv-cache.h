@@ -479,11 +479,16 @@ private:
 
 public:
     // co-tenancy: exactly one cache per memory tree runs the ledger protocol; composite
-    // parents (iSWA) demote all but one child. Non-owners keep every local mechanism
-    // (budget, band, waves) but never scan, serve, or publish.
+    // parents (iSWA) demote all but one child and hand the owner a sibling pointer so the
+    // tree's offer is the SUM and demand targets split by offer weight. Non-owners keep
+    // every local mechanism (budget, band, waves, grants on their own pools) but never
+    // scan, serve, or publish themselves.
     void vbr_set_ledger_owner(bool owner) { vbr_ledger_owner_ = owner; }
+    void vbr_set_ledger_sibling(llama_kv_cache * sib) { vbr_ledger_sibling_ = sib; }
+    size_t vbr_execute_shed(const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next);
 private:
     bool vbr_ledger_owner_ = true;
+    llama_kv_cache * vbr_ledger_sibling_ = nullptr;
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)
