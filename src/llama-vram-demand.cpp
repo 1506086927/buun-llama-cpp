@@ -32,6 +32,10 @@ struct hb_obs {
     uint64_t change_ns = 0;
 };
 
+// strictly linear attempt lifecycle: IDLE -> PROBE (first failure opens the attempt)
+// -> DEMAND (committed) -> SATISFIED (load done); unlink resets to IDLE from any phase
+enum class phase { IDLE, PROBE, DEMAND, SATISFIED };
+
 struct demander {
     // process-wide plan hints (device_id/busid -> bytes), set before load
     std::map<std::string, uint64_t> plan;
@@ -43,9 +47,7 @@ struct demander {
     bool terminal_failed = false;
 
     // live attempt
-    bool     attempt_open  = false;
-    bool     committed     = false; // probe -> demand happened
-    bool     satisfied     = false;
+    phase    ph            = phase::IDLE;
     uint64_t ver           = 0;
     uint64_t created_ts    = 0;
     uint64_t deadline      = 0;     // patience deadline (extensible, capped)
@@ -93,14 +95,12 @@ uint64_t observe_hb(demander & d, const std::string & key, uint64_t counter, uin
 }
 
 void unlink_all(demander & d, const char * reason) {
-    if (d.attempt_open) {
+    if (d.ph != phase::IDLE) {
         LLAMA_LOG_INFO("vram-demand: attempt ver %llu closed (%s)\n",
                 (unsigned long long) d.ver, reason);
     }
     llama_vram_claim_withdraw_all();
-    d.attempt_open = false;
-    d.committed    = false;
-    d.satisfied    = false;
+    d.ph = phase::IDLE;
     d.devs.clear();
     d.marker_obs.clear();
     d.claim_progress.clear();
@@ -136,6 +136,173 @@ bool publish_claims(demander & d, llama_vram_claim_phase phase) {
     return any;
 }
 
+// ---- the hold loop, decomposed ----
+
+// no substrate: honor SHORT patience with plain backoff — the grace for a resident that
+// cannot be seen is pointless, but a clean bounded wait keeps behavior uniform (design:
+// clean fail + SHORT patience)
+bool hold_bare() {
+    static thread_local uint64_t bare_deadline = 0;
+    const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (bare_deadline == 0) {
+        bare_deadline = now + (uint64_t) LLAMA_VRAM_LEDGER_SHORT_MS * NS_PER_MS;
+    }
+    if (now >= bare_deadline) {
+        bare_deadline = 0;
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(LLAMA_VRAM_LEDGER_BEAT_MS));
+    return true;
+}
+
+// everything one round needs from the marker set, aggregated per busid with ONE
+// observe_hb per marker. Each age is recorded once and compared against both freshness
+// windows: LONG/2 qualifies a donor beat for the patience upgrade, the selected
+// window/2 gates offer counting — they differ until the upgrade lands.
+struct marker_agg {
+    bool     any_marker        = false;
+    bool     all_fresh         = true;  // every beat inside the offer window
+    bool     fresh_offer       = false; // ∃ fresh marker with a live offer
+    uint64_t offers_fresh_sum  = 0;     // Σ shed_available over fresh offers
+    uint64_t grant_pending_sum = 0;
+};
+
+struct marker_scan {
+    std::map<std::string, marker_agg> per_dev; // busid -> aggregate
+    // first qualifying donor beat (serviced VBR resident with a live offer on a demanded
+    // device, fresh within LONG/2) — the patience-upgrade trigger, kept per marker so
+    // the log names the donor
+    bool        beat_seen  = false;
+    std::string beat_busid;
+    int32_t     beat_pid   = 0;
+    uint64_t    beat_offer = 0;
+};
+
+marker_scan scan_markers_once(demander & d, const std::vector<llama_vram_peer_marker> & markers,
+                              uint64_t now, uint64_t fresh_ns, uint64_t offer_fresh) {
+    marker_scan sc;
+    for (const auto & m : markers) {
+        const uint64_t age = observe_hb(d, m.busid + "-" + std::to_string(m.pid), m.hb_counter, now);
+        auto & agg = sc.per_dev[m.busid];
+        agg.any_marker = true;
+        if (age >= offer_fresh) {
+            agg.all_fresh = false;
+        } else if (m.fields.shed_available > 0) {
+            agg.fresh_offer = true;
+            agg.offers_fresh_sum += m.fields.shed_available;
+        }
+        agg.grant_pending_sum += m.fields.grant_pending;
+        const auto dv = d.devs.find(m.busid);
+        const bool demanded_dev = dv != d.devs.end() && dv->second.demanded;
+        if (!sc.beat_seen && demanded_dev &&
+            m.fields.serviced == 1 && m.fields.vbr == 1 &&
+            m.fields.shed_available > 0 && age < fresh_ns) {
+            sc.beat_seen  = true;
+            sc.beat_busid = m.busid;
+            sc.beat_pid   = m.pid;
+            sc.beat_offer = m.fields.shed_available;
+        }
+    }
+    return sc;
+}
+
+// ---- patience upgrade (sticky): a qualifying beat inside the active window ----
+void apply_patience_upgrade(demander & d, const marker_scan & sc, uint64_t now, uint64_t cap) {
+    if (d.long_window || now >= d.deadline || !sc.beat_seen) {
+        return;
+    }
+    d.long_window = true;
+    d.deadline = std::min(cap, now + (uint64_t) LLAMA_VRAM_LEDGER_LONG_MS * NS_PER_MS);
+    LLAMA_LOG_INFO("vram-demand: potential donor on %s (pid %d, offer %.1f MiB) — patience %llds\n",
+            sc.beat_busid.c_str(), sc.beat_pid, sc.beat_offer/1048576.0,
+            (long long) LLAMA_VRAM_LEDGER_LONG_MS/1000);
+}
+
+// post-commit progress: grant_pending on a demanded device's donor marker
+bool grant_progress_seen(const demander & d, const marker_scan & sc) {
+    for (const auto & [b, s] : d.devs) {
+        if (!s.demanded) {
+            continue;
+        }
+        const auto it = sc.per_dev.find(b);
+        if (it != sc.per_dev.end() && it->second.grant_pending_sum > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// READY ⟺ free-covers ∨ ∃ fresh offer ∨ (markers nonempty ∧ all fresh)
+bool dev_ready(const dev_state & s, const std::string & busid, const marker_scan & sc) {
+    const uint64_t free_b = dev_free(s.dev);
+    const uint64_t need   = est_remaining(s);
+    if (free_b >= need + llama_vram_headroom_bytes()) {
+        return true; // free covers
+    }
+    const auto it = sc.per_dev.find(busid);
+    if (it == sc.per_dev.end()) {
+        return false; // offers needed, no markers at all
+    }
+    return it->second.fresh_offer || (it->second.any_marker && it->second.all_fresh);
+}
+
+// joint sufficiency across the demanded set — logs every falling-short device
+bool jointly_sufficient(const demander & d, const marker_scan & sc) {
+    bool sufficient = true;
+    for (const auto & [b, s] : d.devs) {
+        if (!s.demanded || s.dev == nullptr) {
+            continue;
+        }
+        const auto it = sc.per_dev.find(b);
+        const uint64_t offers   = it != sc.per_dev.end() ? it->second.offers_fresh_sum : 0;
+        const uint64_t free_b   = dev_free(s.dev);
+        const uint64_t headroom = llama_vram_headroom_bytes();
+        const uint64_t have     = offers + (free_b > headroom ? free_b - headroom : 0);
+        if (have < est_remaining(s)) {
+            LLAMA_LOG_WARN("vram-demand: device %s insufficient even with offers "
+                    "(need %.1f MiB, offers %.1f MiB + free %.1f MiB)\n",
+                    b.c_str(), est_remaining(s)/1048576.0, offers/1048576.0, free_b/1048576.0);
+            sufficient = false;
+        }
+    }
+    return sufficient;
+}
+
+enum class tiebreak { PROCEED, OUTWAIT, YIELD };
+
+// earlier live claimants win ties: outwait the first one within patience; if it
+// PROGRESSES, yield — fail fast rather than both grinding to expiry
+tiebreak tie_break(demander & d, const std::vector<llama_vram_peer_claim> & claims) {
+    for (const auto & c : claims) {
+        if (c.fields.created_ts_ns < d.created_ts ||
+            (c.fields.created_ts_ns == d.created_ts && c.pid < llama_vram_ledger_self_pid())) {
+            const std::string key = "claim-" + c.busid + "-" + std::to_string(c.pid);
+            const auto it = d.claim_progress.find(key);
+            if (it != d.claim_progress.end() && c.bytes_now > it->second) {
+                LLAMA_LOG_WARN("vram-demand: earlier claimant pid %d is progressing — yielding\n", c.pid);
+                return tiebreak::YIELD;
+            }
+            d.claim_progress[key] = c.bytes_now;
+            return tiebreak::OUTWAIT;
+        }
+    }
+    return tiebreak::PROCEED;
+}
+
+// backoff ∈ [BEAT, 2·BEAT], final step clamped to the deadline — the shared tail of
+// every keep-holding round
+bool backoff_step(const demander & d, uint64_t now, uint64_t cap) {
+    uint64_t sleep_ms = (uint64_t) LLAMA_VRAM_LEDGER_BEAT_MS
+                      + (d.ver + (now / NS_PER_MS)) % (uint64_t) LLAMA_VRAM_LEDGER_BEAT_MS;
+    const uint64_t hard = d.ph >= phase::DEMAND ? d.deadline : cap;
+    if (now + sleep_ms * NS_PER_MS > hard) {
+        sleep_ms = std::max<uint64_t>(1, (hard - now) / NS_PER_MS);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+    return true;
+}
+
 } // namespace
 
 void llama_vram_plan_hint_set(const char * device_id, uint64_t bytes) {
@@ -169,7 +336,7 @@ ggml_backend_buffer_t llama_vram_hold_alloc_ctx_tensors(ggml_context * ctx,
 
 void llama_vram_demand_alloc_landed(ggml_backend_dev_t dev, size_t bytes) {
     auto & d = dm();
-    if (!d.attempt_open) {
+    if (d.ph == phase::IDLE) {
         return;
     }
     const std::string busid = dev_busid(dev);
@@ -184,21 +351,7 @@ void llama_vram_demand_alloc_landed(ggml_backend_dev_t dev, size_t bytes) {
 bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
     auto & d = dm();
     if (!llama_vram_ledger_armed()) {
-        // no substrate: honor SHORT patience with plain backoff — the grace for a
-        // resident that cannot be seen is pointless, but a clean bounded wait keeps
-        // behavior uniform (design: clean fail + SHORT patience)
-        static thread_local uint64_t bare_deadline = 0;
-        const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (bare_deadline == 0) {
-            bare_deadline = now + (uint64_t) LLAMA_VRAM_LEDGER_SHORT_MS * NS_PER_MS;
-        }
-        if (now >= bare_deadline) {
-            bare_deadline = 0;
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(LLAMA_VRAM_LEDGER_BEAT_MS));
-        return true;
+        return hold_bare();
     }
 
     const uint64_t now = llama_vram_ledger_now_ns();
@@ -210,11 +363,9 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
         return false; // this load already negotiated and lost — fail fast
     }
 
-    // ---- attempt open (ABSENT -> PROBE) ----
-    if (!d.attempt_open) {
-        d.attempt_open = true;
-        d.committed    = false;
-        d.satisfied    = false;
+    // ---- attempt open (IDLE -> PROBE) ----
+    if (d.ph == phase::IDLE) {
+        d.ph = phase::PROBE;
         d.ver++;
         d.created_ts   = now;
         d.long_window  = false;
@@ -247,7 +398,7 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
             ds.revisions = 1;
             LLAMA_LOG_INFO("vram-demand: est revision on %s -> %.1f MiB remaining\n",
                     busid.c_str(), est_remaining(ds)/1048576.0);
-            if (d.committed) {
+            if (d.ph >= phase::DEMAND) {
                 // donors size their shed from the claim file — the revised est must land
                 publish_claims(d, LLAMA_VRAM_CLAIM_DEMAND);
             }
@@ -266,7 +417,7 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
         }
     }
 
-    if (!d.committed) {
+    if (d.ph == phase::PROBE) {
         publish_claims(d, LLAMA_VRAM_CLAIM_PROBE);
     }
 
@@ -281,113 +432,42 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
     const uint64_t offer_fresh = (uint64_t) window_ms/2 * NS_PER_MS;                 // offer counting uses the selected window
     const uint64_t cap         = d.created_ts + (uint64_t) LLAMA_VRAM_LEDGER_EXT_CAP_MS * NS_PER_MS;
 
-    // ---- patience upgrade (sticky): a qualifying beat inside the active window ----
-    bool progress_event = false;
-    for (const auto & m : markers) {
-        const std::string key = m.busid + "-" + std::to_string(m.pid);
-        const uint64_t age = observe_hb(d, key, m.hb_counter, now);
-        const bool demanded_dev = d.devs.count(m.busid) != 0 && d.devs[m.busid].demanded;
-        if (!d.long_window && now < d.deadline &&
-            m.fields.serviced == 1 && m.fields.vbr == 1 &&
-            m.fields.shed_available > 0 && demanded_dev && age < fresh_ns) {
-            d.long_window = true;
-            d.deadline = std::min(cap, now + (uint64_t) LLAMA_VRAM_LEDGER_LONG_MS * NS_PER_MS);
-            LLAMA_LOG_INFO("vram-demand: potential donor on %s (pid %d, offer %.1f MiB) — patience %llds\n",
-                    m.busid.c_str(), m.pid, m.fields.shed_available/1048576.0,
-                    (long long) LLAMA_VRAM_LEDGER_LONG_MS/1000);
-        }
-        // post-commit progress: grant_pending on a demanded device's donor marker
-        if (d.committed && demanded_dev && m.fields.grant_pending > 0) {
-            progress_event = true;
-        }
-    }
+    const marker_scan sc = scan_markers_once(d, markers, now, fresh_ns, offer_fresh);
+    apply_patience_upgrade(d, sc, now, cap);
+    bool progress_event = d.ph >= phase::DEMAND && grant_progress_seen(d, sc);
 
-    // ---- pre-commit: tie-break against earlier claims, then READY/sufficiency ----
-    if (!d.committed) {
-        for (const auto & c : claims) {
-            if (c.fields.created_ts_ns < d.created_ts ||
-                (c.fields.created_ts_ns == d.created_ts && c.pid < llama_vram_ledger_self_pid())) {
-                // an earlier live claimant: outwait within patience; if it PROGRESSES, we
-                // fail fast rather than both grinding to expiry
-                const std::string key = "claim-" + c.busid + "-" + std::to_string(c.pid);
-                auto it = d.claim_progress.find(key);
-                if (it != d.claim_progress.end() && c.bytes_now > it->second) {
-                    LLAMA_LOG_WARN("vram-demand: earlier claimant pid %d is progressing — yielding\n", c.pid);
-                    unlink_all(d, "lost tie-break");
-                    d.terminal_failed = true;
-                    return false;
-                }
-                d.claim_progress[key] = c.bytes_now;
+    if (d.ph == phase::PROBE) {
+        // ---- pre-commit: tie-break against earlier claims, then READY/sufficiency ----
+        switch (tie_break(d, claims)) {
+            case tiebreak::YIELD:
+                unlink_all(d, "lost tie-break");
+                d.terminal_failed = true;
+                return false;
+            case tiebreak::OUTWAIT:
                 // outwait: skip READY evaluation this round
-                goto backoff;
+                return backoff_step(d, now, cap);
+            case tiebreak::PROCEED:
+                break;
+        }
+        // READY per demanded device, single sufficiency evaluation at the trigger point
+        bool all_ready = true;
+        for (const auto & [b, s] : d.devs) {
+            if (s.demanded && s.dev != nullptr && !dev_ready(s, b, sc)) {
+                all_ready = false;
             }
         }
-        {
-            // READY per demanded device, single sufficiency evaluation at the trigger point
-            bool all_ready = true;
-            for (const auto & [b, s] : d.devs) {
-                if (!s.demanded || s.dev == nullptr) {
-                    continue;
-                }
-                const uint64_t free_b = dev_free(s.dev);
-                const uint64_t need   = est_remaining(s);
-                const bool offers_needed = free_b < need + llama_vram_headroom_bytes();
-                if (!offers_needed) {
-                    continue; // free covers -> READY
-                }
-                bool fresh_offer = false, any_marker = false, all_fresh = true;
-                for (const auto & m : markers) {
-                    if (m.busid != b) {
-                        continue;
-                    }
-                    any_marker = true;
-                    const uint64_t age = observe_hb(d, m.busid + "-" + std::to_string(m.pid), m.hb_counter, now);
-                    if (age >= offer_fresh) {
-                        all_fresh = false;
-                    } else if (m.fields.shed_available > 0) {
-                        fresh_offer = true;
-                    }
-                }
-                // READY ⟺ free-covers ∨ ∃ fresh offer ∨ (markers nonempty ∧ all fresh)
-                if (!fresh_offer && !(any_marker && all_fresh)) {
-                    all_ready = false;
-                }
+        if (all_ready || now >= d.deadline) {
+            // joint sufficiency, evaluated ONCE
+            if (!jointly_sufficient(d, sc)) {
+                unlink_all(d, "insufficient");
+                d.terminal_failed = true;
+                return false;
             }
-            if (all_ready || now >= d.deadline) {
-                // joint sufficiency, evaluated ONCE
-                bool sufficient = true;
-                for (const auto & [b, s] : d.devs) {
-                    if (!s.demanded || s.dev == nullptr) {
-                        continue;
-                    }
-                    uint64_t offers = 0;
-                    for (const auto & m : markers) {
-                        if (m.busid == b && m.fields.shed_available > 0 &&
-                            observe_hb(d, m.busid + "-" + std::to_string(m.pid), m.hb_counter, now) < offer_fresh) {
-                            offers += m.fields.shed_available;
-                        }
-                    }
-                    const uint64_t free_b = dev_free(s.dev);
-                    const uint64_t headroom = llama_vram_headroom_bytes();
-                    const uint64_t have   = offers + (free_b > headroom ? free_b - headroom : 0);
-                    if (have < est_remaining(s)) {
-                        LLAMA_LOG_WARN("vram-demand: device %s insufficient even with offers "
-                                "(need %.1f MiB, offers %.1f MiB + free %.1f MiB)\n",
-                                b.c_str(), est_remaining(s)/1048576.0, offers/1048576.0, free_b/1048576.0);
-                        sufficient = false;
-                    }
-                }
-                if (!sufficient) {
-                    unlink_all(d, "insufficient");
-                    d.terminal_failed = true;
-                    return false;
-                }
-                publish_claims(d, LLAMA_VRAM_CLAIM_DEMAND);
-                d.committed = true;
-                d.last_free_seen = dev_free(dev);
-                LLAMA_LOG_INFO("vram-demand: demand committed (ver %llu) — waiting for donors\n",
-                        (unsigned long long) d.ver);
-            }
+            publish_claims(d, LLAMA_VRAM_CLAIM_DEMAND);
+            d.ph = phase::DEMAND;
+            d.last_free_seen = dev_free(dev);
+            LLAMA_LOG_INFO("vram-demand: demand committed (ver %llu) — waiting for donors\n",
+                    (unsigned long long) d.ver);
         }
     } else {
         // ---- post-commit progress extension: free movement or own landed bytes ----
@@ -398,11 +478,11 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
         d.last_free_seen = free_b;
     }
 
-    if (progress_event && d.committed) {
+    if (progress_event && d.ph >= phase::DEMAND) {
         d.deadline = std::min(cap, now + (uint64_t) LLAMA_VRAM_LEDGER_LONG_MS * NS_PER_MS);
     }
 
-    if (now >= d.deadline && (d.committed || now >= cap)) {
+    if (now >= d.deadline && (d.ph >= phase::DEMAND || now >= cap)) {
         // committed and out of patience (or hard cap): honest per-device failure
         for (const auto & [b, s] : d.devs) {
             if (s.demanded) {
@@ -417,30 +497,19 @@ bool llama_vram_demand_hold(ggml_backend_dev_t dev, size_t bytes) {
         return false;
     }
 
-backoff:
-    // backoff ∈ [BEAT, 2·BEAT], final step clamped to the deadline
-    {
-        uint64_t sleep_ms = (uint64_t) LLAMA_VRAM_LEDGER_BEAT_MS
-                          + (d.ver + (now / NS_PER_MS)) % (uint64_t) LLAMA_VRAM_LEDGER_BEAT_MS;
-        const uint64_t hard = d.committed ? d.deadline : cap;
-        if (now + sleep_ms * NS_PER_MS > hard) {
-            sleep_ms = std::max<uint64_t>(1, (hard - now) / NS_PER_MS);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
-    }
-    return true;
+    return backoff_step(d, now, cap);
 }
 
 void llama_vram_demand_satisfied() {
     auto & d = dm();
     d.terminal_failed = false; // load concluded — the next load negotiates fresh
-    if (!d.attempt_open || !d.committed) {
+    if (d.ph == phase::IDLE || d.ph == phase::PROBE) {
         // an attempt that never committed (or never opened) has nothing to hold onto
         unlink_all(d, "load done without demand");
         return;
     }
     publish_claims(d, LLAMA_VRAM_CLAIM_SATISFIED);
-    d.satisfied = true;
+    d.ph = phase::SATISFIED;
     LLAMA_LOG_INFO("vram-demand: satisfied (ver %llu) — claim held until first decode\n",
             (unsigned long long) d.ver);
 }
@@ -452,12 +521,12 @@ void llama_vram_demand_abandon() {
 
 void llama_vram_demand_complete() {
     auto & d = dm();
-    if (!d.satisfied) {
+    if (d.ph != phase::SATISFIED) {
         return;
     }
     unlink_all(d, "claim-complete");
 }
 
 bool llama_vram_demand_pending_complete() {
-    return dm().satisfied;
+    return dm().ph == phase::SATISFIED;
 }
