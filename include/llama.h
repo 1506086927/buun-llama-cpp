@@ -396,6 +396,9 @@ extern "C" {
         bool vbr_dynamic; // arm the decode-time KV degrade controller (turbo-typed caches decay
                           // tier-by-tier as the context fills; requires flash attention and a
                           // backend exporting the ggml-vbr.h interface) [EXPERIMENTAL]
+        bool vbr_min_bits_explicit; // --vbr-floor was typed: doubles as peer-yield consent —
+                          // co-tenancy demand sheds may walk to the floor instead of
+                          // stopping at the restorable f16->t8 band
         bool vbr_budget_explicit; // vbr_vram_budget_bytes is a user-set HARD CAP: the runtime
                           // must never re-derive it from live free VRAM [EXPERIMENTAL]
         bool vbr_pin_k;   // K side is PINNED at type_k: the degrade/promote ladder never touches

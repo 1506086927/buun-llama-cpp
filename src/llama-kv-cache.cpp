@@ -1304,9 +1304,12 @@ llama_kv_cache::llama_kv_cache(
                     t8_band_end_++;
                 }
             }
-            LLAMA_LOG_INFO("%s: co-tenancy: f16->t8 band = %zu of %zu order steps%s\n",
+            vbr_floor_typed_ = vbr_params_.min_bits_explicit || getenv("VBR_MIN_BITS") != nullptr;
+            LLAMA_LOG_INFO("%s: co-tenancy: f16->t8 band = %zu of %zu order steps%s%s\n",
                     __func__, t8_band_end_, vbr_degrade_order_.size(),
-                    t8_band_end_ == 0 ? " (demand shedding disabled)" : "");
+                    t8_band_end_ == 0 ? " (demand shedding disabled)" : "",
+                    t8_band_end_ != 0 && vbr_floor_typed_
+                        ? " — explicit floor: peer yield consented to the floor" : "");
             vbr_floor_clamp_order();
             vbr_budget_bytes_    = (size_t) vbr_params_.budget_bytes;
             vbr_budget_explicit_ = vbr_params_.budget_explicit;
@@ -4121,7 +4124,7 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
 // cost by ~n_layers and zero every offer. The budget is deliberately not an input: an offer
 // says what shedding COULD free, the grant math decides what it does free.
 size_t llama_kv_cache::vbr_shed_available(int device) const {
-    if (!vbr_vmm_active() || t8_band_end_ == 0) {
+    if (!vbr_vmm_active() || vbr_demand_limit() == 0) {
         return 0;
     }
     uint32_t wm_max = 0;
@@ -4144,7 +4147,7 @@ size_t llama_kv_cache::vbr_shed_available(int device) const {
             }
         }
         std::vector<int64_t> freed(vbr_pools_.size(), 0);
-        for (size_t i = vbr_degrade_cursor_; i < std::min(vbr_degrade_limit_, t8_band_end_); ++i) {
+        for (size_t i = vbr_degrade_cursor_; i < vbr_demand_limit(); ++i) {
             const auto & stp = vbr_degrade_order_[i];
             const auto it = map_layer_ids.find(stp.il);
             if (it == map_layer_ids.end()) {
@@ -4207,7 +4210,7 @@ size_t llama_kv_cache::vbr_shed_available(int device) const {
             dbg_total += s;
         }
         LLAMA_LOG_DEBUG("%s: recompute: band [%zu, %zu) wm %u -> %.1f MiB offerable\n",
-                __func__, vbr_degrade_cursor_, std::min(vbr_degrade_limit_, t8_band_end_),
+                __func__, vbr_degrade_cursor_, vbr_demand_limit(),
                 wm_key, dbg_total/1048576.0);
     }
     size_t total = 0;
@@ -4429,7 +4432,7 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
                 proj_before[pi] = vbr_vmm_projected_bytes(vbr_pools_[pi], wm_next);
             }
         }
-        const size_t band_limit = std::min(vbr_degrade_limit_, t8_band_end_);
+        const size_t band_limit = vbr_demand_limit();
         size_t freed_demanded = 0;
         while (freed_demanded < target && vbr_degrade_cursor_ < band_limit) {
             if (!vbr_degrade_next(wm_next)) {

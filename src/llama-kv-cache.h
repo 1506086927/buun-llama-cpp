@@ -381,6 +381,18 @@ private:
     // co-tenancy: end of the leading f16->t8 band of the order (demand sheds stop here);
     // 0 = no band (custom VBR_DEGRADE_ORDER carries no band guarantee -> demand shed off)
     size_t t8_band_end_ = 0;
+    // peer-yield consent bound (Preston 2026-07-20, explicit-floor-as-consent): a TYPED
+    // --vbr-floor (flag or VBR_MIN_BITS env) consents demand sheds down to the floor —
+    // the ledger is per-uid, so the demander is the same human who typed it. A defaulted
+    // floor keeps the conservative restorable band. 0 = demand shedding disabled.
+    size_t vbr_demand_limit() const {
+        if (t8_band_end_ == 0) {
+            return 0;
+        }
+        return vbr_floor_typed_ ? vbr_degrade_limit_
+                                : std::min(vbr_degrade_limit_, t8_band_end_);
+    }
+    bool vbr_floor_typed_ = false;
     // vbr_shed_available memo: per-pool freed-bytes projection, keyed on (tier epoch,
     // watermark padded to the 256-cell quantum) — budget is deliberately NOT an input
     mutable uint64_t            shed_avail_epoch_ = ~0ull;

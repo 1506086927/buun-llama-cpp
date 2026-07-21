@@ -35,6 +35,8 @@ struct llama_memory_vbr_params {
     bool     dynamic      = false; // arm the VMM pool + decode-time degrade controller
     uint64_t budget_bytes = 0;     // mapped-physical KV budget; 0 = floor-layout-cost fallback
     double   min_bits     = 0.0;   // aggregate bits/value floor (0 = bottom-tier floor)
+    // the floor was TYPED (flag or env): doubles as peer-yield consent down to it
+    bool     min_bits_explicit = false;
     // explicit budgets are HARD CAPS: the runtime never re-derives them from live free VRAM
     // (an auto budget floats within [armed value, live reach] at decode boundaries)
     bool     budget_explicit = false;
