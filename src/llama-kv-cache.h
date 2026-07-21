@@ -462,7 +462,7 @@ private:
     uint64_t vbr_runtime_ver_      = 0;
     uint64_t vbr_last_prepare_ns_  = 0; // decode-based idleness input (ticks never update it)
     std::set<std::string> vbr_runtime_live_; // busids with a live runtime claim
-    void vbr_runtime_demand_update(uint32_t wm_next);
+    void vbr_runtime_demand_update(uint32_t wm_next, bool was_over);
 
     void   vbr_ledger_precheck();                 // every boundary, outside the stable gate
     void   vbr_ledger_scan_service(uint32_t wm_next); // composes the four phases below

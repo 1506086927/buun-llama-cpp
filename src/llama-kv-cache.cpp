@@ -2045,6 +2045,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // budget trigger: degrade while ANY pool exceeds its share. A step only shrinks the pool
             // that owns its tensor, but the cursor is a global price order — advancing it while any
             // pool is over budget is the simplest rule that terminates and preserves the price order.
+            const bool vbr_was_over = vbr_over_budget(wm_next); // P3c: pre-loop pressure snapshot
             while (vbr_over_budget(wm_next)) {
                 vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
                 if (!vbr_degrade_next(wm_next)) {
@@ -2072,9 +2073,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                         __func__, pi, p.device, vbr_vmm_projected_bytes(p, wm_next)/1024.0/1024.0,
                         p.budget/1024.0/1024.0, p.be->vmm_pool_mapped(p.vmm)/1024.0/1024.0, wm_next);
             }
-            // P3 runtime-growth demand: our own ladder ran first (a transient shortage
-            // self-clears); publish/clear a phase=runtime claim per still-shorted pool
-            vbr_runtime_demand_update(wm_next);
+            // P3 runtime-growth demand: the trigger is band-spent AND under pressure THIS
+            // boundary (pre-own-loop snapshot) — the own loop's exit makes post-loop
+            // projected <= budget_eff whenever the sub-band ladder still works, which must
+            // not hide the demand (the band is what peers owe; the sub-band walk is the
+            // demander's own sacrifice)
+            vbr_runtime_demand_update(wm_next, vbr_was_over);
             // co-tenancy: full ledger pass on a pre-check hit, or unconditionally every 8th
             // boundary once ≥1s has passed since the last full scan (bounds the miss window
             // when our own rename baseline-swallowed a peer's concurrent rename)
@@ -2917,6 +2921,7 @@ void llama_kv_cache::breathe() {
         llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull) {
         vbr_ledger_scan_service(wm_next); // demand waves run band-capped inside
     }
+    vbr_runtime_demand_update(wm_next, /*was_over=*/false); // tick: CLEAR path only
     // no spontaneous degrade pressure at idle: budget_eff floors at mapped and nothing
     // grows here, so the general over-budget loop cannot fire — only demand decrements
     // (band-capped, in the scan) shed. Promotes get their idle chance under the same
@@ -4269,7 +4274,7 @@ bool llama_kv_cache::vbr_presence_quiet() const {
 // shortfall <= 0 at every donor and draws no shed). CLEAR unlinks at the first boundary
 // where the recomputed shortage is gone — the donors' lift signal. Skipped entirely while
 // a load-phase claim is still live (satisfied pre-claim-complete: one claim per process).
-void llama_kv_cache::vbr_runtime_demand_update(uint32_t wm_next) {
+void llama_kv_cache::vbr_runtime_demand_update(uint32_t wm_next, bool was_over) {
     if (!llama_vram_ledger_armed() || !vbr_ledger_owner_ || llama_vram_demand_pending_complete()) {
         return;
     }
@@ -4285,7 +4290,9 @@ void llama_kv_cache::vbr_runtime_demand_update(uint32_t wm_next) {
         }
         const size_t projected = vbr_vmm_projected_bytes(p, wm_next);
         const size_t beff      = vbr_budget_eff(p);
-        const bool   shorted   = projected > beff && window_spent;
+        // shorted: band spent AND this boundary saw pressure (pre-own-loop), or the ladder
+        // is exhausted with projection still over
+        const bool   shorted   = window_spent && (was_over || projected > beff);
         const bool live = vbr_runtime_live_.count(p.busid) != 0;
         if (shorted) {
             const uint64_t wanted = projected - beff;
