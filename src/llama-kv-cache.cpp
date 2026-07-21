@@ -1969,6 +1969,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // done (fence-ordered before the previous graph). Must precede this boundary's degrades and
         // ensure_mapped so no later page map can be ripped by a stale queued unmap.
         vbr_flush_deferred_unmaps();
+        // P3 idleness input: a boundary IS decode activity; ticks never write this
+        vbr_last_prepare_ns_ = llama_vram_ledger_now_ns();
     }
     // one ubatch token sum serves both the budget block and the scratch reserve below
     uint32_t n_tokens = 0;
@@ -2076,6 +2078,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                         __func__, pi, p.device, vbr_vmm_projected_bytes(p, wm_next)/1024.0/1024.0,
                         p.budget/1024.0/1024.0, p.be->vmm_pool_mapped(p.vmm)/1024.0/1024.0, wm_next);
             }
+            // P3 runtime-growth demand: our own ladder ran first (a transient shortage
+            // self-clears); publish/clear a phase=runtime claim per still-shorted pool
+            vbr_runtime_demand_update(wm_next);
             // co-tenancy: full ledger pass on a pre-check hit, or unconditionally every 8th
             // boundary once ≥1s has passed since the last full scan (bounds the miss window
             // when our own rename baseline-swallowed a peer's concurrent rename)
@@ -4266,6 +4271,50 @@ bool llama_kv_cache::vbr_presence_quiet() const {
     return vbr_scan_events_ - vbr_nlive_change_scan_ >= (uint32_t) LLAMA_VRAM_LEDGER_DEBOUNCE;
 }
 
+// P3 runtime-growth demand, demander side. Publishes a phase=runtime claim when this
+// resident spent its own consent window and is still over budget (the try_map-failed case
+// arrives here at the NEXT boundary — the map failure fails that batch recoverably first);
+// the est carries projected - budget_eff with est_partial=0 so donors apply the shed-sizing
+// formula unchanged (an explicit-cap demander whose shortage free VRAM covers nets
+// shortfall <= 0 at every donor and draws no shed). CLEAR unlinks at the first boundary
+// where the recomputed shortage is gone — the donors' lift signal. Skipped entirely while
+// a load-phase claim is still live (satisfied pre-claim-complete: one claim per process).
+void llama_kv_cache::vbr_runtime_demand_update(uint32_t wm_next) {
+    if (!llama_vram_ledger_armed() || !vbr_ledger_owner_ || llama_vram_demand_pending_complete()) {
+        return;
+    }
+    for (auto & p : vbr_pools_) {
+        if (p.vmm == nullptr || vbr_pool_busid(p) == "-") {
+            continue;
+        }
+        const size_t projected = vbr_vmm_projected_bytes(p, wm_next);
+        const size_t beff      = vbr_budget_eff(p);
+        const bool   shorted   = projected > beff && vbr_degrade_cursor_ >= vbr_demand_limit();
+        auto live = vbr_runtime_est_.find(p.busid);
+        if (shorted) {
+            const uint64_t wanted = projected - beff;
+            if (live == vbr_runtime_est_.end() || live->second == 0) {
+                llama_vram_claim_fields f = {};
+                f.phase                     = LLAMA_VRAM_CLAIM_RUNTIME;
+                f.bytes_total_remaining_est = wanted;
+                f.est_partial               = 0;
+                f.ver                       = ++vbr_runtime_ver_;
+                f.created_ts_ns             = llama_vram_ledger_now_ns();
+                if (llama_vram_claim_publish(p.busid, f)) {
+                    vbr_runtime_est_[p.busid] = wanted;
+                    vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns(); // own rename
+                    LLAMA_LOG_INFO("%s: runtime demand on %s: %.1f MiB (consent window spent)\n",
+                            __func__, p.busid.c_str(), wanted/1048576.0);
+                }
+            }
+        } else if (live != vbr_runtime_est_.end() && live->second > 0) {
+            llama_vram_claim_withdraw(p.busid);
+            vbr_runtime_est_[p.busid] = 0;
+            LLAMA_LOG_INFO("%s: runtime demand on %s cleared\n", __func__, p.busid.c_str());
+        }
+    }
+}
+
 size_t llama_kv_cache::vbr_total_grant_decrement() const {
     size_t total = 0;
     for (const auto & p : vbr_pools_) {
@@ -4421,8 +4470,14 @@ void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
     // ---- demand service: rank-0 shed sizing ----
     // one band per donor per session-generation is enforced by the band cursor itself
     // (monotone: once spent, shed_available stays 0 until vbr_full_reset)
+    // idleness for runtime-demand donation: decode-based, evaluated here (a boundary
+    // caller has just stamped last_prepare, so it is never idle — active-vs-active
+    // residents self-serve via their own ladders; only the tick path can qualify)
+    const bool donor_idle = vbr_last_prepare_ns_ != 0 &&
+        now - vbr_last_prepare_ns_ >= (uint64_t) LLAMA_VRAM_LEDGER_IDLE_MS * 1000000ull;
     for (const auto & c : claims) {
-        if (c.fields.phase != LLAMA_VRAM_CLAIM_DEMAND) {
+        if (c.fields.phase != LLAMA_VRAM_CLAIM_DEMAND &&
+            !(c.fields.phase == LLAMA_VRAM_CLAIM_RUNTIME && donor_idle)) {
             continue;
         }
         // already granted to this (pid, starttime, ver) on this device? one decision, one shed

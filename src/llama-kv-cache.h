@@ -444,6 +444,16 @@ private:
     uint32_t vbr_pool_n_live(const vbr_pool & p) const;
     bool     vbr_presence_quiet() const; // promote gate: no N_live change within DEBOUNCE scans
 
+    // ---- P3 runtime-growth demand (idle-donor only) ----
+    // a resident that spent its own consent window and is still over budget publishes a
+    // phase=runtime claim; only donors idle >= IDLE honor it (active-vs-active residents
+    // self-serve via their own ladders). CLEAR is demander-owned: the first boundary
+    // where the recomputed shortage <= 0 unlinks (the donors' lift signal).
+    uint64_t vbr_runtime_ver_      = 0;
+    uint64_t vbr_last_prepare_ns_  = 0; // decode-based idleness input (ticks never update it)
+    std::map<std::string, uint64_t> vbr_runtime_est_; // busid -> published est (0/absent = none)
+    void vbr_runtime_demand_update(uint32_t wm_next);
+
     void   vbr_ledger_precheck();                 // every boundary, outside the stable gate
     void   vbr_ledger_scan_service(uint32_t wm_next); // full scan + grant upkeep + demand service
     void   vbr_apply_grant_decrements();          // recompute per-pool sums, bust memos
