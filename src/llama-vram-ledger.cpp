@@ -95,6 +95,118 @@ static const std::string & vrlg_dir() {
     return dir;
 }
 
+// ---- shared claim/marker file machinery (both families use the 88-byte layout) ----
+
+// atomic tmp+rename publish of a complete file image: field changes must bump dir mtime
+// for readers' pre-checks. Returns the renamed file reopened O_WRONLY | O_NOFOLLOW (kept
+// open for slot pwrites); on any failure whatever was created is unlinked and -1 returned.
+static int vrlg_write_file(const std::string & dir_tmp_prefix, const std::string & path, const uint8_t buf[VRLG_FILE_SIZE]) {
+    std::string tmp = dir_tmp_prefix + "-XXXXXX";
+    int tmp_fd = mkstemp(tmp.data());
+    if (tmp_fd < 0) {
+        return -1;
+    }
+    bool ok = write(tmp_fd, buf, VRLG_FILE_SIZE) == (ssize_t) VRLG_FILE_SIZE;
+    close(tmp_fd);
+    if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
+        unlink(tmp.c_str());
+        return -1;
+    }
+    int fd = open(path.c_str(), O_WRONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        unlink(path.c_str());
+        return -1;
+    }
+    return fd;
+}
+
+// seqlock write: odd seq -> payload -> even seq; readers discard torn slots. The beat
+// counter is hb_seq/2 by construction (both advance only here), so it is not stored.
+static void vrlg_slot_write(int fd, uint32_t & hb_seq, uint64_t extra_u64) {
+    uint8_t slot[VRLG_FILE_SIZE - VRLG_SLOT_OFF];
+    hb_seq += 1; // odd: write in progress
+    vrlg_put_u32(slot, 0, hb_seq);
+    pwrite(fd, slot, 4, VRLG_SLOT_OFF);
+    hb_seq += 1; // even: the value the stable slot will carry
+    vrlg_put_u32(slot, 4, 0);
+    vrlg_put_u64(slot, 8, hb_seq/2);
+    vrlg_put_u64(slot, 16, extra_u64);
+    pwrite(fd, slot + 4, sizeof(slot) - 4, VRLG_SLOT_OFF + 4);
+    vrlg_put_u32(slot, 0, hb_seq);
+    pwrite(fd, slot, 4, VRLG_SLOT_OFF);
+}
+
+// seqlock read of the slot region: retry while a beat is mid-write (full pread, discard
+// if seq is odd or changed underneath us)
+static bool vrlg_read_stable(int fd, uint8_t buf[VRLG_FILE_SIZE]) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (pread(fd, buf, VRLG_FILE_SIZE, 0) != (ssize_t) VRLG_FILE_SIZE) {
+            return false;
+        }
+        uint32_t seq1 = vrlg_get_u32(buf, VRLG_SLOT_OFF);
+        if (seq1 % 2 != 0) {
+            continue;
+        }
+        uint8_t slot2[4];
+        if (pread(fd, slot2, 4, VRLG_SLOT_OFF) != 4 || vrlg_get_u32(slot2, 0) != seq1) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+// retire a registry entry's on-disk presence: close the kept-open slot fd, unlink the file
+static void vrlg_entry_drop(int & fd, const std::string & path) {
+    if (fd >= 0) {
+        close(fd);
+        fd = -1;
+    }
+    unlink(path.c_str());
+}
+
+// shared directory-scan skeleton for <prefix><busid>-<pid> files: prefix match, SCAN_CAP
+// warn-once (caller-owned flag so each family warns independently), pid parse, self-skip.
+// cb(path, busid, pid) returns 1 = valid (cb collected it), 0 = ignore (malformed/torn —
+// never trusted, never GC'd here), -1 = owner dead (GC'd here: any scanner has authority).
+template <typename F>
+static void vrlg_scan_dir(const char * prefix, const char * caller, const char * kind, bool & warned_cap, const F & cb) {
+    DIR * d = opendir(vrlg_dir().c_str());
+    if (d == nullptr) {
+        return;
+    }
+    int seen = 0;
+    const size_t prefix_len = strlen(prefix);
+    for (struct dirent * de = readdir(d); de != nullptr; de = readdir(d)) {
+        if (strncmp(de->d_name, prefix, prefix_len) != 0) {
+            continue;
+        }
+        if (++seen > LLAMA_VRAM_LEDGER_SCAN_CAP) {
+            if (!warned_cap) {
+                LLAMA_LOG_WARN("%s: more than %d %s files, ignoring the excess\n",
+                        caller, (int) LLAMA_VRAM_LEDGER_SCAN_CAP, kind);
+                warned_cap = true;
+            }
+            break;
+        }
+        // <busid>-<pid>: pid is the suffix after the last '-'
+        const char * name = de->d_name + prefix_len;
+        const char * dash = strrchr(name, '-');
+        if (dash == nullptr || dash == name) {
+            continue;
+        }
+        int32_t pid = (int32_t) atoi(dash + 1);
+        if (pid <= 0 || pid == getpid()) {
+            continue;
+        }
+        std::string path = vrlg_dir() + "/" + de->d_name;
+        if (cb(path, std::string(name, dash - name), pid) == -1) {
+            unlink(path.c_str()); // GC authority: any scanner
+        }
+    }
+    closedir(d);
+}
+
 // ---- identity and liveness ----
 
 // starttime = field 22 of /proc/<pid>/stat; comm (field 2) may contain spaces, so parse
@@ -149,10 +261,7 @@ struct vrlg_state {
         {
             std::lock_guard<std::mutex> lock(mu);
             for (auto & [busid, e] : claims) {
-                if (e.fd >= 0) {
-                    close(e.fd);
-                }
-                unlink(e.path.c_str()); // leftover files would only burden peers' GC
+                vrlg_entry_drop(e.fd, e.path); // leftover files would only burden peers' GC
             }
             claims.clear();
             cv.notify_all(); // empty registry -> the writer thread exits
@@ -168,22 +277,6 @@ static vrlg_state & vrlg() {
     return s;
 }
 
-// seqlock write: odd seq -> payload -> even seq; readers discard torn slots. The beat
-// counter is hb_seq/2 by construction (both advance only here), so it is not stored.
-static void vrlg_beat_entry(vrlg_claim_entry & e) {
-    uint8_t slot[VRLG_FILE_SIZE - VRLG_SLOT_OFF];
-    e.hb_seq += 1; // odd: write in progress
-    vrlg_put_u32(slot, 0, e.hb_seq);
-    pwrite(e.fd, slot, 4, VRLG_SLOT_OFF);
-    e.hb_seq += 1; // even: the value the stable slot will carry
-    vrlg_put_u32(slot, 4, 0);
-    vrlg_put_u64(slot, 8, e.hb_seq/2);
-    vrlg_put_u64(slot, 16, e.bytes_now);
-    pwrite(e.fd, slot + 4, sizeof(slot) - 4, VRLG_SLOT_OFF + 4);
-    vrlg_put_u32(slot, 0, e.hb_seq);
-    pwrite(e.fd, slot, 4, VRLG_SLOT_OFF);
-}
-
 static void vrlg_thread_main() {
     auto & s = vrlg();
     std::unique_lock<std::mutex> lock(s.mu);
@@ -193,7 +286,7 @@ static void vrlg_thread_main() {
             return;
         }
         for (auto & [busid, e] : s.claims) {
-            vrlg_beat_entry(e);
+            vrlg_slot_write(e.fd, e.hb_seq, e.bytes_now);
         }
         // half of BEAT keeps every consumer comfortably under the <= BEAT cadence
         s.cv.wait_for(lock, std::chrono::milliseconds(LLAMA_VRAM_LEDGER_BEAT_MS/2));
@@ -224,22 +317,7 @@ static int vrlg_read_claim_file(const std::string & path, int32_t pid, llama_vra
     if (fd < 0) {
         return 0;
     }
-    // seqlock read of the slot region: retry while a beat is mid-write
-    bool stable = false;
-    for (int attempt = 0; attempt < 3 && !stable; ++attempt) {
-        if (pread(fd, buf, sizeof(buf), 0) != (ssize_t) sizeof(buf)) {
-            break;
-        }
-        uint32_t seq1 = vrlg_get_u32(buf, VRLG_SLOT_OFF);
-        if (seq1 % 2 != 0) {
-            continue;
-        }
-        uint8_t slot2[4];
-        if (pread(fd, slot2, 4, VRLG_SLOT_OFF) != 4 || vrlg_get_u32(slot2, 0) != seq1) {
-            continue;
-        }
-        stable = true;
-    }
+    bool stable = vrlg_read_stable(fd, buf);
     close(fd);
     if (!stable ||
         vrlg_get_u32(buf, 0) != VRLG_MAGIC ||
@@ -326,28 +404,15 @@ bool llama_vram_claim_publish(const std::string & busid, const llama_vram_claim_
 
     // all file work happens on locals; the registry is only touched once everything
     // succeeded, so no failure path needs cleanup beyond its own file descriptors.
-    // atomic tmp+rename: field changes must bump dir mtime for readers' pre-checks
-    std::string tmp = vrlg_dir() + "/.claim-tmp-XXXXXX";
-    int tmp_fd = mkstemp(tmp.data());
-    if (tmp_fd < 0) {
-        return false;
-    }
-    bool ok = write(tmp_fd, buf, sizeof(buf)) == (ssize_t) sizeof(buf);
-    close(tmp_fd);
     std::string path = vrlg_claim_path(busid, getpid());
-    if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
-        unlink(tmp.c_str());
-        return false;
-    }
-    int fd = open(path.c_str(), O_WRONLY | O_NOFOLLOW);
+    int fd = vrlg_write_file(vrlg_dir() + "/.claim-tmp", path, buf);
     if (fd < 0) {
-        unlink(path.c_str());
         return false;
     }
 
     auto & e = s.claims[busid];
     if (e.fd >= 0) {
-        close(e.fd);
+        close(e.fd); // close only, no vrlg_entry_drop: the rename already replaced this path
     }
     e.path      = path;
     e.fd        = fd;
@@ -377,10 +442,7 @@ bool llama_vram_claim_withdraw(const std::string & busid) {
     if (it == s.claims.end()) {
         return false;
     }
-    if (it->second.fd >= 0) {
-        close(it->second.fd);
-    }
-    unlink(it->second.path.c_str());
+    vrlg_entry_drop(it->second.fd, it->second.path);
     s.claims.erase(it);
     s.cv.notify_all();
     return true;
@@ -390,10 +452,7 @@ void llama_vram_claim_withdraw_all() {
     auto & s = vrlg();
     std::lock_guard<std::mutex> lock(s.mu);
     for (auto & [busid, e] : s.claims) {
-        if (e.fd >= 0) {
-            close(e.fd);
-        }
-        unlink(e.path.c_str());
+        vrlg_entry_drop(e.fd, e.path);
     }
     s.claims.clear();
     s.cv.notify_all();
@@ -404,50 +463,17 @@ int llama_vram_ledger_scan(std::vector<llama_vram_peer_claim> & out) {
     if (!llama_vram_ledger_armed()) {
         return 0;
     }
-    DIR * d = opendir(vrlg_dir().c_str());
-    if (d == nullptr) {
-        return 0;
-    }
     static bool warned_cap = false;
-    int seen = 0;
-    const size_t prefix_len = strlen(VRLG_CLAIM_PREFIX);
-    for (struct dirent * de = readdir(d); de != nullptr; de = readdir(d)) {
-        if (strncmp(de->d_name, VRLG_CLAIM_PREFIX, prefix_len) != 0) {
-            continue;
-        }
-        if (++seen > LLAMA_VRAM_LEDGER_SCAN_CAP) {
-            if (!warned_cap) {
-                LLAMA_LOG_WARN("%s: more than %d ledger files, ignoring the excess\n",
-                        __func__, (int) LLAMA_VRAM_LEDGER_SCAN_CAP);
-                warned_cap = true;
-            }
-            break;
-        }
-        // <busid>-<pid>: pid is the suffix after the last '-'
-        const char * name = de->d_name + prefix_len;
-        const char * dash = strrchr(name, '-');
-        if (dash == nullptr || dash == name) {
-            continue;
-        }
-        int32_t pid = (int32_t) atoi(dash + 1);
-        if (pid <= 0 || pid == getpid()) {
-            continue;
-        }
-        std::string path = vrlg_dir() + "/" + de->d_name;
+    vrlg_scan_dir(VRLG_CLAIM_PREFIX, __func__, "ledger", warned_cap,
+            [&out](const std::string & path, const std::string & busid, int32_t pid) {
         llama_vram_peer_claim pc;
-        switch (vrlg_read_claim_file(path, pid, pc)) {
-            case 1:
-                pc.busid = std::string(name, dash - name);
-                out.push_back(std::move(pc));
-                break;
-            case -1:
-                unlink(path.c_str()); // GC authority: any scanner
-                break;
-            default:
-                break;
+        const int res = vrlg_read_claim_file(path, pid, pc);
+        if (res == 1) {
+            pc.busid = busid;
+            out.push_back(std::move(pc));
         }
-    }
-    closedir(d);
+        return res;
+    });
     return (int) out.size();
 }
 
@@ -491,10 +517,7 @@ struct vrlm_state {
 
     ~vrlm_state() {
         for (auto & [busid, e] : markers) {
-            if (e.fd >= 0) {
-                close(e.fd);
-            }
-            unlink(e.path.c_str());
+            vrlg_entry_drop(e.fd, e.path);
         }
     }
 };
@@ -528,26 +551,14 @@ bool llama_vram_marker_publish(const std::string & busid, const llama_vram_marke
     vrlg_put_u32(buf, VRLG_SLOT_OFF + 0, hb_seq);
     vrlg_put_u64(buf, VRLG_SLOT_OFF + 8, hb_seq/2);
 
-    std::string tmp = vrlg_dir() + "/.marker-tmp-XXXXXX";
-    int tmp_fd = mkstemp(tmp.data());
-    if (tmp_fd < 0) {
-        return false;
-    }
-    bool ok = write(tmp_fd, buf, sizeof(buf)) == (ssize_t) sizeof(buf);
-    close(tmp_fd);
     std::string path = vrlg_dir() + "/" + VRLM_MARKER_PREFIX + busid + "-" + std::to_string(getpid());
-    if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
-        unlink(tmp.c_str());
-        return false;
-    }
-    int fd = open(path.c_str(), O_WRONLY | O_NOFOLLOW);
+    int fd = vrlg_write_file(vrlg_dir() + "/.marker-tmp", path, buf);
     if (fd < 0) {
-        unlink(path.c_str());
         return false;
     }
     auto & e = s.markers[busid];
     if (e.fd >= 0) {
-        close(e.fd);
+        close(e.fd); // close only, no vrlg_entry_drop: the rename already replaced this path
     }
     e.path          = path;
     e.fd            = fd;
@@ -568,17 +579,7 @@ void llama_vram_marker_beat(const std::string & busid) {
         return;
     }
     e.last_beat_ns = now;
-    uint8_t slot[VRLG_FILE_SIZE - VRLG_SLOT_OFF];
-    e.hb_seq += 1;
-    vrlg_put_u32(slot, 0, e.hb_seq);
-    pwrite(e.fd, slot, 4, VRLG_SLOT_OFF);
-    e.hb_seq += 1;
-    vrlg_put_u32(slot, 4, 0);
-    vrlg_put_u64(slot, 8, e.hb_seq/2);
-    vrlg_put_u64(slot, 16, 0);
-    pwrite(e.fd, slot + 4, sizeof(slot) - 4, VRLG_SLOT_OFF + 4);
-    vrlg_put_u32(slot, 0, e.hb_seq);
-    pwrite(e.fd, slot, 4, VRLG_SLOT_OFF);
+    vrlg_slot_write(e.fd, e.hb_seq, 0); // markers carry no bytes_now
 }
 
 bool llama_vram_marker_present(const std::string & busid) {
@@ -591,10 +592,7 @@ bool llama_vram_marker_withdraw(const std::string & busid) {
     if (it == s.markers.end()) {
         return false;
     }
-    if (it->second.fd >= 0) {
-        close(it->second.fd);
-    }
-    unlink(it->second.path.c_str());
+    vrlg_entry_drop(it->second.fd, it->second.path);
     s.markers.erase(it);
     return true;
 }
@@ -602,10 +600,7 @@ bool llama_vram_marker_withdraw(const std::string & busid) {
 void llama_vram_marker_withdraw_all() {
     auto & s = vrlm();
     for (auto & [busid, e] : s.markers) {
-        if (e.fd >= 0) {
-            close(e.fd);
-        }
-        unlink(e.path.c_str());
+        vrlg_entry_drop(e.fd, e.path);
     }
     s.markers.clear();
 }
@@ -615,56 +610,15 @@ int llama_vram_ledger_scan_markers(std::vector<llama_vram_peer_marker> & out) {
     if (!llama_vram_ledger_armed()) {
         return 0;
     }
-    DIR * d = opendir(vrlg_dir().c_str());
-    if (d == nullptr) {
-        return 0;
-    }
     static bool warned_cap = false;
-    int seen = 0;
-    const size_t prefix_len = strlen(VRLM_MARKER_PREFIX);
-    for (struct dirent * de = readdir(d); de != nullptr; de = readdir(d)) {
-        if (strncmp(de->d_name, VRLM_MARKER_PREFIX, prefix_len) != 0) {
-            continue;
-        }
-        if (++seen > LLAMA_VRAM_LEDGER_SCAN_CAP) {
-            if (!warned_cap) {
-                LLAMA_LOG_WARN("%s: more than %d marker files, ignoring the excess\n",
-                        __func__, (int) LLAMA_VRAM_LEDGER_SCAN_CAP);
-                warned_cap = true;
-            }
-            break;
-        }
-        const char * name = de->d_name + prefix_len;
-        const char * dash = strrchr(name, '-');
-        if (dash == nullptr || dash == name) {
-            continue;
-        }
-        int32_t pid = (int32_t) atoi(dash + 1);
-        if (pid <= 0 || pid == getpid()) {
-            continue;
-        }
-        std::string path = vrlg_dir() + "/" + de->d_name;
-
+    vrlg_scan_dir(VRLM_MARKER_PREFIX, __func__, "marker", warned_cap,
+            [&out](const std::string & path, const std::string & busid, int32_t pid) {
         uint8_t buf[VRLG_FILE_SIZE];
         int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
         if (fd < 0) {
-            continue;
+            return 0;
         }
-        bool stable = false;
-        for (int attempt = 0; attempt < 3 && !stable; ++attempt) {
-            if (pread(fd, buf, sizeof(buf), 0) != (ssize_t) sizeof(buf)) {
-                break;
-            }
-            uint32_t seq1 = vrlg_get_u32(buf, VRLG_SLOT_OFF);
-            if (seq1 % 2 != 0) {
-                continue;
-            }
-            uint8_t slot2[4];
-            if (pread(fd, slot2, 4, VRLG_SLOT_OFF) != 4 || vrlg_get_u32(slot2, 0) != seq1) {
-                continue;
-            }
-            stable = true;
-        }
+        bool stable = vrlg_read_stable(fd, buf);
         close(fd);
         if (!stable ||
             vrlg_get_u32(buf, 0) != VRLM_MAGIC ||
@@ -672,15 +626,14 @@ int llama_vram_ledger_scan_markers(std::vector<llama_vram_peer_marker> & out) {
             vrlg_get_u32(buf, 8) != llama_crc32(buf + VRLG_BODY_OFF, VRLG_SLOT_OFF - VRLG_BODY_OFF) ||
             (int32_t) vrlg_get_u32(buf, 24) != pid ||
             vrlg_get_u32(buf, 16) > 1 || vrlg_get_u32(buf, 20) > 1) {
-            continue;
+            return 0;
         }
         uint64_t starttime = vrlg_get_u64(buf, 32);
         if (!llama_vram_ledger_pid_alive(pid, starttime)) {
-            unlink(path.c_str()); // GC authority: any scanner
-            continue;
+            return -1;
         }
         llama_vram_peer_marker pm;
-        pm.busid         = std::string(name, dash - name);
+        pm.busid         = busid;
         pm.pid           = pid;
         pm.starttime     = starttime;
         pm.created_ts_ns = vrlg_get_u64(buf, 40);
@@ -690,8 +643,8 @@ int llama_vram_ledger_scan_markers(std::vector<llama_vram_peer_marker> & out) {
         pm.fields.grant_pending  = vrlg_get_u64(buf, 56);
         pm.hb_counter    = vrlg_get_u64(buf, VRLG_SLOT_OFF + 8);
         out.push_back(std::move(pm));
-    }
-    closedir(d);
+        return 1;
+    });
     return (int) out.size();
 }
 
