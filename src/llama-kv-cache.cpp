@@ -4505,6 +4505,9 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
     const bool donor_idle = vbr_last_prepare_ns_ != 0 &&
         now - vbr_last_prepare_ns_ >= (uint64_t) LLAMA_VRAM_LEDGER_IDLE_MS * 1000000ull;
     for (const auto & c : claims) {
+        LLAMA_LOG_DEBUG("%s: claim pid %d phase %u est %.1f MiB (donor_idle %d)\n",
+                __func__, c.pid, (unsigned) c.fields.phase,
+                c.fields.bytes_total_remaining_est/1048576.0, (int) donor_idle);
         if (c.fields.phase != LLAMA_VRAM_CLAIM_DEMAND &&
             !(c.fields.phase == LLAMA_VRAM_CLAIM_RUNTIME && donor_idle)) {
             continue;
@@ -4570,6 +4573,9 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
             }
         }
         const uint64_t covered = (free_b > headroom_eff ? free_b - headroom_eff : 0) + peers_pending;
+        LLAMA_LOG_DEBUG("%s: sizing pid %d: est %.1f free %.1f hr %.1f off %.1f\n",
+                __func__, c.pid, c.fields.bytes_total_remaining_est/1048576.0,
+                free_b/1048576.0, headroom_eff/1048576.0, (our_offer + sib_offer)/1048576.0);
         if (c.fields.bytes_total_remaining_est <= covered) {
             continue; // shortfall ≤ 0: free (or peers' in-flight sheds) already cover it
         }
