@@ -17,6 +17,7 @@
 // false and every operation degrades to the clean-fail path.
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -60,8 +61,17 @@ struct llama_vram_claim_fields {
     uint64_t created_ts_ns;  // fixed once per demand ver, identical across its per-device files
 };
 
-// one validated peer file as read by a scan; heartbeat/bytes_now are raw snapshots —
-// staleness aging against previous sightings is the consumer's state, not the TU's
+// reader-side heartbeat observation aging: freshness is measured by the READER's clock
+// across unchanged counter reads — a first sighting counts as a beat (age 0), staleness
+// accrues only across subsequent unchanged reads. The map is the consumer's state; keys
+// are whatever identity the consumer chooses. Returns age in ns.
+struct llama_vram_hb_obs {
+    uint64_t counter   = 0;
+    uint64_t change_ns = 0;
+};
+uint64_t llama_vram_hb_observe(std::map<std::string, llama_vram_hb_obs> & obs,
+                               const std::string & key, uint64_t counter, uint64_t now);
+
 struct llama_vram_peer_claim {
     std::string busid;
     int32_t     pid;
@@ -131,8 +141,6 @@ bool llama_vram_marker_present(const std::string & busid);
 // in-place heartbeat, called from the owner's scan events; no-op if never published or
 // if beaten less than BEAT ago
 void llama_vram_marker_beat(const std::string & busid);
-bool llama_vram_marker_withdraw(const std::string & busid);
-void llama_vram_marker_withdraw_all();
 
 // scan peer markers (own skipped; dead-owner GC; SCAN_CAP applies)
 int llama_vram_ledger_scan_markers(std::vector<llama_vram_peer_marker> & out);

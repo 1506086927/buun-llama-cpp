@@ -9,6 +9,7 @@
 #include "llama-vram-ledger.h" // co-tenancy peer claim/marker types (P2)
 
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -426,9 +427,9 @@ private:
         bool        collateral;
     };
     std::vector<vbr_grant_row> vbr_grants_;
-    // reader-side heartbeat aging for claim stall-lift (key "busid-pid")
-    struct vbr_hb_obs { uint64_t counter = 0; uint64_t change_ns = 0; };
-    std::map<std::string, vbr_hb_obs> vbr_claim_obs_;
+    // reader-side heartbeat aging (shared llama_vram_hb_obs; claim keys "busid-pid",
+    // marker keys "m-busid-pid")
+    std::map<std::string, llama_vram_hb_obs> vbr_claim_obs_;
     // ledger scan pacing: dir-mtime pre-check baseline + last full-scan clock
     uint64_t vbr_ledger_mtime_  = 0;
     uint64_t vbr_last_scan_ns_  = 0;
@@ -446,9 +447,8 @@ private:
     // (growing headroom is the safe direction); departures only after the raw count holds
     // for DEBOUNCE consecutive scan events (a GC'd marker of a crashed-and-restarting peer
     // must not flap the budgets). Promotes are presence-quiet gated on the change scan.
-    std::map<std::string, uint32_t> vbr_n_live_;
-    std::map<std::string, uint32_t> vbr_n_live_raw_;
-    std::map<std::string, uint32_t> vbr_n_live_stable_;
+    struct vbr_presence { uint32_t cur = 0, raw = 0, stable = 0; };
+    std::map<std::string, vbr_presence> vbr_presence_;
     uint32_t vbr_scan_events_          = 0;
     uint32_t vbr_nlive_change_scan_    = 0;
     uint32_t vbr_pool_n_live(const vbr_pool & p) const;
@@ -461,7 +461,7 @@ private:
     // where the recomputed shortage <= 0 unlinks (the donors' lift signal).
     uint64_t vbr_runtime_ver_      = 0;
     uint64_t vbr_last_prepare_ns_  = 0; // decode-based idleness input (ticks never update it)
-    std::map<std::string, uint64_t> vbr_runtime_est_; // busid -> published est (0/absent = none)
+    std::set<std::string> vbr_runtime_live_; // busids with a live runtime claim
     void vbr_runtime_demand_update(uint32_t wm_next);
 
     void   vbr_ledger_precheck();                 // every boundary, outside the stable gate
@@ -473,6 +473,9 @@ private:
                                uint64_t now, uint32_t wm_next);
     void   vbr_grant_pending_clear();
     void   vbr_markers_publish(uint64_t now);
+    void   vbr_maybe_promote(uint32_t wm_next); // gated promote step (boundary + tick)
+    void   vbr_arm_wave_fences();               // arm fences for queued transcode waves
+    vbr_pool * vbr_find_pool(const std::string & busid);
     void   vbr_apply_grant_decrements();          // recompute per-pool sums, bust memos
     size_t vbr_total_grant_decrement() const;     // promote freeze gate
     const std::string & vbr_pool_busid(vbr_pool & p) const;

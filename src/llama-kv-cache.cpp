@@ -2033,21 +2033,15 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             }
             wm_next = vbr_watermark_cells(n_tokens);
             vbr_shrink_watermark(); // occupancy drops release phantom tail pages first
-            static const bool vbr_promote_on = [] {
-                const char * e = getenv("VBR_PROMOTE"); // kill switch for experiments; default ON
-                return e == nullptr || atoi(e) != 0;
-            }();
+
             // promote pacing: ONE step per boundary, and only after a quiet window (no degrade in
             // the last 4 boundaries). Promotes re-encode aged rows from degraded recon — error
             // compounds per hop — so waves spread out and a clamp-driven degrade vetoes the
             // immediate bounce-back. Boundary counting keeps the cooldown deterministic.
             vbr_quiet_boundaries_++;
-            // co-tenancy: promotes freeze while any unamortized grant remains — a promote
-            // would climb back into bytes a demander is still claiming
-            if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4 &&
-                vbr_total_grant_decrement() == 0 && vbr_presence_quiet()) {
-                vbr_promote_next(wm_next);
-            }
+            // co-tenancy: promotes freeze while any unamortized grant remains, and around
+            // presence changes (gates live in vbr_maybe_promote)
+            vbr_maybe_promote(wm_next);
             // budget trigger: degrade while ANY pool exceeds its share. A step only shrinks the pool
             // that owns its tensor, but the cursor is a global price order — advancing it while any
             // pool is over budget is the simplest rule that terminates and preserves the price order.
@@ -2092,12 +2086,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // S5: the wave's transcodes/scrubs are queued on each pool's side stream — arm that
             // device's fence so the next graph_compute GPU-waits on them; the host proceeds straight
             // to graph build.
-            for (auto & p : vbr_pools_) {
-                if (p.wave_pending) {
-                    p.be->fence_arm(p.backend);
-                    p.wave_pending = false;
-                }
-            }
+            vbr_arm_wave_fences();
         } else {
             // Fast path: settled — skip the budget/degrade bookkeeping. wm_next stays the current
             // watermark; the shared eager map below still covers occupancy that creeps up under the
@@ -2933,20 +2922,8 @@ void llama_kv_cache::breathe() {
     // (band-capped, in the scan) shed. Promotes get their idle chance under the same
     // gates as the boundary path.
     vbr_quiet_boundaries_++;
-    static const bool vbr_promote_on = [] {
-        const char * e = getenv("VBR_PROMOTE");
-        return e == nullptr || atoi(e) != 0;
-    }();
-    if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4 &&
-        vbr_total_grant_decrement() == 0 && vbr_presence_quiet()) {
-        vbr_promote_next(wm_next);
-    }
-    for (auto & p : vbr_pools_) {
-        if (p.wave_pending) {
-            p.be->fence_arm(p.backend);
-            p.wave_pending = false;
-        }
-    }
+    vbr_maybe_promote(wm_next);
+    vbr_arm_wave_fences();
     vbr_boundary_count_++;
 }
 
@@ -4266,9 +4243,18 @@ const std::string & llama_kv_cache::vbr_pool_busid(vbr_pool & p) const {
     return p.busid;
 }
 
+llama_kv_cache::vbr_pool * llama_kv_cache::vbr_find_pool(const std::string & busid) {
+    for (auto & p : vbr_pools_) {
+        if (p.vmm != nullptr && vbr_pool_busid(p) == busid) {
+            return &p;
+        }
+    }
+    return nullptr;
+}
+
 uint32_t llama_kv_cache::vbr_pool_n_live(const vbr_pool & p) const {
-    const auto it = vbr_n_live_.find(p.busid);
-    return it != vbr_n_live_.end() && it->second > 0 ? it->second : 1;
+    const auto it = vbr_presence_.find(p.busid);
+    return it != vbr_presence_.end() && it->second.cur > 0 ? it->second.cur : 1;
 }
 
 bool llama_kv_cache::vbr_presence_quiet() const {
@@ -4287,17 +4273,23 @@ void llama_kv_cache::vbr_runtime_demand_update(uint32_t wm_next) {
     if (!llama_vram_ledger_armed() || !vbr_ledger_owner_ || llama_vram_demand_pending_complete()) {
         return;
     }
+    // loop-invariant gate first: the common case (consent window unspent, nothing live)
+    // must not pay the per-pool projection walk every boundary
+    const bool window_spent = vbr_degrade_cursor_ >= vbr_demand_limit();
+    if (!window_spent && vbr_runtime_live_.empty()) {
+        return;
+    }
     for (auto & p : vbr_pools_) {
         if (p.vmm == nullptr || vbr_pool_busid(p) == "-") {
             continue;
         }
         const size_t projected = vbr_vmm_projected_bytes(p, wm_next);
         const size_t beff      = vbr_budget_eff(p);
-        const bool   shorted   = projected > beff && vbr_degrade_cursor_ >= vbr_demand_limit();
-        auto live = vbr_runtime_est_.find(p.busid);
+        const bool   shorted   = projected > beff && window_spent;
+        const bool live = vbr_runtime_live_.count(p.busid) != 0;
         if (shorted) {
             const uint64_t wanted = projected - beff;
-            if (live == vbr_runtime_est_.end() || live->second == 0) {
+            if (!live) {
                 llama_vram_claim_fields f = {};
                 f.phase                     = LLAMA_VRAM_CLAIM_RUNTIME;
                 f.bytes_total_remaining_est = wanted;
@@ -4305,16 +4297,38 @@ void llama_kv_cache::vbr_runtime_demand_update(uint32_t wm_next) {
                 f.ver                       = ++vbr_runtime_ver_;
                 f.created_ts_ns             = llama_vram_ledger_now_ns();
                 if (llama_vram_claim_publish(p.busid, f)) {
-                    vbr_runtime_est_[p.busid] = wanted;
+                    vbr_runtime_live_.insert(p.busid);
                     vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns(); // own rename
                     LLAMA_LOG_INFO("%s: runtime demand on %s: %.1f MiB (consent window spent)\n",
                             __func__, p.busid.c_str(), wanted/1048576.0);
                 }
             }
-        } else if (live != vbr_runtime_est_.end() && live->second > 0) {
+        } else if (live) {
             llama_vram_claim_withdraw(p.busid);
-            vbr_runtime_est_[p.busid] = 0;
+            vbr_runtime_live_.erase(p.busid);
             LLAMA_LOG_INFO("%s: runtime demand on %s cleared\n", __func__, p.busid.c_str());
+        }
+    }
+}
+
+// promote gate shared by the boundary path and the tick (one env read, one gate — the
+// co-tenancy freeze terms live here exactly once)
+void llama_kv_cache::vbr_maybe_promote(uint32_t wm_next) {
+    static const bool vbr_promote_on = [] {
+        const char * e = getenv("VBR_PROMOTE"); // kill switch for experiments; default ON
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4 &&
+        vbr_total_grant_decrement() == 0 && vbr_presence_quiet()) {
+        vbr_promote_next(wm_next);
+    }
+}
+
+void llama_kv_cache::vbr_arm_wave_fences() {
+    for (auto & p : vbr_pools_) {
+        if (p.wave_pending) {
+            p.be->fence_arm(p.backend);
+            p.wave_pending = false;
         }
     }
 }
@@ -4364,42 +4378,30 @@ void llama_kv_cache::vbr_ledger_precheck() {
 void llama_kv_cache::vbr_presence_census(const std::vector<llama_vram_peer_marker> & peers) {
     // ---- P3 presence census: N_live per device = self + live peer markers ----
     vbr_scan_events_++;
-    {
-        std::map<std::string, uint32_t> raw;
-        for (auto & p : vbr_pools_) {
-            if (p.vmm != nullptr && vbr_pool_busid(p) != "-") {
-                raw[p.busid] = 1; // self
-            }
+    std::map<std::string, uint32_t> raw;
+    for (auto & p : vbr_pools_) {
+        if (p.vmm != nullptr && vbr_pool_busid(p) != "-") {
+            raw[p.busid] = 1; // self
         }
-        for (const auto & m : peers) {
-            auto it = raw.find(m.busid);
-            if (it != raw.end()) {
-                it->second++;
-            }
+    }
+    for (const auto & m : peers) {
+        auto it = raw.find(m.busid);
+        if (it != raw.end()) {
+            it->second++;
         }
-        for (auto & [busid, n] : raw) {
-            uint32_t & cur = vbr_n_live_[busid];
-            if (cur == 0) {
-                cur = n; // first sighting: adopt silently (startup, not a change event)
-            } else if (n > cur) {
-                cur = n; // arrival: immediate (growing headroom is the safe direction)
-                vbr_nlive_change_scan_ = vbr_scan_events_;
-                vbr_n_live_stable_[busid] = 0;
-            } else if (n < cur) {
-                // departure: debounce — only after the raw count holds DEBOUNCE scans
-                if (vbr_n_live_raw_[busid] == n) {
-                    if (++vbr_n_live_stable_[busid] >= (uint32_t) LLAMA_VRAM_LEDGER_DEBOUNCE) {
-                        cur = n;
-                        vbr_nlive_change_scan_ = vbr_scan_events_;
-                        vbr_n_live_stable_[busid] = 0;
-                    }
-                } else {
-                    vbr_n_live_stable_[busid] = 0;
-                }
-            } else {
-                vbr_n_live_stable_[busid] = 0;
-            }
-            vbr_n_live_raw_[busid] = n;
+    }
+    // first sighting adopts silently; arrivals are immediate (growing headroom is the safe
+    // direction); departures only after the raw count holds DEBOUNCE consecutive scans
+    for (auto & [busid, n] : raw) {
+        auto & st = vbr_presence_[busid];
+        st.stable = (st.cur != 0 && n < st.cur && st.raw == n) ? st.stable + 1 : 0;
+        st.raw = n;
+        if (st.cur == 0) {
+            st.cur = n;
+        } else if (n > st.cur || st.stable >= (uint32_t) LLAMA_VRAM_LEDGER_DEBOUNCE) {
+            st.cur = n;
+            st.stable = 0;
+            vbr_nlive_change_scan_ = vbr_scan_events_;
         }
     }
 
@@ -4431,11 +4433,9 @@ bool llama_kv_cache::vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> 
         } else if (claim != nullptr) {
             // heartbeat-stall (flat 3·BEAT rule): the ≤BEAT writer thread makes cadence
             // decode-independent, so a stalled beat means a wedged demander
-            auto & o = vbr_claim_obs_[g.busid + "-" + std::to_string(g.pid)];
-            if (o.change_ns == 0 || o.counter != claim->hb_counter) {
-                o.counter   = claim->hb_counter;
-                o.change_ns = now;
-            } else if (now - o.change_ns > (uint64_t) LLAMA_VRAM_LEDGER_HB_STALL_MS * 1000000ull) {
+            if (llama_vram_hb_observe(vbr_claim_obs_, g.busid + "-" + std::to_string(g.pid),
+                                       claim->hb_counter, now)
+                    > (uint64_t) LLAMA_VRAM_LEDGER_HB_STALL_MS * 1000000ull) {
                 lift = true;
             }
             if (!lift && !g.collateral) {
@@ -4495,13 +4495,7 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
             continue;
         }
         // does the demand name one of our devices, and do we have an offer there?
-        vbr_pool * demanded_pool = nullptr;
-        for (auto & p : vbr_pools_) {
-            if (p.vmm != nullptr && vbr_pool_busid(p) == c.busid) {
-                demanded_pool = &p;
-                break;
-            }
-        }
+        vbr_pool * demanded_pool = vbr_find_pool(c.busid);
         if (demanded_pool == nullptr) {
             continue;
         }
@@ -4519,12 +4513,9 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
                 continue;
             }
             // freshness for donor selection instantiates with LONG/2
-            auto & o = vbr_claim_obs_["m-" + m.busid + "-" + std::to_string(m.pid)];
-            if (o.change_ns == 0 || o.counter != m.hb_counter) {
-                o.counter   = m.hb_counter;
-                o.change_ns = now;
-            }
-            if (now - o.change_ns >= (uint64_t) LLAMA_VRAM_LEDGER_LONG_MS/2 * 1000000ull) {
+            if (llama_vram_hb_observe(vbr_claim_obs_, "m-" + m.busid + "-" + std::to_string(m.pid),
+                                       m.hb_counter, now)
+                    >= (uint64_t) LLAMA_VRAM_LEDGER_LONG_MS/2 * 1000000ull) {
                 continue; // stale offer — not a competitor
             }
             // peers' created_ts vs ours: ours is unknowable from our own map (publish
@@ -4563,8 +4554,8 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
         // the offer IS the freeable footprint) and let each child shed its own portion
         // with its own grants, decrements and pending. Non-iSWA: sibling is null and the
         // whole target is ours.
-        const uint64_t own_target = (our_offer + sib_offer) > 0
-            ? (uint64_t) ((__int128) target * our_offer / (our_offer + sib_offer)) : 0;
+        // (our_offer + sib_offer > 0 guaranteed by the continue above)
+        const uint64_t own_target = (uint64_t) ((__int128) target * our_offer / (our_offer + sib_offer));
         size_t freed_own = vbr_execute_shed(c, own_target, wm_next);
         grants_changed = grants_changed || freed_own > 0;
         if (vbr_ledger_sibling_ != nullptr && freed_own < target) {
@@ -4583,13 +4574,7 @@ size_t llama_kv_cache::vbr_execute_shed(const llama_vram_peer_claim & c, uint64_
     if (target == 0) {
         return 0;
     }
-    vbr_pool * demanded_pool = nullptr;
-    for (auto & p : vbr_pools_) {
-        if (p.vmm != nullptr && vbr_pool_busid(p) == c.busid) {
-            demanded_pool = &p;
-            break;
-        }
-    }
+    vbr_pool * demanded_pool = vbr_find_pool(c.busid);
     if (demanded_pool == nullptr) {
         return 0;
     }

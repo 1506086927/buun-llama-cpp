@@ -35,6 +35,17 @@ static constexpr size_t   VRLG_SLOT_OFF  = 64;
 
 static constexpr const char * VRLG_CLAIM_PREFIX = "ggml-vram-claim-";
 
+uint64_t llama_vram_hb_observe(std::map<std::string, llama_vram_hb_obs> & obs,
+                               const std::string & key, uint64_t counter, uint64_t now) {
+    auto & o = obs[key];
+    if (o.change_ns == 0 || o.counter != counter) {
+        o.counter   = counter;
+        o.change_ns = now;
+        return 0;
+    }
+    return now - o.change_ns;
+}
+
 size_t llama_vram_headroom_bytes() {
     static const size_t headroom = [] {
         const char * e = getenv("VBR_VRAM_HEADROOM_MIB");
@@ -592,25 +603,6 @@ bool llama_vram_marker_present(const std::string & busid) {
     return vrlm().markers.count(busid) != 0;
 }
 
-bool llama_vram_marker_withdraw(const std::string & busid) {
-    auto & s = vrlm();
-    auto it = s.markers.find(busid);
-    if (it == s.markers.end()) {
-        return false;
-    }
-    vrlg_entry_drop(it->second.fd, it->second.path);
-    s.markers.erase(it);
-    return true;
-}
-
-void llama_vram_marker_withdraw_all() {
-    auto & s = vrlm();
-    for (auto & [busid, e] : s.markers) {
-        vrlg_entry_drop(e.fd, e.path);
-    }
-    s.markers.clear();
-}
-
 int llama_vram_ledger_scan_markers(std::vector<llama_vram_peer_marker> & out) {
     out.clear();
     if (!llama_vram_ledger_armed()) {
@@ -681,8 +673,6 @@ uint64_t llama_vram_ledger_dir_mtime_ns() { return 0; }
 bool llama_vram_marker_publish(const std::string &, const llama_vram_marker_fields &) { return false; }
 bool llama_vram_marker_present(const std::string &) { return false; }
 void llama_vram_marker_beat(const std::string &) {}
-bool llama_vram_marker_withdraw(const std::string &) { return false; }
-void llama_vram_marker_withdraw_all() {}
 
 int llama_vram_ledger_scan_markers(std::vector<llama_vram_peer_marker> & out) { out.clear(); return 0; }
 

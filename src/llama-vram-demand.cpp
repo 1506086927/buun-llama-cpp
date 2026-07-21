@@ -25,12 +25,7 @@ struct dev_state {
     bool     demanded    = false; // a failure occurred (or plan remainder > 0) this attempt
 };
 
-// observation aging for peer heartbeats: freshness is measured by the READER's clock
-// across unchanged counter reads — a first sighting counts as a beat
-struct hb_obs {
-    uint64_t counter   = 0;
-    uint64_t change_ns = 0;
-};
+
 
 // strictly linear attempt lifecycle: IDLE -> PROBE (first failure opens the attempt)
 // -> DEMAND (committed) -> SATISFIED (load done); unlink resets to IDLE from any phase
@@ -53,7 +48,7 @@ struct demander {
     uint64_t deadline      = 0;     // patience deadline (extensible, capped)
     bool     long_window   = false; // sticky upgrade happened
     std::map<std::string, dev_state> devs;      // busid -> state
-    std::map<std::string, hb_obs>    marker_obs; // "busid-pid" -> aging
+    std::map<std::string, llama_vram_hb_obs> marker_obs; // "busid-pid" -> aging
     std::map<std::string, uint64_t>  claim_progress; // peer claim key -> last bytes_now (tie-break)
     std::map<std::string, llama_vram_claim_fields> last_pub; // publish memo (rename on change only)
     uint64_t last_free_seen = 0;    // post-commit progress signal (primary demanded dev)
@@ -83,16 +78,7 @@ uint64_t est_remaining(const dev_state & ds) {
     return 0;
 }
 
-// age a peer heartbeat against our observation history; returns age in ns
-uint64_t observe_hb(demander & d, const std::string & key, uint64_t counter, uint64_t now) {
-    auto & o = d.marker_obs[key];
-    if (o.change_ns == 0 || o.counter != counter) {
-        o.counter   = counter;
-        o.change_ns = now;
-        return 0;
-    }
-    return now - o.change_ns;
-}
+
 
 void unlink_all(demander & d, const char * reason) {
     if (d.ph != phase::IDLE) {
@@ -183,7 +169,7 @@ marker_scan scan_markers_once(demander & d, const std::vector<llama_vram_peer_ma
                               uint64_t now, uint64_t fresh_ns, uint64_t offer_fresh) {
     marker_scan sc;
     for (const auto & m : markers) {
-        const uint64_t age = observe_hb(d, m.busid + "-" + std::to_string(m.pid), m.hb_counter, now);
+        const uint64_t age = llama_vram_hb_observe(d.marker_obs, m.busid + "-" + std::to_string(m.pid), m.hb_counter, now);
         auto & agg = sc.per_dev[m.busid];
         agg.n_markers++;
         if (age >= offer_fresh) {
