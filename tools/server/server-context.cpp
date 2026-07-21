@@ -1620,6 +1620,11 @@ private:
             return false;
         }
 
+        // co-tenancy: the server runs more init-time decodes after common's warmup
+        // (speculative compat probes, template detection) — keep the not-real-traffic
+        // flag up for all of them; closed at the end of init
+        llama_set_warmup(ctx_tgt, true);
+
         vocab = llama_model_get_vocab(model_tgt);
 
         needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
@@ -2229,6 +2234,14 @@ private:
                 }
             }
         }
+
+        // co-tenancy: init-time decodes end HERE. Everything above (common warmup,
+        // speculative compat probes, template detection) is not real traffic and must not
+        // fire claim-complete — a held demand's claim survives to the first real request.
+        // The warmup flag is the existing "this decode isn't real" state; the true bracket
+        // opened in common_init_from_params, and any init probe that flipped it off gets
+        // re-covered by closing it only now.
+        llama_set_warmup(ctx_tgt, false);
 
         return true;
     }
