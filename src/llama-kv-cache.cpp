@@ -4725,9 +4725,11 @@ void llama_kv_cache::vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants
     }
     decrement += vbr_total_grant_decrement();
     grants    += (uint32_t) vbr_grants_.size();
+    // telemetry reports the PUBLISHED truth: an explicit budget never offers, so /slots
+    // must not show peers an offer the marker does not carry
     std::set<int> devs;
     for (const auto & p : vbr_pools_) {
-        if (p.vmm != nullptr && devs.insert(p.device).second) {
+        if (!vbr_budget_explicit_ && p.vmm != nullptr && devs.insert(p.device).second) {
             offer += vbr_shed_available(p.device);
         }
     }

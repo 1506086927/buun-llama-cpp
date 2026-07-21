@@ -1350,6 +1350,11 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
+        // co-tenancy: declare serviced BEFORE any context init — the first marker publish
+        // rides context creation, and an explicit-budget resident's fields never change
+        // again, so a late flag would stay unpublished forever
+        llama_vram_mark_serviced();
+
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
@@ -2128,9 +2133,7 @@ private:
             SRV_TRC("%s", "idle tick: memory breathe\n");
             llama_memory_breathe(llama_get_memory(ctx_tgt));
         });
-        // co-tenancy: this host runs an idle tick, so its presence markers advertise
-        // serviced:1 — the signal that lets a co-loading peer upgrade its patience window
-        llama_vram_mark_serviced();
+
 
         metrics.init();
 
