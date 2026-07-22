@@ -429,17 +429,21 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_TURBO3_0 = 42, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_TURBO4_0 = 43, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_TURBO2_0 = 44, // TurboQuant 2-bit KV cache: 2-bit PolarQuant, no QJL
-        GGML_TYPE_TURBO3_TCQ = 45, // TurboQuant 3-bit KV cache: TCQ (Trellis-Coded Quantization)
-        GGML_TYPE_TURBO2_TCQ = 46, // TurboQuant 2-bit KV cache: TCQ (k=2, L=8, 256 states)
-        GGML_TYPE_TURBO8_0 = 47, // TurboQuant 8-bit KV cache: FWHT + uniform 256-level grid + per-block absmax, no QJL
-        GGML_TYPE_TURBO1   = 48, // RESERVED (codec removed 2026-07-05; slot kept for gguf type-id stability)
-        GGML_TYPE_TURBO1_NSN = 49, // RESERVED (codec removed 2026-07-05)
-        GGML_TYPE_TURBO1_CQ = 50, // RESERVED (codec removed 2026-07-05)
-        GGML_TYPE_TURBO1_TCQ = 51, // turbo1 Trellis-Coded: FWHT + k=1/L=8 trellis, separate K/V 256-state codebooks (1.25 bpw)
-        GGML_TYPE_COUNT   = 52,
+        GGML_TYPE_Q2_0    = 42, // 2-bit weight quant, group-64 (upstream-canonical; PrismML Bonsai g64)
+        // NOTE: turbo* KV-cache codec type-ids were bumped +1 (were 42-51) to free slot 42 for the
+        //       upstream Q2_0 assignment. These are runtime KV codecs, never written to distributed GGUFs.
+        GGML_TYPE_TURBO3_0 = 43, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TURBO4_0 = 44, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TURBO2_0 = 45, // TurboQuant 2-bit KV cache: 2-bit PolarQuant, no QJL
+        GGML_TYPE_TURBO3_TCQ = 46, // TurboQuant 3-bit KV cache: TCQ (Trellis-Coded Quantization)
+        GGML_TYPE_TURBO2_TCQ = 47, // TurboQuant 2-bit KV cache: TCQ (k=2, L=8, 256 states)
+        GGML_TYPE_TURBO8_0 = 48, // TurboQuant 8-bit KV cache: FWHT + uniform 256-level grid + per-block absmax, no QJL
+        GGML_TYPE_TURBO1   = 49, // RESERVED (codec removed 2026-07-05; slot kept for gguf type-id stability)
+        GGML_TYPE_TURBO1_NSN = 50, // RESERVED (codec removed 2026-07-05)
+        GGML_TYPE_TURBO1_CQ = 51, // RESERVED (codec removed 2026-07-05)
+        GGML_TYPE_TURBO1_TCQ = 52, // turbo1 Trellis-Coded: FWHT + k=1/L=8 trellis, separate K/V 256-state codebooks (1.25 bpw)
+        GGML_TYPE_Q2_0_G128 = 53, // 2-bit ternary weight quant, group-128 (PrismML Bonsai; on-disk type-42 remapped here at load)
+        GGML_TYPE_COUNT   = 54,
     };
 
     // precision
@@ -483,6 +487,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
     };
 
     // available tensor operations:
