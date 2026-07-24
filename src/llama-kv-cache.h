@@ -6,7 +6,10 @@
 #include "llama-memory.h"
 
 #include "ggml-vbr.h" // backend interface for turbo KV / dynamic VBR (resolved at init, never linked)
+#include "llama-vram-ledger.h" // co-tenancy peer claim/marker types (P2)
 
+#include <map>
+#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -143,6 +146,8 @@ public:
 
     bool get_can_shift() const override;
 
+    void breathe() override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -181,8 +186,26 @@ public:
     // totals for cross-cache aggregation (iSWA weights its children by stored values)
     void   kv_bpv_accum(double & bits, double & vals) const;
 
+    // co-tenancy: bytes a demand-driven shed could free on `device` — max shed over the
+    // remaining f16->t8 band, net of the projected dequant-scratch growth it would cost.
+    // 0 when the band is spent/absent, the order is a custom override, or no VMM pool
+    // lives on the device. Memoized; safe to call between boundaries (marker writes).
+    size_t vbr_shed_available(int device) const;
+
+    void vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants,
+                             uint64_t & offer, uint64_t & pending) const override;
+
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
     double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
+
+    // shared ladder-sim primitives: seed a per-(layer,side) type view + per-step
+    // applicability under vbr_degrade_next's exact skip rules (see impl comment) — the
+    // floor sim, the bpv-if-degraded walk and the co-tenancy offer all ride these
+    void vbr_sim_seed(std::vector<ggml_type> & sim, bool pooled_only,
+                      ggml_type entry_k, ggml_type entry_v,
+                      double * sum_bits, int64_t * sum_vals, size_t * n_pinned) const;
+    bool vbr_sim_step(const std::vector<ggml_type> & sim, size_t i,
+                      size_t & slot, const ggml_tensor *& t, ggml_type & type_B) const;
 
     // shared floor-walk core (runtime clamp + fit capacity math), see impl comment
     struct vbr_floor_sim_result {
@@ -332,6 +355,10 @@ private:
         uint64_t scratch_rows_epoch = ~0ull;
         size_t   scratch_k_row      = 0;
         size_t   scratch_v_row      = 0;
+        // co-tenancy (P2): PCI bus id (resolved once from the backend device; empty = none)
+        // and the summed unamortized grant decrement vbr_budget_eff subtracts
+        std::string busid;
+        mutable size_t grant_decrement = 0;
         // per-device transcode side stream (lazy) + S5 overlap state: transcodes run async on
         // backend's stream; the next decode graph GPU-waits via the armed per-device fence
         // (be->fence_arm). Tail pages a transcode may still READ (rA extent >
@@ -362,6 +389,110 @@ private:
     // --vbr-floor (env VBR_MIN_BITS): first order step the aggregate bits/value floor forbids;
     // the cursor never advances past it (default = order size, i.e. unclamped)
     size_t vbr_degrade_limit_ = (size_t) -1;
+    // co-tenancy: end of the leading f16->t8 band of the order (demand sheds stop here);
+    // 0 = no band (custom VBR_DEGRADE_ORDER carries no band guarantee -> demand shed off)
+    size_t t8_band_end_ = 0;
+    // peer-yield consent bound (Preston 2026-07-20, explicit-floor-as-consent): a TYPED
+    // --vbr-floor (flag or VBR_MIN_BITS env) consents demand sheds down to the floor —
+    // the ledger is per-uid, so the demander is the same human who typed it. A defaulted
+    // floor keeps the conservative restorable band. 0 = demand shedding disabled.
+    size_t vbr_demand_limit() const {
+        if (t8_band_end_ == 0) {
+            return 0;
+        }
+        return vbr_floor_typed_ ? vbr_degrade_limit_
+                                : std::min(vbr_degrade_limit_, t8_band_end_);
+    }
+    bool vbr_floor_typed_ = false;
+    // vbr_shed_available memo: per-pool freed-bytes projection, keyed on (tier epoch,
+    // watermark padded to the 256-cell quantum) — budget is deliberately NOT an input
+    mutable uint64_t            shed_avail_epoch_ = ~0ull;
+    mutable uint32_t            shed_avail_wm_    = 0;
+    mutable std::vector<size_t> shed_avail_pool_;
+
+    // ---- co-tenancy donor state (P2) ----
+    // grant rows: private in-memory liabilities recording a demand-shed's decrement,
+    // keyed (pid, starttime, ver) with the demanded device's busid; one row per pool the
+    // wave freed bytes in. Collateral rows (lockstep frees on non-demanded devices) carry
+    // the full decrement until the lift event (delta_i = 0 — this also keeps the promote
+    // cursor frozen so a promote cannot undo a lockstep shed).
+    struct vbr_grant_row {
+        std::string busid;      // device the demand named (claim file key)
+        int32_t     pid;
+        uint64_t    starttime;
+        uint64_t    ver;
+        size_t      pool_idx;
+        uint64_t    bytes;
+        uint64_t    bytes_now_at_grant;
+        bool        collateral;
+    };
+    std::vector<vbr_grant_row> vbr_grants_;
+    // reader-side heartbeat aging (shared llama_vram_hb_obs; claim keys "busid-pid",
+    // marker keys "m-busid-pid")
+    std::map<std::string, llama_vram_hb_obs> vbr_claim_obs_;
+    // ledger scan pacing: dir-mtime pre-check baseline + last full-scan clock
+    uint64_t vbr_ledger_mtime_  = 0;
+    uint64_t vbr_last_scan_ns_  = 0;
+    bool     vbr_ledger_force_  = false; // pre-check hit: run the full controller path
+    // last published marker fields per busid (republish = rename only on change)
+    std::map<std::string, std::pair<uint64_t, uint64_t>> vbr_marker_pub_; // {shed_avail, grant_pending}
+    // our marker's created_ts (donor-rank input; 0 until first publish) and the per-device
+    // granted-but-not-yet-flushed bytes (set at shed commit, cleared at the first scan
+    // event after that wave's deferred unmaps flush)
+    uint64_t vbr_marker_created_ts_ = 0;
+    std::map<std::string, uint64_t> vbr_grant_pending_;
+
+    // ---- P3 presence census ----
+    // effective N_live per busid (self + live peer markers). Arrivals count immediately
+    // (growing headroom is the safe direction); departures only after the raw count holds
+    // for DEBOUNCE consecutive scan events (a GC'd marker of a crashed-and-restarting peer
+    // must not flap the budgets). Promotes are presence-quiet gated on the change scan.
+    struct vbr_presence { uint32_t cur = 0, raw = 0, stable = 0; };
+    std::map<std::string, vbr_presence> vbr_presence_;
+    uint32_t vbr_scan_events_          = 0;
+    uint32_t vbr_nlive_change_scan_    = 0;
+    uint32_t vbr_pool_n_live(const vbr_pool & p) const;
+    bool     vbr_presence_quiet() const; // promote gate: no N_live change within DEBOUNCE scans
+
+    // ---- P3 runtime-growth demand (idle-donor only) ----
+    // a resident that spent its own consent window and is still over budget publishes a
+    // phase=runtime claim; only donors idle >= IDLE honor it (active-vs-active residents
+    // self-serve via their own ladders). CLEAR is demander-owned: the first boundary
+    // where the recomputed shortage <= 0 unlinks (the donors' lift signal).
+    uint64_t vbr_runtime_ver_      = 0;
+    uint64_t vbr_last_prepare_ns_  = 0; // decode-based idleness input (ticks never update it)
+    std::set<std::string> vbr_runtime_live_; // busids with a live runtime claim
+    std::vector<size_t> vbr_pre_deficit_;    // per-pool pre-own-loop deficit (the honest ask)
+    void vbr_runtime_demand_update(uint32_t wm_next, bool was_over);
+
+    void   vbr_ledger_precheck();                 // every boundary, outside the stable gate
+    void   vbr_ledger_scan_service(uint32_t wm_next); // composes the four phases below
+    void   vbr_presence_census(const std::vector<llama_vram_peer_marker> & peers);
+    bool   vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> & claims, uint64_t now);
+    bool   vbr_service_demands(const std::vector<llama_vram_peer_claim> & claims,
+                               const std::vector<llama_vram_peer_marker> & peers,
+                               uint64_t now, uint32_t wm_next);
+    void   vbr_grant_pending_clear();
+    void   vbr_markers_publish(uint64_t now);
+    void   vbr_maybe_promote(uint32_t wm_next); // gated promote step (boundary + tick)
+    void   vbr_arm_wave_fences();               // arm fences for queued transcode waves
+    vbr_pool * vbr_find_pool(const std::string & busid);
+    void   vbr_apply_grant_decrements();          // recompute per-pool sums, bust memos
+    size_t vbr_total_grant_decrement() const;     // promote freeze gate
+    const std::string & vbr_pool_busid(vbr_pool & p) const;
+
+public:
+    // co-tenancy: exactly one cache per memory tree runs the ledger protocol; composite
+    // parents (iSWA) demote all but one child and hand the owner a sibling pointer so the
+    // tree's offer is the SUM and demand targets split by offer weight. Non-owners keep
+    // every local mechanism (budget, band, waves, grants on their own pools) but never
+    // scan, serve, or publish themselves.
+    void vbr_set_ledger_owner(bool owner) { vbr_ledger_owner_ = owner; }
+    void vbr_set_ledger_sibling(llama_kv_cache * sib) { vbr_ledger_sibling_ = sib; }
+    size_t vbr_execute_shed(const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next);
+private:
+    bool vbr_ledger_owner_ = true;
+    llama_kv_cache * vbr_ledger_sibling_ = nullptr;
     size_t vbr_floor_cost_bytes_ = 0;                 // page-exact cost of the floor layout at full
                                                       // kv_size (fallback budget in dynamic mode)
     bool   vbr_budget_warned_ = false;                // budget-unmeetable warning fired (terminal)
@@ -388,7 +519,7 @@ private:
     void     vbr_shrink_watermark();                  // occupancy dropped: release phantom tail pages
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();
-    void     vbr_flush_deferred_unmaps();
+    size_t   vbr_flush_deferred_unmaps(); // returns the number of entries flushed
     bool     vbr_scratch_reserve(uint32_t wm_cells);  // #88: boundary-time f16 dequant scratch grow
     char *   vbr_stash_ensure(vbr_pool & p);          // lazy per-pool sink-stash buffer; returns base
     void     vbr_load_degrade_order();                // baked table, VBR_DEGRADE_ORDER=<file>, or generic fallback

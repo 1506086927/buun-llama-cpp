@@ -55,7 +55,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
         ggml_log_level log_level,
-        common_vbr_fit_costs * vbr_costs = nullptr) {
+        common_vbr_fit_costs * vbr_costs = nullptr,
+        bool plan_hint = false) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -178,6 +179,35 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         devs.push_back(llama_model_get_device(model, i));
     }
 
+    // co-tenancy plan hint: this process intends to allocate model+context+compute on each
+    // device, published as a held demand's joint cross-device estimate. plan_hint defaults
+    // FALSE so a forgotten tag fails toward the designed no-hint/est_partial fallback —
+    // only the requested-full-configuration measurement is tagged (a hint that lies is
+    // worse than none: it carries a one-revision fuse). When the fit later shrinks the
+    // config the standing hint overstates; the satisfied phase caps the harm. Meta devices
+    // (SPLIT_MODE_TENSOR) split evenly, matching the shard rotation's balanced layout.
+    if (plan_hint) {
+        auto hint = [](ggml_backend_dev_t d, uint64_t bytes) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(d, &props);
+            if (props.device_id != nullptr) {
+                llama_vram_plan_hint(props.device_id, bytes);
+            }
+        };
+        for (size_t i = 0; i < nd; i++) {
+            ggml_backend_dev_t dev = llama_model_get_device(model, i);
+            const uint64_t planned = ret[i].mb.model + ret[i].mb.context + ret[i].mb.compute;
+            if (ggml_backend_dev_is_meta(dev)) {
+                const size_t n_simple = ggml_backend_meta_dev_n_devs(dev);
+                for (size_t j = 0; j < n_simple; j++) {
+                    hint(ggml_backend_meta_dev_simple_dev(dev, j), planned / n_simple);
+                }
+            } else {
+                hint(dev, planned);
+            }
+        }
+    }
+
     hp_ngl         = llama_model_n_layer(model);
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
@@ -245,7 +275,7 @@ static void common_params_fit_impl(
     vbr_costs.entry_k = type_k_entry;
     vbr_costs.entry_v = type_v_entry;
     const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
-            cparams->vbr_dynamic ? &vbr_costs : nullptr);
+            cparams->vbr_dynamic ? &vbr_costs : nullptr, /*plan_hint=*/true);
     const size_t nd = devs.size(); // number of devices
 
     // dynamic VBR: measured dry-load KV bytes are PRICE-tier-priced (largest tier <= the floor)

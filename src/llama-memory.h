@@ -35,6 +35,8 @@ struct llama_memory_vbr_params {
     bool     dynamic      = false; // arm the VMM pool + decode-time degrade controller
     uint64_t budget_bytes = 0;     // mapped-physical KV budget; 0 = floor-layout-cost fallback
     double   min_bits     = 0.0;   // aggregate bits/value floor (0 = bottom-tier floor)
+    // the floor was TYPED (flag or env): doubles as peer-yield consent down to it
+    bool     min_bits_explicit = false;
     // explicit budgets are HARD CAPS: the runtime never re-derives them from live free VRAM
     // (an auto budget floats within [armed value, live reach] at decode boundaries)
     bool     budget_explicit = false;
@@ -159,6 +161,14 @@ struct llama_memory_i {
     virtual double memory_vbr_scratch_bytes_per_token(ggml_type /*entry_k*/, ggml_type /*entry_v*/, double /*floor_bpv*/) {
         return 0.0;
     }
+
+    // deferred maintenance at a quiet moment (llama.h: llama_memory_breathe)
+    virtual void breathe() {}
+
+    // co-tenancy telemetry accumulator (llama-ext.h: llama_vram_cotenancy): unamortized
+    // grant decrement bytes, live grant rows, current donation offer, unflushed pending
+    virtual void vbr_cotenancy_accum(uint64_t & /*decrement*/, uint32_t & /*grants*/,
+                                     uint64_t & /*offer*/, uint64_t & /*pending*/) const {}
 
     //
     // ops

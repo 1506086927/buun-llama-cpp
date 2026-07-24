@@ -43,6 +43,12 @@ struct llama_cparams {
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;
+    bool fused_lid;          // use fused lightning indexer
+    bool auto_flid;
+    bool fused_dsv4_hc_pre;
+    bool fused_dsv4_hc_comb;
+    bool fused_dsv4_hc_post;
+    bool auto_fhc;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
@@ -55,6 +61,7 @@ struct llama_cparams {
     uint64_t vbr_vram_budget_bytes = 0;
     uint64_t vbr_growth_headroom_bytes = 0;
     bool vbr_budget_explicit = false;
+    bool vbr_min_bits_explicit = false;
     // mixed-config side pins, see llama.h vbr_pin_k
     bool vbr_pin_k = false;
     bool vbr_pin_v = false;

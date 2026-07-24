@@ -138,6 +138,15 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share, vbr_swa);
+
+    // co-tenancy: the ledger protocol (scan, demand service, marker publication) runs
+    // ONCE per memory tree — two children independently serving the same claim would
+    // double-shed and fight over the shared per-process marker file. The base cache owns
+    // the protocol with the SWA child as its sibling: the published offer is the SUM of
+    // both children and demand targets split by offer weight, each child shedding its own
+    // portion on its own pools (the design's parent-level servicing; P4 cell 13).
+    kv_swa->vbr_set_ledger_owner(false);
+    kv_base->vbr_set_ledger_sibling(kv_swa.get());
 }
 
 void llama_kv_cache_iswa::clear(bool data) {
@@ -241,7 +250,7 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = balloc.split_equal(n_ubatch, !unified);
+            auto ubatch = balloc.split_equal(n_ubatch, !unified, 0);
 
             if (ubatch.n_tokens == 0) {
                 break;

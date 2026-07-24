@@ -109,6 +109,25 @@ LLAMA_API double llama_vbr_floor_bits_per_token(struct llama_context * ctx,
 LLAMA_API double llama_vbr_scratch_bytes_per_token(struct llama_context * ctx,
         enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv);
 
+// co-tenancy plan hint: total bytes this process still intends to allocate on the device
+// (PCI bus id per ggml_backend_dev_props.device_id). Set by the fit pass before load so a
+// held demand can publish an honest joint cross-device estimate instead of drip-feeding
+// per-failure asks (est_partial).
+LLAMA_API void llama_vram_plan_hint(const char * device_id, uint64_t bytes);
+
+// co-tenancy: declare this process serviced (runs an idle tick — llama-server). Presence
+// markers then advertise serviced:1, the qualifying signal for a co-loader's LONG patience.
+LLAMA_API void llama_vram_mark_serviced(void);
+
+// co-tenancy telemetry for /props//slots: all zeros = inert (single tenant, no ledger)
+struct llama_vram_cotenancy_state {
+    uint64_t grant_decrement; // unamortized bytes currently decremented from KV budgets
+    uint32_t grants_active;   // live grant rows
+    uint64_t shed_offer;      // published donation offer, summed over devices
+    uint64_t grant_pending;   // granted-but-not-yet-flushed bytes
+};
+LLAMA_API struct llama_vram_cotenancy_state llama_vram_cotenancy(const struct llama_context * ctx);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

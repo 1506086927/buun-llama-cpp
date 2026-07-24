@@ -1249,7 +1249,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
             COM_ERR("failed to load lora adapter '%s'\n", la.path.c_str());
-            pimpl->model.reset(model);
+            pimpl->model.reset();
             return;
         }
 
@@ -1313,6 +1313,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        // drop the model too: most callers only check model() and would deref the
+        // missing context — any failure past model load must yield an empty result
+        pimpl->samplers.clear();
+        pimpl->samplers_seq_config.clear();
+        pimpl->model.reset();
         return;
     }
 
@@ -1422,6 +1427,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     if (params.warmup) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
+        // mark the context: warmup decodes are not real requests (the co-tenancy
+        // claim-complete hook and other warmup-sensitive logic key off this)
+        llama_set_warmup(lctx, true);
+
         std::vector<llama_token> tmp;
         llama_token bos = llama_vocab_bos(vocab);
         llama_token eos = llama_vocab_eos(vocab);
@@ -1452,6 +1461,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
+        llama_set_warmup(lctx, false);
 
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
@@ -1624,6 +1634,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
     cparams.vbr_min_bits          = params.vbr_min_bits_value;
+    cparams.vbr_min_bits_explicit = params.vbr_min_bits_explicit;
     cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
     cparams.vbr_dynamic           = params.vbr_dynamic();
     cparams.vbr_budget_explicit   = params.vbr_vram_budget_explicit;

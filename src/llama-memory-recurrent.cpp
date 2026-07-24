@@ -5,6 +5,7 @@
 #include "llama-io.h"
 #include "llama-batch.h"
 #include "llama-model.h"
+#include "llama-vram-demand.h"
 
 #include "ggml-backend.h"
 
@@ -122,7 +123,9 @@ llama_memory_recurrent::llama_memory_recurrent(
                 t->buffer = buf; // the scheduler must not try to allocate the cache tensors
             }
         } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+            // co-tenancy hold-aware alloc: hybrid models' recurrent state is often the
+            // second-largest context alloc — same patience as the attention KV twin
+            buf = llama_vram_hold_alloc_ctx_tensors(ctx.get(), buft);
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for rs cache");
@@ -692,15 +695,12 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
-                if (n_rs_seq > 0) {
-                    // [TAG_RECURRENT_ROLLBACK_SPLITS]
-                    // TODO: recurrent state rollback does not support equal splits
-                    ubatch = balloc.split_seq(n_ubatch);
-                } else {
-                    // TODO: non-sequential equal split can be done if using unified KV cache
-                    //       for simplicity, we always use sequential equal split for now
-                    ubatch = balloc.split_equal(n_ubatch, true);
-                }
+                // TODO: non-sequential equal split can be done if using unified KV cache
+                //       for simplicity, we always use sequential equal split for now
+                // [TAG_RECURRENT_ROLLBACK_SPLITS]
+                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+                //   so that the rollback snapshots remain valid
+                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {

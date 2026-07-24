@@ -155,6 +155,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -396,6 +397,9 @@ extern "C" {
         bool vbr_dynamic; // arm the decode-time KV degrade controller (turbo-typed caches decay
                           // tier-by-tier as the context fills; requires flash attention and a
                           // backend exporting the ggml-vbr.h interface) [EXPERIMENTAL]
+        bool vbr_min_bits_explicit; // --vbr-floor was typed: doubles as peer-yield consent —
+                          // co-tenancy demand sheds may walk to the floor instead of
+                          // stopping at the restorable f16->t8 band
         bool vbr_budget_explicit; // vbr_vram_budget_bytes is a user-set HARD CAP: the runtime
                           // must never re-derive it from live free VRAM [EXPERIMENTAL]
         bool vbr_pin_k;   // K side is PINNED at type_k: the degrade/promote ladder never touches
@@ -747,6 +751,10 @@ extern "C" {
     LLAMA_API void llama_memory_clear(
             llama_memory_t mem,
                       bool data);
+
+    // Run deferred memory maintenance at a quiet moment. Must be called from the thread
+    // that calls llama_decode. No-op for memory types with nothing to do.
+    LLAMA_API void llama_memory_breathe(llama_memory_t mem);
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails

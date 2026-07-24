@@ -4,6 +4,8 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-vram-demand.h"
+#include "llama-vram-ledger.h"
 
 #include <algorithm>
 #include <cassert>
@@ -62,21 +64,13 @@ static uint32_t turbo_tcq_codebook_crc32(const char * path, size_t n_floats) {
     if (!path || !path[0]) {
         return 0; // no custom codebook → use compiled-in default → hash 0
     }
-    uint32_t crc = 0xFFFFFFFF;
     FILE * f = fopen(path, "rb");
     if (!f) { return 0; }
     float buf[512];
     size_t n = fread(buf, sizeof(float), n_floats, f);
     fclose(f);
     if (n != n_floats) { return 0; }
-    const uint8_t * data = (const uint8_t *)buf;
-    for (size_t i = 0; i < n_floats * sizeof(float); i++) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; j++) {
-            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
-        }
-    }
-    return crc ^ 0xFFFFFFFF;
+    return llama_crc32((const uint8_t *) buf, n_floats * sizeof(float));
 }
 
 static uint32_t turbo_tcq_fingerprint(void) {
@@ -541,22 +535,6 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
     if (tensor->type != GGML_TYPE_F32) {
         ggml_quantize_chunk(tensor->type, data, tensor->data, 0, 1, n*n, nullptr);
     }
-}
-
-static ggml_tensor * ggml_mul_mat_aux(
-        ggml_context * ctx,
-        ggml_tensor * cur,
-        ggml_tensor * rot) {
-    const auto n = rot->ne[0];
-
-    ggml_tensor * res;
-
-    res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
-    res = ggml_mul_mat   (ctx, rot, res);
-    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
-    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
-
-    return res;
 }
 
 //
@@ -1073,6 +1051,16 @@ llama_kv_cache::llama_kv_cache(
             p.device      = device;
             p.gran        = gran;
             p.mapped_base = be->vmm_pool_mapped(pool);
+            // co-tenancy: resolve the PCI bus id eagerly — p.backend stays null until the
+            // first degrade wave arms the side stream, far too late for marker publication
+            p.busid = "-";
+            if (ggml_backend_dev_t bdev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b))) {
+                ggml_backend_dev_props bprops;
+                ggml_backend_dev_get_props(bdev, &bprops);
+                if (bprops.device_id != nullptr) {
+                    p.busid = bprops.device_id;
+                }
+            }
             vbr_pools_.push_back(std::move(p));
             LLAMA_LOG_INFO("%s: VBR VMM pool #%zu: %.2f MiB VA reserved (device %d, %zu KiB pages), %.2f MiB mapped up front\n",
                     __func__, vbr_pools_.size() - 1, va_size/1024.0/1024.0, device, gran/1024,
@@ -1145,7 +1133,9 @@ llama_kv_cache::llama_kv_cache(
             is_vmm_buf = buf != nullptr;
         }
         if (buf == nullptr && !hparams.no_alloc) {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            // co-tenancy hold-aware alloc (a failing ask lands as the claim's one allowed
+            // est_partial upward revision)
+            buf = llama_vram_hold_alloc_ctx_tensors(ctx.get(), buft);
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -1287,6 +1277,27 @@ llama_kv_cache::llama_kv_cache(
         // experiment overrides.
         if (vbr_vmm_active()) {
             vbr_load_degrade_order();
+            // co-tenancy band cap: demand-driven sheds may only spend the leading f16->t8
+            // band of the price order — the one cheap AND domain-reversible rung (sub-t8
+            // sheds imprint irreversible re-encode error into existing tokens). A custom
+            // VBR_DEGRADE_ORDER carries no band guarantee, so it disables demand shedding.
+            t8_band_end_ = 0;
+            if (getenv("VBR_DEGRADE_ORDER") == nullptr) {
+                while (t8_band_end_ < vbr_degrade_order_.size() &&
+                       vbr_degrade_order_[t8_band_end_].tier == VBR_TIER_T8) {
+                    t8_band_end_++;
+                }
+            }
+            // consent comes ONLY from the typed flag (or its documented LLAMA_ARG env,
+            // which sets min_bits_explicit through the arg handler) — the raw VBR_MIN_BITS
+            // developer override still moves the floor VALUE but never grants peer-yield
+            // consent (bare presence of a debug env must not consent to sub-t8 loss)
+            vbr_floor_typed_ = vbr_params_.min_bits_explicit;
+            LLAMA_LOG_INFO("%s: co-tenancy: f16->t8 band = %zu of %zu order steps%s%s\n",
+                    __func__, t8_band_end_, vbr_degrade_order_.size(),
+                    t8_band_end_ == 0 ? " (demand shedding disabled)" : "",
+                    t8_band_end_ != 0 && vbr_floor_typed_
+                        ? " — explicit floor: peer yield consented to the floor" : "");
             vbr_floor_clamp_order();
             vbr_budget_bytes_    = (size_t) vbr_params_.budget_bytes;
             vbr_budget_explicit_ = vbr_params_.budget_explicit;
@@ -1890,7 +1901,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true);
+            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -1942,6 +1953,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // done (fence-ordered before the previous graph). Must precede this boundary's degrades and
         // ensure_mapped so no later page map can be ripped by a stale queued unmap.
         vbr_flush_deferred_unmaps();
+        // P3 idleness input: a boundary IS decode activity; ticks never write this
+        vbr_last_prepare_ns_ = llama_vram_ledger_now_ns();
     }
     // one ubatch token sum serves both the budget block and the scratch reserve below
     uint32_t n_tokens = 0;
@@ -1968,9 +1981,13 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // Stable when: budget fully explored, quiet for N boundaries, occupancy hasn't meaningfully moved.
         static const uint32_t VBR_STABLE_QUICK = 10; // quiet-boundary threshold for fast path
         static const int32_t  VBR_USED_DELTA   = 512; // occupancy delta below which we're stable
+        // co-tenancy: the ledger pre-check runs EVERY boundary, outside the stable gate —
+        // a peer's rename (new claim, offer change) forces the full controller path
+        vbr_ledger_precheck();
         bool vbr_stable = (vbr_degrade_cursor_ >= std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) &&
                            vbr_quiet_boundaries_ >= VBR_STABLE_QUICK &&
-                           std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA);
+                           std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA &&
+                           !vbr_ledger_force_);
 
         // predicted watermark for THIS boundary; both paths eagerly map to it once, after the if/else.
         uint32_t wm_next = 0;
@@ -2000,21 +2017,32 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             }
             wm_next = vbr_watermark_cells(n_tokens);
             vbr_shrink_watermark(); // occupancy drops release phantom tail pages first
-            static const bool vbr_promote_on = [] {
-                const char * e = getenv("VBR_PROMOTE"); // kill switch for experiments; default ON
-                return e == nullptr || atoi(e) != 0;
-            }();
+
             // promote pacing: ONE step per boundary, and only after a quiet window (no degrade in
             // the last 4 boundaries). Promotes re-encode aged rows from degraded recon — error
             // compounds per hop — so waves spread out and a clamp-driven degrade vetoes the
             // immediate bounce-back. Boundary counting keeps the cooldown deterministic.
             vbr_quiet_boundaries_++;
-            if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4) {
-                vbr_promote_next(wm_next);
-            }
+            // co-tenancy: promotes freeze while any unamortized grant remains, and around
+            // presence changes (gates live in vbr_maybe_promote)
+            vbr_maybe_promote(wm_next);
             // budget trigger: degrade while ANY pool exceeds its share. A step only shrinks the pool
             // that owns its tensor, but the cursor is a global price order — advancing it while any
             // pool is over budget is the simplest rule that terminates and preserves the price order.
+            // P3c: pre-loop pressure snapshot — the runtime demand's honest ask is what
+            // this boundary was short BEFORE the own ladder's sacrifice resolved it
+            const bool vbr_was_over = vbr_over_budget(wm_next);
+            if (vbr_was_over) {
+                vbr_pre_deficit_.assign(vbr_pools_.size(), 0);
+                for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+                    const auto & pp = vbr_pools_[pi];
+                    if (pp.vmm != nullptr) {
+                        const size_t proj = vbr_vmm_projected_bytes(pp, wm_next);
+                        const size_t be   = vbr_budget_eff(pp);
+                        vbr_pre_deficit_[pi] = proj > be ? proj - be : 0;
+                    }
+                }
+            }
             while (vbr_over_budget(wm_next)) {
                 vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
                 if (!vbr_degrade_next(wm_next)) {
@@ -2042,15 +2070,24 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                         __func__, pi, p.device, vbr_vmm_projected_bytes(p, wm_next)/1024.0/1024.0,
                         p.budget/1024.0/1024.0, p.be->vmm_pool_mapped(p.vmm)/1024.0/1024.0, wm_next);
             }
+            // P3 runtime-growth demand: the trigger is band-spent AND under pressure THIS
+            // boundary (pre-own-loop snapshot) — the own loop's exit makes post-loop
+            // projected <= budget_eff whenever the sub-band ladder still works, which must
+            // not hide the demand (the band is what peers owe; the sub-band walk is the
+            // demander's own sacrifice)
+            vbr_runtime_demand_update(wm_next, vbr_was_over);
+            // co-tenancy: full ledger pass on a pre-check hit, or unconditionally every 8th
+            // boundary once ≥1s has passed since the last full scan (bounds the miss window
+            // when our own rename baseline-swallowed a peer's concurrent rename)
+            if (vbr_ledger_force_ ||
+                (vbr_boundary_count_ % 8 == 0 &&
+                 llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull)) {
+                vbr_ledger_scan_service(wm_next);
+            }
             // S5: the wave's transcodes/scrubs are queued on each pool's side stream — arm that
             // device's fence so the next graph_compute GPU-waits on them; the host proceeds straight
             // to graph build.
-            for (auto & p : vbr_pools_) {
-                if (p.wave_pending) {
-                    p.be->fence_arm(p.backend);
-                    p.wave_pending = false;
-                }
-            }
+            vbr_arm_wave_fences();
         } else {
             // Fast path: settled — skip the budget/degrade bookkeeping. wm_next stays the current
             // watermark; the shared eager map below still covers occupancy that creeps up under the
@@ -2068,6 +2105,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         if (!vbr_vmm_try_map(wm_next)) {
             LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) — "
                     "failing this batch recoverably\n", __func__, wm_next);
+            // co-tenancy (spec: try_map-failed runtime-demand disjunct): route the NEXT
+            // boundary to the full controller path — a stable-path resident squeezed by a
+            // rename-free co-tenant would otherwise never publish its runtime demand and
+            // livelock on failing batches
+            vbr_ledger_force_ = true;
             return {};
         }
         // free-running boundary counter: drives the auto-budget re-derive throttle above and the
@@ -2085,6 +2127,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         if (!vbr_scratch_reserve(vbr_watermark_cells(n_tokens))) {
             LLAMA_LOG_ERROR("%s: f16 dequant scratch reserve failed (device memory exhausted) — "
                     "failing this batch recoverably\n", __func__);
+            vbr_ledger_force_ = true; // same routing as the try_map failure above
             return {};
         }
     }
@@ -2598,10 +2641,7 @@ bool llama_kv_cache::vbr_unit_pooled(size_t ikv, bool is_v) const {
 // references (raw budget vs clamped) made every boundary under a co-tenant clamp promote
 // then re-degrade — two transcodes plus one extra quantization hop on aged rows per flap.
 size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
-    static const size_t headroom = [] {
-        const char * e = getenv("VBR_VRAM_HEADROOM_MIB");
-        return (size_t) (e ? strtoull(e, nullptr, 10) : 192) * 1024 * 1024;
-    }();
+    const size_t headroom = llama_vram_headroom_bytes();
     // memoized per boundary: the degrade loop re-evaluates over_budget per step and the promote
     // hysteresis visits every pool, so an uncached get_device_memory here is a driver round-trip
     // multiplied by wave length x pools — and free VRAM cannot meaningfully move within one
@@ -2613,10 +2653,39 @@ size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
     size_t free_b = 0, total_b = 0;
     p.be->get_device_memory(p.device, &free_b, &total_b);
     const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm);
-    const size_t cap = mapped_now + (free_b > headroom ? free_b - headroom : 0);
+    // P3 fairness: headroom scales with the presence census (every live fork process has
+    // lazy CUDA pools that need room), and at N_live > 1 the budget base relaxes to a
+    // fair share of its own spare — mapped-anchored, 64 MiB-quantized, floored at this
+    // pool's share of the floor-layout cost. N_live == 1 bypasses BOTH (bit-identical
+    // single-tenant behavior; the quantization alone would cost up to 64 MiB).
+    const uint32_t n_live = vbr_pool_n_live(p);
+    const size_t headroom_eff = headroom * n_live;
+    if (n_live > 1) {
+        constexpr size_t quantum = 64ull * 1024 * 1024;
+        size_t va_total = 0;
+        for (const auto & q : vbr_pools_) {
+            va_total += q.vmm != nullptr ? q.size : 0;
+        }
+        const size_t floor_share = va_total > 0
+            ? (size_t) ((double) vbr_floor_cost_bytes_ * (double) p.size / (double) va_total) : 0;
+        const size_t spare = budget_eff > mapped_now ? budget_eff - mapped_now : 0;
+        budget_eff = std::max(floor_share, mapped_now + spare / n_live / quantum * quantum);
+    }
+    const size_t cap = mapped_now + (free_b > headroom_eff ? free_b - headroom_eff : 0);
     if (cap < budget_eff) {
         budget_eff = cap;
     }
+    // co-tenancy (mapped-anchored invariant): subtract this pool's unamortized grant
+    // decrements, then floor at mapped — the floor binds precisely in the shed->flush
+    // window so no consumer (including our own degrade loop) ever sees a budget below
+    // what is physically mapped. budget_eff = max(mapped, min(budget, live_cap) - Σdecr).
+    budget_eff = budget_eff > p.grant_decrement ? budget_eff - p.grant_decrement : 0;
+    if (budget_eff < mapped_now) {
+        budget_eff = mapped_now;
+    }
+#ifndef NDEBUG
+    GGML_ASSERT(budget_eff >= mapped_now);
+#endif
     p.budget_eff_stamp = vbr_boundary_count_;
     p.budget_eff_cache = budget_eff;
     return budget_eff;
@@ -2807,11 +2876,65 @@ size_t llama_kv_cache::vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_c
     return total;
 }
 
+// idle-time maintenance, decode-thread only (llama_memory_breathe). The co-tenancy tick:
+// an idle resident runs no decode boundaries, so without this it is deaf to demands and
+// its deferred unmaps never flush. Order is normative (design v3.8): flush FIRST (the
+// grant math and mapped-floor argument assume freed physical lands before any budget
+// evaluation), then stash-clear, budget rederive (throttled to every 8th tick, mirroring
+// the boundary throttle), full-reset-if-empty, watermark shrink, ledger scan + demand
+// service, promote step, fence-arm (MANDATORY — the next decode graph races the wave
+// otherwise), boundary count++ (budget memo + promote pacing depend on it).
+void llama_kv_cache::breathe() {
+    const size_t flushed = vbr_flush_deferred_unmaps();
+    if (flushed > 0) {
+        LLAMA_LOG_DEBUG("%s: flushed %zu deferred VBR unmaps at idle\n", __func__, flushed);
+    }
+    if (!vbr_vmm_active() || vbr_budget_bytes_ == 0) {
+        return;
+    }
+    if (vbr_stash_dirty_) {
+        for (auto & p : vbr_pools_) {
+            for (size_t j = 0; j < layers.size(); ++j) {
+                p.k[j].stash_valid = 0;
+                p.v[j].stash_valid = 0;
+            }
+        }
+        vbr_stash_dirty_ = false;
+    }
+    if (!vbr_budget_explicit_ && vbr_boundary_count_ % 8 == 0) {
+        vbr_rederive_budget();
+    }
+    uint32_t used_now = 0;
+    for (uint32_t st = 0; st < n_stream; ++st) {
+        used_now += v_cells[st].get_used();
+    }
+    if (vbr_degrade_cursor_ > 0 && used_now == 0) {
+        vbr_full_reset();
+    }
+    const uint32_t wm_next = vbr_watermark_cells(0);
+    vbr_shrink_watermark();
+    vbr_ledger_precheck();
+    if (vbr_ledger_force_ ||
+        llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull) {
+        vbr_ledger_scan_service(wm_next); // demand waves run band-capped inside
+    }
+    vbr_runtime_demand_update(wm_next, /*was_over=*/false); // tick: CLEAR path only
+    // no spontaneous degrade pressure at idle: budget_eff floors at mapped and nothing
+    // grows here, so the general over-budget loop cannot fire — only demand decrements
+    // (band-capped, in the scan) shed. Promotes get their idle chance under the same
+    // gates as the boundary path.
+    vbr_quiet_boundaries_++;
+    vbr_maybe_promote(wm_next);
+    vbr_arm_wave_fences();
+    vbr_boundary_count_++;
+}
+
 // S5: unmap tail pages queued by the previous degrade wave. Safe only after the wave's transcodes
 // finished (they READ the old tier-A extent, which reaches into these pages) — one side-stream
 // sync per pool makes that certain; by the next decode boundary the wave is long done, so this is
 // ~free.
-void llama_kv_cache::vbr_flush_deferred_unmaps() {
+size_t llama_kv_cache::vbr_flush_deferred_unmaps() {
+    size_t flushed = 0;
     for (auto & p : vbr_pools_) {
         if (p.unmap_deferred.empty()) {
             continue;
@@ -2821,8 +2944,10 @@ void llama_kv_cache::vbr_flush_deferred_unmaps() {
         for (const auto & [off, len] : p.unmap_deferred) {
             p.be->vmm_pool_unmap(p.vmm, off, len);
         }
+        flushed += p.unmap_deferred.size();
         p.unmap_deferred.clear();
     }
+    return flushed;
 }
 
 // Generic degrade-rank curves for models WITHOUT a baked order (matrix v3, 2026-07-05).
@@ -3029,13 +3154,15 @@ static double vbr_resolve_floor_bpv(double min_bits) {
 // pooled_only restricts units to VMM-pooled ones (the runtime); dry-load contexts have no pools
 // and pass false. entry_k/entry_v override each side's tensor type (the fit's cparams types are
 // price-swapped during fitting; it passes the true entry types) — GGML_TYPE_COUNT = tensor type.
-llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
-        double floor_bpv, bool pooled_only, ggml_type entry_k, ggml_type entry_v) const {
-    vbr_floor_sim_result res;
-    res.end_types.assign(layers.size() * 2, GGML_TYPE_COUNT);
-    auto & sim = res.end_types;
-    double  sum_bits = 0.0;
-    int64_t sum_vals = 0;
+// Shared degrade-ladder simulation core. Every consumer of the price order — the floor
+// clamp/capacity sim, the pressure telemetry's bpv-if-degraded walk, and the co-tenancy
+// offer — walks the same rules or the ADVERTS LIE: seed a per-(layer, side) type view,
+// then per step apply exactly vbr_degrade_next's skip rules. Callers own their loop
+// bounds, stop conditions and accounting; the rules live here once.
+void llama_kv_cache::vbr_sim_seed(std::vector<ggml_type> & sim, bool pooled_only,
+                                  ggml_type entry_k, ggml_type entry_v,
+                                  double * sum_bits, int64_t * sum_vals, size_t * n_pinned) const {
+    sim.assign(layers.size() * 2, GGML_TYPE_COUNT);
     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
         for (int side = 0; side < 2; ++side) {
             const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
@@ -3047,32 +3174,60 @@ llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
             // aggregate math on the canonical tensor: shard row sizes are additive across pools
             // (blocks never straddle the split), so this is exact under -sm tensor too
             sim[ikv*2 + side] = entry;
-            sum_bits += 8.0 * ggml_row_size(entry, t->ne[0]);
-            sum_vals += t->ne[0];
-            res.n_pinned += !vbr_unit_movable(entry, side != 0);
+            if (sum_bits != nullptr) {
+                *sum_bits += 8.0 * ggml_row_size(entry, t->ne[0]);
+            }
+            if (sum_vals != nullptr) {
+                *sum_vals += t->ne[0];
+            }
+            if (n_pinned != nullptr) {
+                *n_pinned += !vbr_unit_movable(entry, side != 0);
+            }
         }
     }
+}
+
+// step i applicable? (same skip rules as vbr_degrade_next: unknown layer, absent/pinned
+// unit, same-type or no-gain no-ops). On true, fills the slot/tensor/target for the
+// caller's accounting; the caller applies sim[slot] = type_B when it accepts the step.
+bool llama_kv_cache::vbr_sim_step(const std::vector<ggml_type> & sim, size_t i,
+                                  size_t & slot, const ggml_tensor *& t, ggml_type & type_B) const {
+    const auto & st = vbr_degrade_order_[i];
+    const auto it = map_layer_ids.find(st.il);
+    if (it == map_layer_ids.end()) {
+        return false;
+    }
+    slot = (size_t) it->second * 2 + (st.is_v ? 1 : 0);
+    t    = st.is_v ? layers[it->second].v : layers[it->second].k;
+    if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_unit_movable(sim[slot], st.is_v != 0)) {
+        return false; // absent or pinned (runtime skips these steps identically)
+    }
+    type_B = vbr_tier_type(st.tier);
+    if (sim[slot] == type_B ||
+        ggml_row_size(type_B, t->ne[0]) >= ggml_row_size(sim[slot], t->ne[0])) {
+        return false; // same no-op rule as vbr_degrade_next
+    }
+    return true;
+}
+
+llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
+        double floor_bpv, bool pooled_only, ggml_type entry_k, ggml_type entry_v) const {
+    vbr_floor_sim_result res;
+    auto & sim = res.end_types;
+    double  sum_bits = 0.0;
+    int64_t sum_vals = 0;
+    vbr_sim_seed(sim, pooled_only, entry_k, entry_v, &sum_bits, &sum_vals, &res.n_pinned);
     res.clamp_step = vbr_degrade_order_.size();
     if (sum_vals == 0) {
         return res;
     }
     for (size_t i = 0; i < vbr_degrade_order_.size(); ++i) {
-        const auto & st = vbr_degrade_order_[i];
-        const auto it = map_layer_ids.find(st.il);
-        if (it == map_layer_ids.end()) {
+        size_t slot; const ggml_tensor * t; ggml_type type_B;
+        if (!vbr_sim_step(sim, i, slot, t, type_B)) {
             continue;
         }
-        const size_t slot = (size_t) it->second * 2 + (st.is_v ? 1 : 0);
-        const ggml_tensor * t = st.is_v ? layers[it->second].v : layers[it->second].k;
-        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_unit_movable(sim[slot], st.is_v != 0)) {
-            continue; // absent or pinned (runtime skips these steps identically)
-        }
-        const ggml_type type_B = vbr_tier_type(st.tier);
         const size_t rA = ggml_row_size(sim[slot], t->ne[0]);
         const size_t rB = ggml_row_size(type_B,    t->ne[0]);
-        if (sim[slot] == type_B || rB >= rA) {
-            continue; // same no-op rule as vbr_degrade_next
-        }
         const double bits_next = sum_bits - 8.0*rA + 8.0*rB;
         if (bits_next / sum_vals < floor_bpv - 1e-9) {
             res.clamp_step = i;
@@ -3939,20 +4094,11 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     // vbr_degrade_next until every pool's RAW projection fits (or the floor clamp stops it) —
     // the aggregate the controller would land at if the deficit were paid by tiers alone.
     // Mirrors the vbr_floor_clamp_order simulation; aggregate basis = VMM-pooled units.
-    std::vector<ggml_type> sim(layers.size() * 2, GGML_TYPE_COUNT);
+    std::vector<ggml_type> sim;
     double  sum_bits = 0.0;
     int64_t sum_vals = 0;
-    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-        for (int side = 0; side < 2; ++side) {
-            const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
-            if (t == nullptr || !vbr_unit_pooled(ikv, side != 0)) {
-                continue;
-            }
-            sim[ikv*2 + side] = t->type;
-            sum_bits += 8.0 * (double) ggml_row_size(t->type, t->ne[0]);
-            sum_vals += t->ne[0];
-        }
-    }
+    vbr_sim_seed(sim, /*pooled_only=*/true, GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+                 &sum_bits, &sum_vals, nullptr);
     auto pools_fit = [&]() {
         for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
             if (vbr_pools_[pi].vmm != nullptr && pool_proj[pi] > (int64_t) vbr_pools_[pi].budget) {
@@ -3963,29 +4109,21 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     };
     for (size_t i = vbr_degrade_cursor_;
          i < std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) && !pools_fit(); ++i) {
+        size_t slot; const ggml_tensor * t; ggml_type type_B;
+        if (!vbr_sim_step(sim, i, slot, t, type_B)) {
+            continue;
+        }
         const auto & stp = vbr_degrade_order_[i];
-        const auto it = map_layer_ids.find(stp.il);
-        if (it == map_layer_ids.end()) {
-            continue;
-        }
-        const size_t slot = (size_t) it->second * 2 + (stp.is_v ? 1 : 0);
-        const ggml_tensor * t = stp.is_v ? layers[it->second].v : layers[it->second].k;
-        if (sim[slot] == GGML_TYPE_COUNT || t == nullptr || !vbr_unit_movable(sim[slot], stp.is_v != 0)) {
-            continue;
-        }
-        const ggml_type type_B = vbr_tier_type(stp.tier);
+        const size_t ikv = slot / 2;
         const size_t rA = ggml_row_size(sim[slot], t->ne[0]);
         const size_t rB = ggml_row_size(type_B,    t->ne[0]);
-        if (sim[slot] == type_B || rB >= rA) {
-            continue;
-        }
         // projection deltas land in EVERY pool holding the unit, priced at each pool's shard width
         for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
             const auto & p = vbr_pools_[pi];
             if (p.vmm == nullptr) {
                 continue;
             }
-            const vbr_extent & e = stp.is_v ? p.v[it->second] : p.k[it->second];
+            const vbr_extent & e = stp.is_v ? p.v[ikv] : p.k[ikv];
             if (e.t == nullptr) {
                 continue;
             }
@@ -4000,6 +4138,621 @@ llama_memory_vbr_state_data llama_kv_cache::memory_vbr_state(llama_seq_id seq_id
     st.bpv_if_degraded = sum_vals > 0 ? sum_bits / (double) sum_vals : 0.0;
 
     return st;
+}
+
+// co-tenancy: the marker-published donation offer. Walks the REMAINING consent window
+// [cursor, vbr_demand_limit()) — the f16->t8 band, or down to a TYPED floor — with the
+// same skip rules as vbr_degrade_next and sums,
+// per pool, the page-padded bytes the full band would free at the current watermark — then
+// subtracts the projected GROWTH of the #88 f16 dequant scratch those sheds would cost.
+// The scratch projection uses the max-row shape of vbr_scratch_reserve (the widest
+// dequant-active row per side), NOT a per-(layer,side) sum — summing would overstate the
+// cost by ~n_layers and zero every offer. The budget is deliberately not an input: an offer
+// says what shedding COULD free, the grant math decides what it does free.
+size_t llama_kv_cache::vbr_shed_available(int device) const {
+    if (!vbr_vmm_active() || vbr_demand_limit() == 0) {
+        return 0;
+    }
+    uint32_t wm_max = 0;
+    for (const auto & p : vbr_pools_) {
+        if (p.vmm != nullptr) {
+            wm_max = std::max(wm_max, p.wm_cells);
+        }
+    }
+    const uint32_t wm_key = GGML_PAD(wm_max, 256);
+    if (shed_avail_epoch_ != vbr_tier_epoch_ || shed_avail_wm_ != wm_key) {
+        shed_avail_pool_.assign(vbr_pools_.size(), 0);
+
+        std::vector<ggml_type> sim;
+        vbr_sim_seed(sim, /*pooled_only=*/true, GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+                     nullptr, nullptr, nullptr);
+        std::vector<int64_t> freed(vbr_pools_.size(), 0);
+        const size_t demand_limit = vbr_demand_limit();
+        for (size_t i = vbr_degrade_cursor_; i < demand_limit; ++i) {
+            size_t slot; const ggml_tensor * t; ggml_type type_B;
+            if (!vbr_sim_step(sim, i, slot, t, type_B)) {
+                continue;
+            }
+            const auto & stp = vbr_degrade_order_[i];
+            const size_t ikv = slot / 2;
+            for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+                const auto & p = vbr_pools_[pi];
+                if (p.vmm == nullptr) {
+                    continue;
+                }
+                const vbr_extent & e = stp.is_v ? p.v[ikv] : p.k[ikv];
+                if (e.t == nullptr) {
+                    continue;
+                }
+                freed[pi] += (int64_t) GGML_PAD(ggml_row_size(sim[slot], e.t->ne[0]) * p.wm_cells, p.gran)
+                           - (int64_t) GGML_PAD(ggml_row_size(type_B,    e.t->ne[0]) * p.wm_cells, p.gran);
+            }
+            sim[slot] = type_B;
+        }
+        for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+            const auto & p = vbr_pools_[pi];
+            if (p.vmm == nullptr) {
+                continue;
+            }
+            // scratch growth: widest dequant-active f16 row per side, before vs after the sim
+            size_t cur_k = 0, cur_v = 0, end_k = 0, end_v = 0;
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                const ggml_tensor * tk = p.k[ikv].t;
+                const ggml_tensor * tv = p.v[ikv].t;
+                bool need_k = false, need_v = false;
+                ggml_vbr_kv_dequant_sides(tk ? tk->type : GGML_TYPE_F16,
+                                          tv ? tv->type : GGML_TYPE_F16, &need_k, &need_v);
+                if (need_k && tk) { cur_k = std::max(cur_k, ggml_row_size(GGML_TYPE_F16, tk->ne[0])); }
+                if (need_v && tv) { cur_v = std::max(cur_v, ggml_row_size(GGML_TYPE_F16, tv->ne[0])); }
+                const ggml_type sk = sim[ikv*2 + 0] != GGML_TYPE_COUNT ? sim[ikv*2 + 0] : (tk ? tk->type : GGML_TYPE_F16);
+                const ggml_type sv = sim[ikv*2 + 1] != GGML_TYPE_COUNT ? sim[ikv*2 + 1] : (tv ? tv->type : GGML_TYPE_F16);
+                ggml_vbr_kv_dequant_sides(sk, sv, &need_k, &need_v);
+                if (need_k && tk) { end_k = std::max(end_k, ggml_row_size(GGML_TYPE_F16, tk->ne[0])); }
+                if (need_v && tv) { end_v = std::max(end_v, ggml_row_size(GGML_TYPE_F16, tv->ne[0])); }
+            }
+            const int64_t scratch_proj =
+                (int64_t) ((end_k > cur_k ? end_k - cur_k : 0) +
+                           (end_v > cur_v ? end_v - cur_v : 0)) * (int64_t) p.wm_cells;
+            shed_avail_pool_[pi] = (size_t) std::max<int64_t>(0, freed[pi] - scratch_proj);
+        }
+        shed_avail_epoch_ = vbr_tier_epoch_;
+        shed_avail_wm_    = wm_key;
+        size_t dbg_total = 0;
+        for (const size_t s : shed_avail_pool_) {
+            dbg_total += s;
+        }
+        LLAMA_LOG_DEBUG("%s: recompute: band [%zu, %zu) wm %u -> %.1f MiB offerable\n",
+                __func__, vbr_degrade_cursor_, demand_limit,
+                wm_key, dbg_total/1048576.0);
+    }
+    size_t total = 0;
+    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+        if (vbr_pools_[pi].vmm != nullptr && vbr_pools_[pi].device == device) {
+            total += shed_avail_pool_[pi];
+        }
+    }
+    return total;
+}
+
+// ---- co-tenancy donor side (P2) ----
+
+const std::string & llama_kv_cache::vbr_pool_busid(vbr_pool & p) const {
+    // resolved eagerly at pool arming; "-" = resolved-and-absent (never publish). The
+    // empty case only exists for pools armed before that code ran (defensive).
+    if (p.busid.empty()) {
+        p.busid = "-";
+    }
+    return p.busid;
+}
+
+llama_kv_cache::vbr_pool * llama_kv_cache::vbr_find_pool(const std::string & busid) {
+    for (auto & p : vbr_pools_) {
+        if (p.vmm != nullptr && vbr_pool_busid(p) == busid) {
+            return &p;
+        }
+    }
+    return nullptr;
+}
+
+uint32_t llama_kv_cache::vbr_pool_n_live(const vbr_pool & p) const {
+    const auto it = vbr_presence_.find(p.busid);
+    return it != vbr_presence_.end() && it->second.cur > 0 ? it->second.cur : 1;
+}
+
+bool llama_kv_cache::vbr_presence_quiet() const {
+    return vbr_scan_events_ - vbr_nlive_change_scan_ >= (uint32_t) LLAMA_VRAM_LEDGER_DEBOUNCE;
+}
+
+// P3 runtime-growth demand, demander side. Publishes a phase=runtime claim when this
+// resident spent its own consent window and is still over budget (the try_map-failed case
+// arrives here at the NEXT boundary — the map failure fails that batch recoverably first);
+// the est carries projected - budget_eff with est_partial=0 so donors apply the shed-sizing
+// formula unchanged (an explicit-cap demander whose shortage free VRAM covers nets
+// shortfall <= 0 at every donor and draws no shed). CLEAR unlinks at the first boundary
+// where the recomputed shortage is gone — the donors' lift signal. Skipped entirely while
+// a load-phase claim is still live (satisfied pre-claim-complete: one claim per process).
+void llama_kv_cache::vbr_runtime_demand_update(uint32_t wm_next, bool was_over) {
+    if (!llama_vram_ledger_armed() || !vbr_ledger_owner_ || llama_vram_demand_pending_complete()) {
+        return;
+    }
+    // loop-invariant gate first: the common case (consent window unspent, nothing live)
+    // must not pay the per-pool projection walk every boundary
+    const bool window_spent = vbr_degrade_cursor_ >= vbr_demand_limit();
+    if (!window_spent && vbr_runtime_live_.empty()) {
+        return;
+    }
+    for (auto & p : vbr_pools_) {
+        if (p.vmm == nullptr || vbr_pool_busid(p) == "-") {
+            continue;
+        }
+        const size_t projected = vbr_vmm_projected_bytes(p, wm_next);
+        const size_t beff      = vbr_budget_eff(p);
+        // shorted: band spent AND this boundary saw pressure (pre-own-loop), or the ladder
+        // is exhausted with projection still over
+        const bool   shorted   = window_spent && (was_over || projected > beff);
+        const size_t pool_idx  = (size_t) (&p - vbr_pools_.data());
+        const bool live = vbr_runtime_live_.count(p.busid) != 0;
+        if (shorted) {
+            // saturated, pre-loop-honest ask (a post-loop subtraction can underflow — the
+            // own ladder's exit condition already restored projected <= budget_eff)
+            const uint64_t wanted = projected > beff ? projected - beff
+                : (pool_idx < vbr_pre_deficit_.size() ? vbr_pre_deficit_[pool_idx] : 0);
+            if (wanted == 0) {
+                continue;
+            }
+            if (!live) {
+                llama_vram_claim_fields f = {};
+                f.phase                     = LLAMA_VRAM_CLAIM_RUNTIME;
+                f.bytes_total_remaining_est = wanted;
+                f.est_partial               = 0;
+                f.ver                       = ++vbr_runtime_ver_;
+                f.created_ts_ns             = llama_vram_ledger_now_ns();
+                if (llama_vram_claim_publish(p.busid, f)) {
+                    vbr_runtime_live_.insert(p.busid);
+                    vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns(); // own rename
+                    LLAMA_LOG_INFO("%s: runtime demand on %s: %.1f MiB (consent window spent)\n",
+                            __func__, p.busid.c_str(), wanted/1048576.0);
+                }
+            }
+        } else if (live) {
+            llama_vram_claim_withdraw(p.busid);
+            vbr_runtime_live_.erase(p.busid);
+            LLAMA_LOG_INFO("%s: runtime demand on %s cleared\n", __func__, p.busid.c_str());
+        }
+    }
+}
+
+// promote gate shared by the boundary path and the tick (one env read, one gate — the
+// co-tenancy freeze terms live here exactly once)
+void llama_kv_cache::vbr_maybe_promote(uint32_t wm_next) {
+    static const bool vbr_promote_on = [] {
+        const char * e = getenv("VBR_PROMOTE"); // kill switch for experiments; default ON
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4 &&
+        vbr_total_grant_decrement() == 0 && vbr_presence_quiet()) {
+        vbr_promote_next(wm_next);
+    }
+}
+
+void llama_kv_cache::vbr_arm_wave_fences() {
+    for (auto & p : vbr_pools_) {
+        if (p.wave_pending) {
+            p.be->fence_arm(p.backend);
+            p.wave_pending = false;
+        }
+    }
+}
+
+size_t llama_kv_cache::vbr_total_grant_decrement() const {
+    size_t total = 0;
+    for (const auto & p : vbr_pools_) {
+        total += p.grant_decrement;
+    }
+    return total;
+}
+
+// recompute each pool's decrement sum from the grant rows and bust the budget memos —
+// called only on grant mutation / amortization change (scan events), never per boundary
+void llama_kv_cache::vbr_apply_grant_decrements() {
+    for (auto & p : vbr_pools_) {
+        p.grant_decrement = 0;
+    }
+    for (const auto & g : vbr_grants_) {
+        if (g.pool_idx < vbr_pools_.size()) {
+            vbr_pools_[g.pool_idx].grant_decrement += g.bytes; // amortization already folded in
+        }
+    }
+    for (auto & p : vbr_pools_) {
+        p.budget_eff_stamp = ~0ull;
+    }
+}
+
+// dir-mtime pre-check, every boundary OUTSIDE the stable gate (~1µs stat): a rename in the
+// ledger (new claim, phase flip, peer offer) forces the full controller path this boundary
+void llama_kv_cache::vbr_ledger_precheck() {
+    if (!vbr_ledger_owner_ || !vbr_vmm_active() || !llama_vram_ledger_armed()) {
+        return;
+    }
+    const uint64_t mtime = llama_vram_ledger_dir_mtime_ns();
+    if (mtime != vbr_ledger_mtime_) {
+        // adopt immediately: our own upcoming renames re-stat and re-adopt after writing
+        vbr_ledger_mtime_ = mtime;
+        vbr_ledger_force_ = true;
+    }
+}
+
+// full ledger pass: grant upkeep (lift / amortize), demand service (rank-0 shed sizing →
+// decrement + capped waves), marker publish/beat. Runs inside the !vbr_stable branch after
+// the pool's own degrade loop and before the existing fence-arm (a demand wave queued here
+// is fenced by that same loop).
+void llama_kv_cache::vbr_presence_census(const std::vector<llama_vram_peer_marker> & peers) {
+    // ---- P3 presence census: N_live per device = self + live peer markers ----
+    vbr_scan_events_++;
+    std::map<std::string, uint32_t> raw;
+    for (auto & p : vbr_pools_) {
+        if (p.vmm != nullptr && vbr_pool_busid(p) != "-") {
+            raw[p.busid] = 1; // self
+        }
+    }
+    for (const auto & m : peers) {
+        auto it = raw.find(m.busid);
+        if (it != raw.end()) {
+            it->second++;
+        }
+    }
+    // first sighting adopts silently; arrivals are immediate (growing headroom is the safe
+    // direction); departures only after the raw count holds DEBOUNCE consecutive scans
+    for (auto & [busid, n] : raw) {
+        auto & st = vbr_presence_[busid];
+        st.stable = (st.cur != 0 && n < st.cur && st.raw == n) ? st.stable + 1 : 0;
+        st.raw = n;
+        if (st.cur == 0) {
+            st.cur = n;
+        } else if (n > st.cur || st.stable >= (uint32_t) LLAMA_VRAM_LEDGER_DEBOUNCE) {
+            st.cur = n;
+            st.stable = 0;
+            vbr_nlive_change_scan_ = vbr_scan_events_;
+        }
+    }
+
+}
+
+// P3 census + grant upkeep + demand service + hygiene: the four phases of the full
+// ledger pass, split for readability — vbr_ledger_scan_service composes them.
+bool llama_kv_cache::vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> & claims, uint64_t now) {
+    // lift on claim-disappearance-with-live-pid / pid-death /
+    // heartbeat-stall; amortize surviving demanded-device rows by the claim's bytes_now ----
+    bool grants_changed = false;
+    for (auto it = vbr_grants_.begin(); it != vbr_grants_.end(); ) {
+        auto & g = *it;
+        const llama_vram_peer_claim * claim = nullptr;
+        bool any_claim_of_owner = false;
+        for (const auto & c : claims) {
+            if (c.pid == g.pid && c.starttime == g.starttime && c.fields.ver == g.ver) {
+                any_claim_of_owner = true;
+                if (c.busid == g.busid) {
+                    claim = &c;
+                }
+            }
+        }
+        bool lift = false;
+        if (!llama_vram_ledger_pid_alive(g.pid, g.starttime)) {
+            lift = true; // trivial lift on death
+        } else if (!any_claim_of_owner) {
+            lift = true; // claim-complete or runtime CLEAR: disappearance with live pid
+        } else if (claim != nullptr) {
+            // heartbeat-stall (flat 3·BEAT rule): the ≤BEAT writer thread makes cadence
+            // decode-independent, so a stalled beat means a wedged demander
+            if (llama_vram_hb_observe(vbr_claim_obs_, g.busid + "-" + std::to_string(g.pid),
+                                       claim->hb_counter, now)
+                    > (uint64_t) LLAMA_VRAM_LEDGER_HB_STALL_MS * 1000000ull) {
+                lift = true;
+            }
+            if (!lift && !g.collateral) {
+                // clamped amortization: the demander's landed bytes release the decrement
+                const uint64_t delta = claim->bytes_now > g.bytes_now_at_grant
+                                       ? claim->bytes_now - g.bytes_now_at_grant : 0;
+                const uint64_t decr  = delta < g.bytes ? g.bytes - delta : 0;
+                if (decr != g.bytes) {
+                    g.bytes = decr; // bytes now carries the LIVE decrement
+                    g.bytes_now_at_grant = claim->bytes_now;
+                    grants_changed = true;
+                    if (g.bytes == 0) {
+                        lift = true;
+                    }
+                }
+            }
+        }
+        // collateral rows: delta_i = 0 — decrement holds in full until the lift event
+        if (lift) {
+            it = vbr_grants_.erase(it);
+            grants_changed = true;
+        } else {
+            ++it;
+        }
+    }
+
+    return grants_changed;
+}
+
+bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim> & claims,
+                                         const std::vector<llama_vram_peer_marker> & peers,
+                                         uint64_t now, uint32_t wm_next) {
+    bool grants_changed = false;
+    // ---- demand service: rank-0 shed sizing ----
+    // one band per donor per session-generation is enforced by the band cursor itself
+    // (monotone: once spent, shed_available stays 0 until vbr_full_reset)
+    // idleness for runtime-demand donation: decode-based, evaluated here (a boundary
+    // caller has just stamped last_prepare, so it is never idle — active-vs-active
+    // residents self-serve via their own ladders; only the tick path can qualify)
+    const bool donor_idle = vbr_last_prepare_ns_ != 0 &&
+        now - vbr_last_prepare_ns_ >= (uint64_t) LLAMA_VRAM_LEDGER_IDLE_MS * 1000000ull;
+    for (const auto & c : claims) {
+        LLAMA_LOG_DEBUG("%s: claim pid %d phase %u est %.1f MiB (donor_idle %d)\n",
+                __func__, c.pid, (unsigned) c.fields.phase,
+                c.fields.bytes_total_remaining_est/1048576.0, (int) donor_idle);
+        if (c.fields.phase != LLAMA_VRAM_CLAIM_DEMAND &&
+            !(c.fields.phase == LLAMA_VRAM_CLAIM_RUNTIME && donor_idle)) {
+            continue;
+        }
+        // already granted to this (pid, starttime, ver) on this device? one decision, one shed
+        bool granted = false;
+        for (const auto & g : vbr_grants_) {
+            if (g.pid == c.pid && g.starttime == c.starttime && g.ver == c.fields.ver &&
+                g.busid == c.busid && !g.collateral) {
+                granted = true;
+                break;
+            }
+        }
+        if (granted || vbr_budget_explicit_) {
+            continue;
+        }
+        // does the demand name one of our devices, and do we have an offer there?
+        vbr_pool * demanded_pool = vbr_find_pool(c.busid);
+        if (demanded_pool == nullptr) {
+            continue;
+        }
+        const size_t our_offer = vbr_shed_available(demanded_pool->device);
+        const size_t sib_offer = vbr_ledger_sibling_ != nullptr
+            ? vbr_ledger_sibling_->vbr_shed_available(demanded_pool->device) : 0;
+        if (our_offer + sib_offer == 0) {
+            continue;
+        }
+        // rank-0 among FRESH offering markers on the demanded device (created_ts, pid) —
+        // our created_ts is the marker's first-publish time; peers' come from the scan
+        bool rank0 = true;
+        for (const auto & m : peers) {
+            if (m.busid != c.busid || m.fields.shed_available == 0) {
+                continue;
+            }
+            // freshness for donor selection instantiates with LONG/2
+            if (llama_vram_hb_observe(vbr_claim_obs_, "m-" + m.busid + "-" + std::to_string(m.pid),
+                                       m.hb_counter, now)
+                    >= (uint64_t) LLAMA_VRAM_LEDGER_LONG_MS/2 * 1000000ull) {
+                continue; // stale offer — not a competitor
+            }
+            // peers' created_ts vs ours: ours is unknowable from our own map (publish
+            // stamps it internally) — use pid as the deterministic total order fallback
+            // when created_ts ties are possible; the ledger's created_ts is authoritative
+            if (m.created_ts_ns < vbr_marker_created_ts_ ||
+                (m.created_ts_ns == vbr_marker_created_ts_ && m.pid < llama_vram_ledger_self_pid())) {
+                rank0 = false;
+                break;
+            }
+        }
+        if (!rank0) {
+            continue;
+        }
+        // shortfall = est − (free − headroom) − Σ peers' grant_pending (bridges shed→flush)
+        size_t free_b = 0, total_b = 0;
+        demanded_pool->be->get_device_memory(demanded_pool->device, &free_b, &total_b);
+        // headroom_eff = base x N_live (spec normative — flat base would undershed by
+        // (N_live-1) x base exactly when the census matters)
+        const size_t headroom_eff = llama_vram_headroom_bytes() * vbr_pool_n_live(*demanded_pool);
+        uint64_t peers_pending = 0;
+        for (const auto & m : peers) {
+            if (m.busid == c.busid) {
+                peers_pending += m.fields.grant_pending;
+            }
+        }
+        const uint64_t covered = (free_b > headroom_eff ? free_b - headroom_eff : 0) + peers_pending;
+        LLAMA_LOG_DEBUG("%s: sizing pid %d: est %.1f free %.1f hr %.1f off %.1f\n",
+                __func__, c.pid, c.fields.bytes_total_remaining_est/1048576.0,
+                free_b/1048576.0, headroom_eff/1048576.0, (our_offer + sib_offer)/1048576.0);
+        if (c.fields.bytes_total_remaining_est <= covered) {
+            continue; // shortfall ≤ 0: free (or peers' in-flight sheds) already cover it
+        }
+        const uint64_t shortfall = c.fields.bytes_total_remaining_est - covered;
+        const uint64_t target    = std::min<uint64_t>(our_offer + sib_offer, shortfall);
+
+        // parent-level iSWA servicing: the SUM of both children's offers backed the
+        // sufficiency above; split the target by offer weight (footprint-proportional —
+        // the offer IS the freeable footprint) and let each child shed its own portion
+        // with its own grants, decrements and pending. Non-iSWA: sibling is null and the
+        // whole target is ours.
+        // (our_offer + sib_offer > 0 guaranteed by the continue above)
+        const uint64_t own_target = (uint64_t) ((__int128) target * our_offer / (our_offer + sib_offer));
+        size_t freed_own = vbr_execute_shed(c, own_target, wm_next);
+        grants_changed = grants_changed || freed_own > 0;
+        if (vbr_ledger_sibling_ != nullptr && freed_own < target) {
+            vbr_ledger_sibling_->vbr_execute_shed(c, target - freed_own, wm_next);
+        }
+    }
+    return grants_changed;
+}
+
+// execute a demand shed of up to `target` bytes for claim c: band/consent-capped degrade
+// waves, one grant row per pool the wave freed bytes in (collateral on non-demanded
+// devices), grant_pending on each affected device's marker. Runs after the pool's own
+// degrade loop at a boundary; the caller's fence-arm covers the queued waves. Returns
+// the bytes freed on the DEMANDED device.
+size_t llama_kv_cache::vbr_execute_shed(const llama_vram_peer_claim & c, uint64_t target, uint32_t wm_next) {
+    if (target == 0) {
+        return 0;
+    }
+    vbr_pool * demanded_pool = vbr_find_pool(c.busid);
+    if (demanded_pool == nullptr) {
+        return 0;
+    }
+    std::vector<size_t> proj_before(vbr_pools_.size(), 0);
+    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+        if (vbr_pools_[pi].vmm != nullptr) {
+            proj_before[pi] = vbr_vmm_projected_bytes(vbr_pools_[pi], wm_next);
+        }
+    }
+    const size_t band_limit = vbr_demand_limit();
+    size_t freed_demanded = 0;
+    while (freed_demanded < target && vbr_degrade_cursor_ < band_limit) {
+        if (!vbr_degrade_next(wm_next)) {
+            break;
+        }
+        vbr_quiet_boundaries_ = 0;
+        freed_demanded = proj_before[demanded_pool - vbr_pools_.data()]
+                       - vbr_vmm_projected_bytes(*demanded_pool, wm_next);
+    }
+    bool changed = false;
+    for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+        auto & p = vbr_pools_[pi];
+        if (p.vmm == nullptr) {
+            continue;
+        }
+        const size_t proj_now = vbr_vmm_projected_bytes(p, wm_next);
+        if (proj_now >= proj_before[pi]) {
+            continue;
+        }
+        const uint64_t freed = proj_before[pi] - proj_now;
+        vbr_grant_row g;
+        g.busid              = c.busid;
+        g.pid                = c.pid;
+        g.starttime          = c.starttime;
+        g.ver                = c.fields.ver;
+        g.pool_idx           = pi;
+        g.bytes              = freed;
+        g.bytes_now_at_grant = c.bytes_now;
+        g.collateral         = vbr_pool_busid(p) != c.busid;
+        vbr_grants_.push_back(std::move(g));
+        changed = true;
+        vbr_grant_pending_[vbr_pool_busid(p)] += freed;
+        LLAMA_LOG_INFO("%s: co-tenancy shed for pid %d on %s: %.1f MiB freed from pool #%zu%s\n",
+                __func__, c.pid, c.busid.c_str(), freed/1048576.0, pi,
+                g.collateral ? " (collateral)" : "");
+    }
+    if (changed) {
+        vbr_apply_grant_decrements(); // sibling-hosted grants decrement sibling budgets
+    }
+    return freed_demanded;
+}
+
+void llama_kv_cache::vbr_grant_pending_clear() {
+    // ---- grant_pending clear: first scan event after the wave's deferred unmaps flushed ----
+    for (auto & [busid, pending] : vbr_grant_pending_) {
+        if (pending == 0) {
+            continue;
+        }
+        bool flushed = true;
+        for (auto & p : vbr_pools_) {
+            if (p.vmm != nullptr && vbr_pool_busid(p) == busid && !p.unmap_deferred.empty()) {
+                flushed = false;
+                break;
+            }
+        }
+        if (flushed) {
+            pending = 0;
+        }
+    }
+
+}
+
+void llama_kv_cache::vbr_markers_publish(uint64_t now) {
+    // ---- marker publish / beat (write discipline: rename only on field change) ----
+    for (auto & p : vbr_pools_) {
+        if (p.vmm == nullptr) {
+            continue;
+        }
+        const std::string & busid = vbr_pool_busid(p);
+        if (busid == "-") {
+            continue;
+        }
+        uint64_t offer   = vbr_budget_explicit_ ? 0 : (uint64_t) vbr_shed_available(p.device);
+        uint64_t pending = vbr_grant_pending_[busid];
+        if (vbr_ledger_sibling_ != nullptr && !vbr_budget_explicit_) {
+            // one marker per tree: the offer peers see is the SUM of both children
+            offer   += vbr_ledger_sibling_->vbr_shed_available(p.device);
+            pending += vbr_ledger_sibling_->vbr_grant_pending_[busid];
+        }
+        auto pub = vbr_marker_pub_.find(busid);
+        if (pub == vbr_marker_pub_.end() || pub->second.first != offer || pub->second.second != pending) {
+            llama_vram_marker_fields f = {};
+            f.vbr            = 1;
+            f.serviced       = llama_vram_marker_serviced_flag() ? 1u : 0u;
+            f.shed_available = offer;
+            f.grant_pending  = pending;
+            if (llama_vram_marker_publish(busid, f)) {
+                vbr_marker_pub_[busid] = { offer, pending };
+                if (vbr_marker_created_ts_ == 0) {
+                    vbr_marker_created_ts_ = now;
+                }
+                // our own rename: re-adopt the dir mtime so we don't trip our own pre-check
+                vbr_ledger_mtime_ = llama_vram_ledger_dir_mtime_ns();
+            }
+        } else {
+            llama_vram_marker_beat(busid);
+        }
+    }
+}
+
+void llama_kv_cache::vbr_ledger_scan_service(uint32_t wm_next) {
+    // explicit budgets still run the pass — they publish markers (shed_available = 0,
+    // demand service skipped) so the demander's presence census stays complete
+    if (!vbr_ledger_owner_ || !vbr_vmm_active() || !llama_vram_ledger_armed()) {
+        return;
+    }
+    vbr_ledger_force_ = false;
+    vbr_last_scan_ns_ = llama_vram_ledger_now_ns();
+
+    std::vector<llama_vram_peer_claim> claims;
+    llama_vram_ledger_scan(claims);
+    std::vector<llama_vram_peer_marker> peers;
+    llama_vram_ledger_scan_markers(peers);
+    const uint64_t now = vbr_last_scan_ns_;
+
+    vbr_presence_census(peers);
+    bool grants_changed = vbr_grants_upkeep(claims, now);
+    if (vbr_ledger_sibling_ != nullptr) {
+        // the owner scans once for the whole tree: the sibling's grants amortize and lift
+        // against the same claim set, and its pending clears on its own flush state
+        if (vbr_ledger_sibling_->vbr_grants_upkeep(claims, now)) {
+            vbr_ledger_sibling_->vbr_apply_grant_decrements();
+        }
+        vbr_ledger_sibling_->vbr_grant_pending_clear();
+    }
+    grants_changed = vbr_service_demands(claims, peers, now, wm_next) || grants_changed;
+    if (grants_changed) {
+        vbr_apply_grant_decrements();
+    }
+    vbr_grant_pending_clear();
+    vbr_markers_publish(now);
+}
+
+void llama_kv_cache::vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants,
+                                         uint64_t & offer, uint64_t & pending) const {
+    if (!vbr_vmm_active()) {
+        return;
+    }
+    decrement += vbr_total_grant_decrement();
+    grants    += (uint32_t) vbr_grants_.size();
+    // telemetry reports the PUBLISHED truth: an explicit budget never offers, so /slots
+    // must not show peers an offer the marker does not carry
+    std::set<int> devs;
+    for (const auto & p : vbr_pools_) {
+        if (!vbr_budget_explicit_ && p.vmm != nullptr && devs.insert(p.device).second) {
+            offer += vbr_shed_available(p.device);
+        }
+    }
+    for (const auto & [busid, pend] : vbr_grant_pending_) {
+        pending += pend;
+    }
 }
 
 bool llama_kv_cache::get_can_shift() const {
@@ -4726,14 +5479,14 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
 
         // rotate back
-        tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
 
         tmp = ggml_rope_ext(ctx, tmp,
                 shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
 
         // rotate fwd
-        tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
 
         tmp = ggml_cpy(ctx, tmp, cur);
     } else {
